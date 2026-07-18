@@ -86,8 +86,9 @@ class SyntheticBallDetector:
         timestamp_ms: float,
         camera_id: int = 0,
         preprocess: bool = True,
+        imgsz: int | None = None,
     ) -> DetectionResult:
-        del preprocess
+        del preprocess, imgsz
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array([135, 80, 80]), np.array([175, 255, 255]))
         contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

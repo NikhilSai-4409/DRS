@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
@@ -20,13 +21,29 @@ from core.drs_decision import DRSDecisionService
 from core.hotspot import HotSpotAnalyzer
 from core.pitch_calibration import ManualPitchCalibrator
 from core.readiness import ReadinessGate
+from core.review_result import CalibratedTrajectoryProducer, ObservedTrajectory, ReviewResult, build_review_result
 from core.tracking_quality import TrackingQualityAnalyzer
 from core.trajectory import TrajectoryPredictor
 
 TESTING_DATA_DIR = Path("data/testing")
 UPLOAD_DIR = TESTING_DATA_DIR / "uploads"
-OUTPUT_DIR = TESTING_DATA_DIR / "outputs"
+# Where analyzed videos / exports land. Defaults next to the uploads, but can be
+# redirected (e.g. alongside the raw recordings, or to an external drive) with
+# DRS_TESTING_OUTPUT_DIR, or per-job via AnalysisOptions.output_dir.
+OUTPUT_DIR = Path(os.environ.get("DRS_TESTING_OUTPUT_DIR", "").strip() or (TESTING_DATA_DIR / "outputs"))
 CALIBRATION_DIR = Path("data/calibration")
+
+
+def _open_video_writer(path: Path, fps: float, size: tuple[int, int]) -> cv2.VideoWriter:
+    """VideoWriter that prefers H.264 (avc1) so the dashboard's browser <video>
+    element can actually play the result — mp4v (MPEG-4 Part 2) does not decode in
+    Chromium. Falls back to mp4v only if H.264 is unavailable in this OpenCV build."""
+    for tag in ("avc1", "mp4v"):
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*tag), fps, size)
+        if writer.isOpened():
+            return writer
+        writer.release()
+    return cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
 
 
 @dataclass(slots=True)
@@ -39,6 +56,27 @@ class AnalysisOptions:
     replay_generation: bool = True
     max_frames: int | None = None
     confidence_threshold: float = 0.25
+    model_path: str | None = None  # explicit .pt to load; None → detector default
+    # Process only every Nth frame. 1 = every frame (default). For high-FPS
+    # clips (120-240 fps) a stride of e.g. 4-8 samples the delivery down to a
+    # sane analysis/training rate and cuts processing time proportionally.
+    frame_stride: int = 1
+    # Redirect this job's analyzed video / exports to a specific folder
+    # (absolute or relative). None → the module OUTPUT_DIR.
+    output_dir: str | None = None
+    # YOLO inference resolution. Default 640 matches the model's training size and
+    # gave the best recall in testing; higher (960/1280) is NOT always better —
+    # only raise it if a small/fast ball is being missed in very wide footage.
+    imgsz: int = 640
+    # CLAHE/sharpen preprocessing before detection. OFF by default: on real footage
+    # it corrupted detection (the model locked onto a stationary false positive,
+    # 24px spread) while raw frames tracked the real moving ball (554px spread).
+    preprocess: bool = False
+    # Calibration choice from the UI. None = auto (use a camera-0 profile if one exists);
+    # False = force heuristic (the Testing wizard's default — a stale/mismatched profile
+    # must NOT silently gate uploads: observed 2026-07-17, a fresh workspace homography
+    # made a quality-0.87 track "invalid: implausible release speed 1.5 km/h").
+    use_calibration: bool | None = None
 
 
 @dataclass(slots=True)
@@ -66,7 +104,8 @@ class DeliveryTestingPipeline:
         if len(video_paths) < 1 or len(video_paths) > 6:
             raise ValueError("Testing platform supports one to six uploaded videos")
 
-        job_dir = OUTPUT_DIR / job_id
+        base_output = Path(options.output_dir) if options.output_dir else OUTPUT_DIR
+        job_dir = base_output / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         camera_results = []
         all_tracks: list[dict[str, Any]] = []
@@ -78,7 +117,7 @@ class DeliveryTestingPipeline:
         sync = self._synchronize(camera_results) if len(camera_results) > 1 else None
         fused = self._fuse_tracks(camera_results)
         replay_fps = min([cam["fps"] for cam in camera_results], default=0.0)
-        geometry_source = self._geometry_source()
+        geometry_source = self._geometry_source(options)
         calibration = self.readiness.calibration()
         sync_readiness = self.readiness.sync(sync, replay_fps)
         edge_analysis = self._analyze_edge(camera_results[0], options) if options.edge_detection else None
@@ -92,9 +131,52 @@ class DeliveryTestingPipeline:
             edge_analysis,
             hotspot_analysis,
         )
-        animation_path = self._write_clean_drs_animation(job_dir, job_id, fused, decision)
+        # Canonical review artifact: the ONE trajectory object every surface (animation,
+        # diagnostics, replay, export) reads. Built from the fused tracker output via a
+        # swappable physics producer — see core/review_result.py.
+        primary = camera_results[0] if camera_results else {}
+        observed = ObservedTrajectory.from_tracks(
+            fused, camera_id=0, fps=float(primary.get("fps") or 0.0)
+        )
+        pixels_per_meter = max(25.0, float(primary.get("width") or 1280) / 20.12)
+        # Impact frame = first tracked point to enter the (estimated) pad region; used to
+        # trim the post-impact drift so the trajectory ends at the delivery, not the clip.
+        impact_frame = self._impact_frame(fused, primary.get("object_estimates", {}).get("pads"))
+        last_frame = int(fused[-1]["frame_id"]) if fused else None
+        # Calibrated producer (image→pitch homography) when a profile exists; else heuristic.
+        producer = self._trajectory_producer(geometry_source, primary)
+        review_result = build_review_result(
+            job_id, observed, decision, geometry_source, producer=producer,
+            pixels_per_meter=pixels_per_meter, impact_frame=impact_frame, last_frame=last_frame,
+        )
+
+        # Broadcast replay package (replaces the old bbox-normalized animation.mp4):
+        # the DECISION-SERVICE side (reconstruction: smoothing, bounce, gates) feeds two
+        # renderer-only generators. Replay 2 needs headless Chrome and degrades gracefully.
+        reconstruction = None
+        replay_players_path: Path | None = None
+        replay_review_path: Path | None = None
+        if options.replay_generation:
+            from core.replay_reconstruction import build_replay_reconstruction
+
+            reconstruction = build_replay_reconstruction(
+                review_result.trajectory.to_dict(), decision
+            )
+            if reconstruction is not None:
+                from core.replay_broadcast import generate_drs_review_replay
+                from core.replay_overlay import generate_replay_with_players
+
+                replay_players_path = generate_replay_with_players(
+                    video_paths[0], reconstruction, job_dir / "replay_players.mp4"
+                )
+                replay_review_path = generate_drs_review_replay(
+                    reconstruction, job_dir / "replay_review.mp4"
+                )
+
         report_path = self._write_report(job_dir, job_id, camera_results, decision, sync)
-        json_path = self._write_json(job_dir, job_id, camera_results, decision, sync, geometry_source)
+        json_path = self._write_json(
+            job_dir, job_id, camera_results, decision, sync, geometry_source, review_result
+        )
         csv_path = self._write_csv(job_dir, job_id, all_tracks)
 
         return {
@@ -105,12 +187,18 @@ class DeliveryTestingPipeline:
             "sync": sync,
             "cameras": camera_results,
             "geometry_source": geometry_source,
+            "trajectory": review_result.trajectory.to_dict(),
+            "diagnostics": review_result.diagnostics,
+            "reconstruction": reconstruction,
             "exports": {
                 "json": str(json_path),
                 "csv": str(csv_path),
                 "pdf": str(report_path),
                 "analyzed_video": camera_results[0]["analyzed_video"],
-                "animation_video": str(animation_path),
+                # the DRS-review render is the animation now (same endpoint, new content)
+                "animation_video": str(replay_review_path) if replay_review_path else "",
+                "replay_players": str(replay_players_path) if replay_players_path else "",
+                "replay_review": str(replay_review_path) if replay_review_path else "",
                 "screenshots": [item for cam in camera_results for item in cam["screenshots"]],
             },
             "calibration_status": calibration.to_dict(),
@@ -131,15 +219,23 @@ class DeliveryTestingPipeline:
         if not cap.isOpened():
             raise ValueError(f"Could not open video: {video_path}")
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        # Frame sampling: keep every `stride`-th frame. stride=1 → every frame.
+        # The effective rate drives tracking/speed math and the written video so
+        # that a sampled clip still plays and measures at correct wall-clock time.
+        stride = max(1, int(getattr(options, "frame_stride", 1) or 1))
+        fps = source_fps / stride if stride > 1 else source_fps
         tracker = SingleBallByteTracker(fps=fps)
         output_path = job_dir / ("analyzed_video.mp4" if camera_id == 0 else f"camera_{camera_id}_analyzed.mp4")
-        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        writer = _open_video_writer(output_path, fps, (width, height))
 
-        frame_id = 0
+        expected_processed = (total_frames // stride) if total_frames else 0
+        milestones = {0, max(0, expected_processed // 2), max(0, expected_processed - 1)}
+        frame_id = 0  # index over KEPT (processed) frames
+        raw_index = -1  # index over every decoded frame, sampled or not
         detections: list[dict[str, Any]] = []
         object_estimates: dict[str, ObjectEstimate] = {}
         screenshots: list[str] = []
@@ -150,10 +246,13 @@ class DeliveryTestingPipeline:
             ok, frame = cap.read()
             if not ok:
                 break
+            raw_index += 1
+            if raw_index % stride != 0:
+                continue
             if options.max_frames is not None and frame_id >= options.max_frames:
                 break
 
-            timestamp_ms = (frame_id / fps) * 1000.0
+            timestamp_ms = (raw_index / source_fps) * 1000.0
             detection_result = self._detect_ball(frame, frame_id, timestamp_ms, camera_id, options)
             track_point = tracker.update(detection_result) if options.ball_tracking else None
             estimates = self._estimate_static_objects(frame)
@@ -170,7 +269,7 @@ class DeliveryTestingPipeline:
             self._draw_drs_overlay(annotated, object_estimates, bounce_point_px, impact_point_px)
             writer.write(annotated)
 
-            if frame_id in {0, max(0, total_frames // 2), max(0, total_frames - 1)}:
+            if frame_id in milestones:
                 shot_path = job_dir / f"camera_{camera_id}_frame_{frame_id}.jpg"
                 cv2.imwrite(str(shot_path), annotated)
                 screenshots.append(str(shot_path))
@@ -244,7 +343,7 @@ class DeliveryTestingPipeline:
     ) -> DetectionResult:
         if not options.ball_detection:
             return DetectionResult(frame_id, timestamp_ms, camera_id, [], 0.0)
-        result = self.detector.detect(frame, frame_id, timestamp_ms, camera_id)
+        result = self.detector.detect(frame, frame_id, timestamp_ms, camera_id, preprocess=options.preprocess, imgsz=options.imgsz)
         filtered = [item for item in result.detections if item.confidence >= options.confidence_threshold]
         return DetectionResult(frame_id, timestamp_ms, camera_id, filtered, result.inference_ms)
 
@@ -281,6 +380,35 @@ class DeliveryTestingPipeline:
         for point in points:
             if x1 <= point.x <= x2 and y1 <= point.y <= y2:
                 return int(point.x), int(point.y)
+        return None
+
+    def _trajectory_producer(self, geometry_source: str, primary: dict[str, Any]):
+        """Pick the trajectory producer: calibrated (image→pitch homography) when a pitch
+        profile exists for camera 0, otherwise the default heuristic producer (None)."""
+        if geometry_source != "calibration":
+            return None
+        calibrator = ManualPitchCalibrator()
+        profile = calibrator.load_profile(0)
+        if not profile or not profile.homography:
+            return None
+        return CalibratedTrajectoryProducer(
+            calibrator, camera_id=0,
+            bounce_px=primary.get("bounce_point_px"),
+            impact_px=primary.get("impact_point_px"),
+            homography_error_cm=profile.homography_error_cm,
+        )
+
+    def _impact_frame(self, tracks: list[dict[str, Any]], pads: dict[str, Any] | None) -> int | None:
+        """Frame of the first tracked point to enter the estimated pad region — the
+        heuristic impact used to trim post-impact drift from the trajectory."""
+        if not tracks or not pads or not pads.get("bbox"):
+            return None
+        b = pads["bbox"]
+        x1, y1 = b["x"], b["y"]
+        x2, y2 = x1 + b["w"], y1 + b["h"]
+        for pt in tracks:
+            if x1 <= pt.get("x", -1) <= x2 and y1 <= pt.get("y", -1) <= y2:
+                return int(pt.get("frame_id", 0))
         return None
 
     def _draw_drs_overlay(
@@ -454,84 +582,6 @@ class DeliveryTestingPipeline:
             "reason": "UltraEdge audio-edge proxy generated from delivery timing window.",
         }
 
-    def _write_clean_drs_animation(self, job_dir: Path, job_id: str, tracks: list[dict[str, Any]], decision: dict[str, Any]) -> Path:
-        path = job_dir / "animation.mp4"
-        width, height, fps = 1280, 720, 30
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-        pitch_left, pitch_right = 210, 1070
-        pitch_top, pitch_bottom = 120, 620
-        crease_x = int(pitch_right - 120)
-        stump_x = int(pitch_right - 70)
-        center_y = (pitch_top + pitch_bottom) // 2
-
-        normalized = self._normalize_track_for_animation(tracks, pitch_left, pitch_right, pitch_top, pitch_bottom)
-        frames = max(90, len(normalized) * 3)
-        for frame_idx in range(frames):
-            canvas = np.zeros((height, width, 3), dtype=np.uint8)
-            canvas[:] = (8, 18, 24)
-            cv2.rectangle(canvas, (0, 0), (width, height), (15, 28, 40), -1)
-            for y in range(0, height, 42):
-                cv2.rectangle(canvas, (0, y), (width, y + 21), (18, 54, 36), -1)
-            for x in range(pitch_left, pitch_right, 52):
-                cv2.line(canvas, (x, pitch_top), (x, pitch_bottom), (62, 90, 76), 1)
-            cv2.rectangle(canvas, (pitch_left, pitch_top), (pitch_right, pitch_bottom), (66, 97, 71), -1)
-            cv2.rectangle(canvas, (pitch_left, pitch_top), (pitch_right, pitch_bottom), (160, 190, 170), 2)
-            cv2.line(canvas, (crease_x, pitch_top), (crease_x, pitch_bottom), (220, 230, 210), 2)
-            self._draw_animation_stumps(canvas, stump_x, center_y)
-            cv2.putText(canvas, "PITCH MAP", (pitch_left, pitch_top - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (210, 235, 255), 2)
-
-            upto = min(len(normalized), max(1, frame_idx // 3))
-            visible = normalized[:upto]
-            if len(visible) > 1:
-                cv2.polylines(canvas, [np.array(visible, dtype=np.int32)], False, (60, 255, 140), 4, cv2.LINE_AA)
-                glow = np.array(visible, dtype=np.int32)
-                cv2.polylines(canvas, [glow], False, (30, 150, 255), 1, cv2.LINE_AA)
-            if visible:
-                cv2.circle(canvas, visible[-1], 10, (245, 245, 245), -1, cv2.LINE_AA)
-                cv2.circle(canvas, visible[-1], 16, (60, 255, 140), 2, cv2.LINE_AA)
-
-            self._draw_animation_panel(canvas, decision)
-            writer.write(canvas)
-        writer.release()
-        return path
-
-    def _normalize_track_for_animation(
-        self,
-        tracks: list[dict[str, Any]],
-        left: int,
-        right: int,
-        top: int,
-        bottom: int,
-    ) -> list[tuple[int, int]]:
-        if not tracks:
-            return [(left + 70, bottom - 80), (right - 90, (top + bottom) // 2)]
-        pts = np.array([[float(item["x"]), float(item["y"])] for item in tracks], dtype=float)
-        min_xy = pts.min(axis=0)
-        span = np.maximum(pts.max(axis=0) - min_xy, 1.0)
-        normalized = (pts - min_xy) / span
-        x = left + normalized[:, 0] * (right - left - 120) + 40
-        y = bottom - normalized[:, 1] * (bottom - top - 80) - 40
-        return [(int(px), int(py)) for px, py in zip(x, y)]
-
-    def _draw_animation_stumps(self, canvas: np.ndarray, x: int, y: int) -> None:
-        for offset in (-18, 0, 18):
-            cv2.line(canvas, (x + offset, y - 76), (x + offset, y + 76), (235, 228, 190), 7, cv2.LINE_AA)
-        cv2.line(canvas, (x - 27, y - 82), (x + 27, y - 82), (235, 228, 190), 4, cv2.LINE_AA)
-
-    def _draw_animation_panel(self, canvas: np.ndarray, decision: dict[str, Any]) -> None:
-        cv2.rectangle(canvas, (36, 36), (490, 180), (4, 12, 28), -1)
-        cv2.rectangle(canvas, (36, 36), (490, 180), (60, 255, 140), 1)
-        result = decision.get("lbw_recommendation", "PENDING")
-        color = (60, 80, 255) if result == "OUT" else (50, 205, 255) if result == "NOT OUT" else (0, 215, 255)
-        cv2.putText(canvas, "CLEAN DRS ANIMATION", (58, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (225, 238, 255), 2)
-        font_scale = 1.05 if len(result) > 14 else 1.55
-        cv2.putText(canvas, result, (58, 130), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 3, cv2.LINE_AA)
-        confidence = int(float(decision.get("confidence_score", 0.0)) * 100)
-        cv2.putText(canvas, f"CONF {confidence}% | {decision.get('reliability', 'low').upper()}", (58, 164), cv2.FONT_HERSHEY_SIMPLEX, 0.64, (60, 255, 140), 2)
-        failed = decision.get("gate", {}).get("failed_gates", [])
-        if failed:
-            cv2.putText(canvas, "FAILED GATES: " + ", ".join(failed[:3]), (520, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 215, 255), 2)
-
     def _confidence(self, detections: list[dict[str, Any]], tracks: list[dict[str, Any]]) -> float:
         if not detections:
             return 0.0
@@ -541,10 +591,19 @@ class DeliveryTestingPipeline:
         track_rate = len(tracks) / max(1, len(detections))
         return round(min(1.0, (avg_detection * 0.55) + (detection_rate * 0.3) + (track_rate * 0.15)), 3)
 
-    def _geometry_source(self) -> str:
+    def _geometry_source(self, options: AnalysisOptions) -> str:
+        # Must be consistent with _trajectory_producer: geometry is "calibration" ONLY when
+        # camera 0 (the analysed clip) has a usable homography — NOT when ANY camera has a
+        # profile. Otherwise geometry_source flips to "calibration" while the producer stays
+        # heuristic, and the flat-pixel speed check wrongly gates a good track.
+        # The UI's explicit Heuristic choice WINS over profile existence: a profile made
+        # against different footage would otherwise gate every upload via the speed check.
+        if options.use_calibration is False:
+            return "heuristic"
         from core.pitch_calibration import ManualPitchCalibrator
 
-        return "calibration" if ManualPitchCalibrator().list_profiles() else "heuristic"
+        profile = ManualPitchCalibrator().load_profile(0)
+        return "calibration" if (profile and profile.homography) else "heuristic"
 
     def _write_json(
         self,
@@ -554,21 +613,20 @@ class DeliveryTestingPipeline:
         decision: dict[str, Any],
         sync: dict[str, Any] | None,
         geometry_source: str,
+        review_result: "ReviewResult | None" = None,
     ) -> Path:
         path = job_dir / "results.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "job_id": job_id,
-                    "decision": decision,
-                    "sync": sync,
-                    "cameras": cameras,
-                    "geometry_source": geometry_source,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        payload = {
+            "job_id": job_id,
+            "decision": decision,
+            "sync": sync,
+            "cameras": cameras,
+            "geometry_source": geometry_source,
+        }
+        if review_result is not None:
+            payload["trajectory"] = review_result.trajectory.to_dict()
+            payload["diagnostics"] = review_result.diagnostics
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return path
 
     def _write_csv(self, job_dir: Path, job_id: str, points: list[dict[str, Any]]) -> Path:

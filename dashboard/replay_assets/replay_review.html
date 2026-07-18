@@ -1,0 +1,226 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  html,body{margin:0;background:#000;overflow:hidden}
+</style></head>
+<body>
+<canvas id="gl" width="1280" height="720"></canvas>
+<canvas id="out" width="1280" height="720" style="display:none"></canvas>
+<pre id="err" style="position:fixed;top:0;left:0;color:#fff;font:12px monospace;z-index:9"></pre>
+<script type="module">
+import * as THREE from "./three.module.min.js";
+import { loadStyle, makeCamera, buildBaseline } from "./broadcast_scene.js";
+try {
+  const style = await loadStyle();
+  const A = await fetch("./delivery3d.json").then(r => r.json());
+  style.color_palette.grassStripeA = "#87a44d"; style.color_palette.grassStripeB = "#7c9846";
+  style.color_palette.background = "#84a04b"; style.color_palette.pitch = "#d8cf89";
+  const SS = style.stumps;
+  SS.height *= 1.10; SS.radius *= 0.85; SS.positions = SS.positions.map(v => v * 1.12);
+  SS.bailY *= 1.10; SS.bailOffset *= 1.12; SS.bailR = 0.005;
+  SS.brandBandY = SS.height * 0.78; SS.brandBandH = 0.035; SS.goldRingY = -1;
+  style.color_palette.stump = "#171646"; style.color_palette.stumpBrand = "#7e8794";
+  style.color_palette.bail = "#10141f";
+  const r = new THREE.WebGLRenderer({ canvas: document.getElementById("gl"), antialias: true, preserveDrawingBuffer: true, alpha: true });
+  r.setSize(1280, 720, false); r.outputColorSpace = THREE.SRGBColorSpace;
+  r.toneMapping = THREE.ACESFilmicToneMapping; r.toneMappingExposure = style.camera.toneMappingExposure;
+  // REFERENCE-VERIFIED (Delivery001 f92-f122): the dark ground element IS the tube's SOFT
+  // CAST SHADOW (moves/angles with the tube, one light direction, stump shadows match).
+  r.shadowMap.enabled = true; r.shadowMap.type = THREE.PCFSoftShadowMap;
+  const sc = new THREE.Scene();
+  buildBaseline(THREE, sc, style);
+
+  // richer pitch surface (user: "the pitch doesn't look good"): wear bands + mow tone + noise
+  const pc = document.createElement("canvas"); pc.width = 256; pc.height = 1024;
+  const px = pc.getContext("2d");
+  px.fillStyle = "#d8cf89"; px.fillRect(0, 0, 256, 1024);
+  for (let i = 0; i < 4; i++) {                     // subtle lengthwise mow tone
+    px.fillStyle = i % 2 ? "rgba(160,148,96,0.10)" : "rgba(236,228,170,0.10)";
+    px.fillRect(i * 64, 0, 64, 1024);
+  }
+  for (let i = 0; i < 26; i++) {                    // horizontal wear banding
+    px.fillStyle = `rgba(150,128,72,${0.04 + Math.random() * 0.10})`;
+    px.fillRect(0, Math.random() * 1024, 256, 8 + Math.random() * 60);
+  }
+  px.fillStyle = "rgba(140,116,60,0.16)"; px.fillRect(0, 960, 256, 64);   // worn crease end
+  for (let i = 0; i < 24000; i++) {
+    const d = Math.random() < 0.5 ? 0 : 255;
+    px.fillStyle = `rgba(${d},${d},${d},${Math.random() * 0.055})`;
+    px.fillRect(Math.random() * 256, Math.random() * 1024, 2, 2);
+  }
+  const pitchMesh = sc.getObjectByName("pitch");
+  const ptex = new THREE.CanvasTexture(pc); ptex.flipY = true;
+  pitchMesh.material.map = ptex; pitchMesh.material.needsUpdate = true;
+
+  // lighting rebalanced so shadowed pitch ~= x0.62 of lit (the measured reference blend)
+  let sun = null;
+  sc.traverse(o => {
+    if (o.isDirectionalLight) sun = o;
+    if (o.isHemisphereLight) o.intensity = 0.72;
+    if (o.isAmbientLight) o.intensity = 0.55;
+  });
+  sun.intensity = 0.95;
+  sun.position.set(4.5, 9, -4.5);                   // shadows fall toward camera-left, like the reference
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(768, 768);                 // modest map = soft penumbra
+  Object.assign(sun.shadow.camera, { left: -6, right: 6, top: 12, bottom: -6, near: 1, far: 40 });
+  sun.shadow.bias = -0.0005;
+  sc.traverse(o => { if (o.isMesh) { o.receiveShadow = true; o.castShadow = !["pitch", "grass", "crease"].includes(o.name); } });
+
+  // ---- trajectory: split at the bounce (sharp V), smooth prediction ----
+  const IB = A.bounce_index;
+  const cl = A.points.filter(p => p[2] <= 6.8);
+  const nDrop = A.points.length - cl.length ? A.points.findIndex(p => p[2] <= 6.8) : 0;
+  const ibC = Math.max(1, IB - nDrop);
+  const obsC = A.observed_n - nDrop;
+  const V = (p) => new THREE.Vector3(p[0], p[1], p[2]);
+  const appPts = cl.slice(0, ibC + 1).map(V);
+  const exitPts = cl.slice(ibC).map(V);
+  const appCurve = new THREE.CatmullRomCurve3(appPts, false, "catmullrom", 0.5);
+  const exitCurve = new THREE.CatmullRomCurve3(exitPts, false, "catmullrom", 0.5);
+  const LA = appCurve.getLength(), LE = exitCurve.getLength();
+  const bF = LA / (LA + LE);
+  const exCum = [0];
+  for (let i = 1; i < exitPts.length; i++) exCum.push(exCum[i - 1] + exitPts[i].distanceTo(exitPts[i - 1]));
+  const fObsExit = exCum[Math.min(exCum.length - 1, Math.max(0, obsC - 1 - ibC))] / exCum[exCum.length - 1];
+
+  const RED = new THREE.Color("#d0263a"), BLU = new THREE.Color("#2f57d8");
+  const NRAD = 20;
+  function tubeGeom(crv, nseg, rad, blendT) {
+    const frames = crv.computeFrenetFrames(nseg, false);
+    const pos = [], cols = [], idx = [];
+    for (let i = 0; i <= nseg; i++) {
+      const t = i / nseg, p = crv.getPointAt(t);
+      const N = frames.normals[Math.min(i, nseg)], Bv = frames.binormals[Math.min(i, nseg)];
+      const c = blendT == null ? RED : RED.clone().lerp(BLU, THREE.MathUtils.smoothstep(t, blendT - 0.02, blendT + 0.10));
+      for (let j = 0; j <= NRAD; j++) {
+        const a = j / NRAD * Math.PI * 2, sin = Math.sin(a), cos = -Math.cos(a);
+        pos.push(p.x + rad * (cos * N.x + sin * Bv.x), p.y + rad * (cos * N.y + sin * Bv.y), p.z + rad * (cos * N.z + sin * Bv.z));
+        cols.push(c.r, c.g, c.b);
+      }
+    }
+    for (let i = 0; i < nseg; i++) for (let j = 0; j < NRAD; j++) {
+      const a = i * (NRAD + 1) + j;
+      idx.push(a, a + NRAD + 1, a + 1, a + 1, a + NRAD + 1, a + NRAD + 2);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute("color", new THREE.Float32BufferAttribute(cols, 3));
+    g.setIndex(idx); g.computeVertexNormals();
+    return g;
+  }
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uOpacity: { value: 0.85 }, uFeather: { value: 0.55 } },
+    vertexShader: `varying vec3 vC; varying vec3 vN; varying vec3 vV;
+      void main(){ vC = color; vec4 mv = modelViewMatrix * vec4(position,1.0);
+        vN = normalMatrix * normal; vV = -mv.xyz; gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: `varying vec3 vC; varying vec3 vN; varying vec3 vV;
+      uniform float uOpacity; uniform float uFeather;
+      void main(){ float f = abs(dot(normalize(vN), normalize(vV)));
+        gl_FragColor = vec4(pow(vC, vec3(1.0/2.2)), uOpacity * smoothstep(0.0, uFeather, f)); }`,
+    transparent: true, depthWrite: false, side: THREE.DoubleSide, vertexColors: true,
+  });
+  const appG = tubeGeom(appCurve, 140, 0.042, null);
+  const exitG = tubeGeom(exitCurve, 100, 0.042, fObsExit);
+  const appMesh = new THREE.Mesh(appG, mat), exitMesh = new THREE.Mesh(exitG, mat);
+  appMesh.castShadow = exitMesh.castShadow = true;   // the reference's dark ground element
+  sc.add(appMesh); sc.add(exitMesh);
+
+  // ---- THE IN-LINE CORRIDOR SHADE (the user's zone graphic, at last understood):
+  // a static strip the WIDTH OF THE WICKETS, centered on the stump line, running down the
+  // pitch from the stumps. The viewer judges PITCHING/IMPACT against it: bounce inside the
+  // shade = IN LINE, outside it = OUTSIDE OFF / OUTSIDE LEG. Flat, soft-edged, always visible.
+  const stumpOuter = Math.abs(SS.positions[2]) + SS.radius;         // outer edge of off/leg stump
+  const CORR_W = stumpOuter * 2, CORR_L = 14.0;
+  // CONSTANT reference corridor: same width end to end, no taper, no lengthwise fade,
+  // present before the ball arrives and unchanged until the replay ends. Only the lateral
+  // edges get a 2-3px soft falloff so it reads painted rather than aliased.
+  const ccv = document.createElement("canvas"); ccv.width = 64; ccv.height = 4;
+  const ccx = ccv.getContext("2d");
+  const cim = ccx.createImageData(64, 4);
+  for (let ty = 0; ty < 4; ty++) for (let tx = 0; tx < 64; tx++) {
+    const u = tx / 63;
+    const cross = Math.min(1, Math.min(u, 1 - u) / 0.06);
+    const o = (ty * 64 + tx) * 4;
+    cim.data[o] = 0; cim.data[o + 1] = 0; cim.data[o + 2] = 0;
+    cim.data[o + 3] = Math.round(255 * cross);
+  }
+  ccx.putImageData(cim, 0, 0);
+  const corridor = new THREE.Mesh(new THREE.PlaneGeometry(CORR_W, CORR_L),
+    new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(ccv), color: 0x000000,
+      transparent: true, opacity: 0.30, depthWrite: false }));
+  corridor.rotation.x = -Math.PI / 2;
+  corridor.position.set(0, 0.012, CORR_L / 2);                      // stump line -> down the pitch
+  sc.add(corridor);
+
+  // pink ball fixed at the bounce point (in the reference it persists at the V) — NO ball shadows
+  const pB = appCurve.getPointAt(1);
+  const markBall = new THREE.Mesh(new THREE.SphereGeometry(0.05, 24, 24),
+    new THREE.MeshPhysicalMaterial({ color: "#ff3ba0", roughness: 0.35, clearcoat: 0.5, emissive: "#7a0038", emissiveIntensity: 0.45 }));
+  markBall.castShadow = false; markBall.position.set(pB.x, 0.05, pB.z); markBall.visible = false; sc.add(markBall);
+  const tipBall = new THREE.Mesh(new THREE.SphereGeometry(0.045, 24, 24),
+    new THREE.MeshPhysicalMaterial({ color: "#e8503f", roughness: 0.35, clearcoat: 0.5, emissive: "#5a0f0f", emissiveIntensity: 0.45 }));
+  tipBall.castShadow = false; tipBall.visible = false; sc.add(tipBall);
+
+  // ---- CAMERA: one continuous broadcast move (reference f92->f122 = push-in, no cut) ----
+  const cam = makeCamera(THREE, style);
+  const poseA = { pos: new THREE.Vector3(-1.0, 4.33, 7.2), look: new THREE.Vector3(0.09, -0.2, 0.0), fov: 26 };
+  const poseB = { pos: new THREE.Vector3(-0.5, 2.0, 9.5), look: new THREE.Vector3(0.15, 0.45, 0.0), fov: 14 };  // farther back, higher, longer lens: stumps ~1/3 frame
+  function setCam(k, drift) {
+    const e = k <= 0 ? 0 : k >= 1 ? 1 : k * k * (3 - 2 * k);
+    const p = poseA.pos.clone().lerp(poseB.pos, e);
+    p.x += Math.sin(e * Math.PI) * -0.55;            // gentle lateral orbit through the move
+    p.z += drift;
+    const l = poseA.look.clone().lerp(poseB.look, e);
+    cam.fov = poseA.fov + (poseB.fov - poseA.fov) * e;
+    cam.updateProjectionMatrix();
+    cam.position.copy(p); cam.lookAt(l); cam.updateMatrixWorld();
+  }
+
+  const out = document.getElementById("out"), ox = out.getContext("2d");
+  const ease = (v) => v <= 0 ? 0 : v >= 1 ? 1 : v * v * (3 - 2 * v);
+  const totA = appG.index.count, totE = exitG.index.count;
+  function setProgress(p) {
+    if (p <= bF) {
+      appG.setDrawRange(0, Math.floor(totA * (p / bF) / 6) * 6);
+      exitG.setDrawRange(0, 0);
+      if (p > 0.002) { tipBall.visible = true; tipBall.position.copy(appCurve.getPointAt(p / bF)); }
+    } else {
+      appG.setDrawRange(0, totA);
+      const pe = (p - bF) / (1 - bF);
+      exitG.setDrawRange(0, Math.floor(totE * pe / 6) * 6);
+      if (pe < 0.995) { tipBall.visible = true; tipBall.position.copy(exitCurve.getPointAt(pe)); }
+      else tipBall.visible = false;
+    }
+    markBall.visible = p >= bF;
+  }
+  async function capture(i) {
+    ox.drawImage(document.getElementById("gl"), 0, 0);
+    for (let a = 0; a < 3; a++) {
+      try {
+        const blob = await new Promise((res, rej) => { out.toBlob(b => b ? res(b) : rej(new Error("null")), "image/png"); });
+        await fetch("/frame?i=" + i, { method: "POST", body: blob });
+        return;
+      } catch (e) { if (a === 2) throw new Error("frame " + i + ": " + e.message); }
+    }
+  }
+
+  // beats: travel (constant speed) -> impact -> PAUSE -> prediction extends WHILE the camera
+  // pushes from the wide view into the stump view (the reference's single continuous move)
+  const FPS = 25, NF = 132;
+  const predStart = bF + (1 - bF) * fObsExit;
+  for (let i = 0; i < NF; i++) {
+    const t = i * (1000 / FPS);
+    let p;
+    if (t < 300) p = 0;
+    else if (t < 1500) p = predStart * Math.pow((t - 300) / 1200, 0.92);
+    else if (t < 1680) p = predStart;                                  // impact pause
+    else p = predStart + (1 - predStart) * ease((t - 1680) / 1500);    // prediction extends
+    const camK = (t - 1800) / 1600;                                    // push begins just after
+    setCam(camK, t < 1500 ? -0.10 * (t / 1500) : -0.10);               // tiny drift during travel
+    setProgress(Math.max(0, Math.min(1, p)));
+    r.render(sc, cam);
+    await capture(i);
+  }
+  await fetch("/done", { method: "POST", body: "1" });
+  document.title = "done";
+} catch (e) { document.getElementById("err").textContent = "ERR::" + ((e && e.stack) || e); document.title = "err"; }
+</script></body></html>

@@ -1,8 +1,20 @@
-path: C:/Users/nikhi/OneDrive/Desktop/DRS/training
+# AUTO-GENERATED from config/dataset.yaml and config/classes.yaml.
+# Edit those config files, then regenerate with:
+#   python scripts/init_production_dataset.py
+path: C:/Users/nikhi/OneDrive/Desktop/DRS/training/datasets/production
 train: images/train
 val: images/val
+test: images/test
 
-nc: 1
+nc: 10
 names:
   0: cricket_ball
-
+  1: bat
+  2: pad
+  3: stumps
+  4: batter
+  5: bowler
+  6: wicketkeeper
+  7: umpire
+  8: popping_crease
+  9: bowling_crease

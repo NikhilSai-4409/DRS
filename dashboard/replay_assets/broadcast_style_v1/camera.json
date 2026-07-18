@@ -1,0 +1,9 @@
+{
+  "_comment": "Frozen lens for every replay shot. Per-shot files set only position/target.",
+  "fov": 21,
+  "aspect": [1920, 1080],
+  "near": 0.1,
+  "far": 400,
+  "toneMapping": "ACESFilmic",
+  "toneMappingExposure": 1.1
+}

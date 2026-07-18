@@ -230,7 +230,7 @@ For tournament-grade accuracy:
 1. **Camera Sync Tolerance:** ±2ms (configurable in `.env`)
 2. **Frame Drop Detection:** Automatic
 3. **Audio Sync:** UltraEdge analysis for edge detection
-4. **Calibration:** Required (15+ checkerboard images per camera)
+4. **Calibration:** Required (15+ ChArUco board images per camera)
 
 ### **Pros & Cons:**
 

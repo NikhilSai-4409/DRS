@@ -1,0 +1,78 @@
+# DRS Tunable Configuration
+#
+# This file is a READ-ONLY overlay for runtime tunables. The single source
+# of truth for hardcoded physics, path constants, and detection thresholds
+# remains in config/settings.py (which the existing 95 tests depend on).
+#
+# Use this YAML for:
+#   * Live pipeline display preferences
+#   * Camera list / resolution
+#   * Per-session overrides the operator might want to flip
+#
+# Nothing in core/ reads this file yet — it is consumed by
+# core/live_pipeline.py and scripts/run_calibration.py for the
+# single-camera live mode added in this milestone.
+
+cameras:
+  # Comma-separated list, or use --cameras on the CLI to override.
+  # For a 1-camera demo, just leave it as "0".
+  # For side + front dual-cam, set this to "0,1" once both are calibrated.
+  default_indices: [0]
+  target_fps: 30
+  buffer_seconds: 8
+  resolution: [1280, 720]
+
+detection:
+  # Where live_pipeline looks first; falls back if missing.
+  model_path: "models/best.pt"
+  fallback_model_path: "models/cricket_ball_yolov8.pt"
+  confidence_threshold: 0.35
+  device: "auto"          # auto | cpu | cuda
+
+tracking:
+  max_disappeared_frames: 8
+  max_distance_pixels: 150
+
+# Trajectory physics — used by the optional predict_with_physics helper.
+# These duplicate config/settings.py constants so operators can tweak them
+# from YAML without editing the settings module. live_pipeline reads these
+# only when calling core.trajectory.predict_with_physics.
+physics:
+  gravity: 9.81
+  air_density: 1.225
+  drag_coefficient: 0.47
+  ball_mass_kg: 0.156
+  ball_diameter_m: 0.072
+  magnus_coefficient: 0.000041
+
+pitch:
+  length_m: 20.12
+  width_m: 3.05
+  stump_height_m: 0.711
+  stump_width_m: 0.2286
+  popping_crease_m: 1.22
+
+lbw:
+  max_impact_height_m: 0.9144
+  umpires_call_margin_m: 0.05
+  min_decision_confidence: 0.65
+
+paths:
+  calibration_profiles: "config/calibration_profiles"
+  decisions_log: "data/decisions.log"
+  exports: "data/exports"
+  uploads: "data/uploads"
+
+api:
+  host: "127.0.0.1"
+  # One unified backend serves HTTP + WebSocket on the same port (8765).
+  backend_port: 8765
+  websocket_port: 8765
+
+# Live pipeline UX (consumed only by core/live_pipeline.py)
+live:
+  appeal_cooldown_seconds: 15
+  show_world_coords: true
+  show_tracking_trail: true
+  trail_length: 20
+  primary_camera_index: 0

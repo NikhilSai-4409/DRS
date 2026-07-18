@@ -59,8 +59,12 @@ async def test_upload_job_completion(tmp_path, monkeypatch):
 async def test_export_files_exist(tmp_path, monkeypatch):
     job = await _upload_completed_job(tmp_path, monkeypatch)
     output_dir = Path(job["output_dir"])
-    for filename in ["analyzed_video.mp4", "animation.mp4", "results.json", "results.csv", "report.pdf"]:
-        assert (output_dir / filename).exists()
+    # These four are written for every completed job. The old bbox-normalized
+    # animation.mp4 was replaced by the broadcast replay package (replay_review.mp4),
+    # which is only rendered when a ball trajectory is reconstructed — this job runs
+    # with the detector disabled, so no trajectory and no replay render is expected.
+    for filename in ["analyzed_video.mp4", "results.json", "results.csv", "report.pdf"]:
+        assert (output_dir / filename).exists(), f"missing export: {filename}"
 
 
 @pytest.mark.asyncio

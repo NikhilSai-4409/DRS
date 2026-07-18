@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import argparse
 import base64
+import hashlib
 import json
-import math
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,15 +20,56 @@ from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDis
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
-from config.settings import CAMERA_IDS, DATA_DIR, RECORDINGS_DIR
+from config.settings import BUFFER_SECONDS, CAMERA_IDS, DATA_DIR, RECORDINGS_DIR, TARGET_FPS
+from core import activity_log
 from core.camera_manager import CameraManager, ReplayController, VideoFrame
+from core.camera_roles import normalize_roles
+from core.frame_buffer import FrameBuffer
 from core.integration import DRSPipeline, PipelineState
+from core.overlay_builder import build_overlay_payload
 from core.pitch_calibration import calibration_status_payload
+from core.review_logger import ReviewLogger
+from core.review_modules import ReviewContext, build_review_result, run_review
+from core.review_engine import ReviewEngine
 from core.synchronization import SyncVerifier
 from utils.logger import get_logger
 
 log = get_logger("api_server")
 SESSION_PATH = DATA_DIR / "decisions" / "desktop_session.json"
+MATCHES_DIR = DATA_DIR / "matches"  # Session History: one archived match per file.
+
+
+def _compute_code_version() -> str:
+    """Content hash of the backend Python sources, captured once at process start.
+    The Electron launcher (main.js) computes the SAME hash from disk on every launch;
+    a mismatch means a stale backend (old code) is still bound to port 8765, so it
+    kills and respawns it. Keep the file set + ordering in sync with main.js."""
+    root = Path(__file__).resolve().parent.parent
+    core_files = sorted((root / "core").rglob("*.py"), key=lambda p: p.relative_to(root).as_posix())
+    ordered = core_files + [root / "drs_app.py", root / "config" / "settings.py"]
+    digest = hashlib.sha1()
+    for path in ordered:
+        try:
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        except OSError:
+            continue
+    return digest.hexdigest()[:16]
+
+
+CODE_VERSION = _compute_code_version()
+
+
+# Pre-match operator checklist thresholds. The checklist gates a match on these
+# so the operator sees one green "Match ready" line instead of chasing telemetry
+# across panels during a live over.
+PREFLIGHT_MIN_FPS = 24.0            # per-camera capture floor for a clean review
+PREFLIGHT_WARN_FPS = 15.0          # below this = unstable, hard fail
+PREFLIGHT_MIN_STORAGE_GB = 20.0    # comfortable recording headroom
+PREFLIGHT_WARN_STORAGE_GB = 5.0    # below this = free up disk before recording
+PREFLIGHT_REPLAY_READY_FRACTION = 0.5  # ring buffer at least half full = replay-ready
 
 
 APPEAL_PRESETS = {
@@ -53,18 +94,39 @@ APPEAL_PRESETS = {
 }
 
 
+def _calibration_quality(error_cm: float | None) -> dict:
+    """Map a homography reprojection error (cm) to a star rating + operator label."""
+    if error_cm is None:
+        return {"stars": 0, "label": "Not calibrated", "level": "missing"}
+    if error_cm < 1.0:
+        return {"stars": 5, "label": "Excellent", "level": "excellent"}
+    if error_cm < 2.0:
+        return {"stars": 4, "label": "Good", "level": "good"}
+    if error_cm < 3.5:
+        return {"stars": 3, "label": "Fair", "level": "fair"}
+    if error_cm < 5.0:
+        return {"stars": 2, "label": "Needs recalibration", "level": "warn"}
+    return {"stars": 1, "label": "Poor — redo capture", "level": "poor"}
+
+
 class DRSBackend:
     """Owns camera capture, replay snapshots, sync verification, and API state."""
 
     def __init__(self, camera_ids: list[int], record: bool = False):
         self.camera_ids = camera_ids
         self.camera_manager = CameraManager(camera_ids, record=record)
+        # Single synchronized source of frames for every review type.
+        self.frame_buffer = FrameBuffer(self.camera_manager)
+        # Auto-saves each review (json + replay + frames) to data/reviews/.
+        self.review_logger = ReviewLogger()
         self.sync_verifier = SyncVerifier()
         self.active_replay: Optional[ReplayController] = None
         self.started_at_ms = time.time() * 1000.0
         self.analysis_mode = {"id": "visible", "label": "Mode A - visible-spectrum approximation"}
         self.current_decision = self._waiting_decision()
-        self.reviews: list[dict] = []
+        # Match-level state (survives restart): name/teams/overs + review history.
+        # `self.reviews` is a live view onto the current match's reviews.
+        self.match: dict = self._new_match()
         # Real-time detection/tracking pipeline integration
         self.pipeline = DRSPipeline(camera_ids, record=False, detector=None)
         self.pipeline_state: Optional[PipelineState] = None
@@ -77,6 +139,8 @@ class DRSBackend:
         self.pipeline.camera_manager = self.camera_manager
         self.pipeline.running = True
         log.info("API backend started with cameras {}", self.camera_ids)
+        activity_log.record("backend_started", "DRS backend started",
+                            cameras=list(self.camera_ids))
 
     def stop(self) -> None:
         self._save_session()
@@ -96,6 +160,7 @@ class DRSBackend:
             "uptime_seconds": int((time.time() * 1000.0 - self.started_at_ms) / 1000.0),
             "timestamp_ms": time.time() * 1000.0,
             "active_model_name": "live-camera-backend",
+            "code_version": CODE_VERSION,
         }
 
     def latest_frame(self, camera_id: int) -> VideoFrame:
@@ -257,7 +322,7 @@ class DRSBackend:
         payload = {
             "cpu_percent": _cpu_percent(),
             "ram_percent": _ram_percent(),
-            "gpu": {"available": False, "percent": None},
+            "gpu": _gpu_status(),
             "camera_fps": camera_fps,
             "frame_drops": frame_drops,
             "latency_ms": round(max(latencies, default=0.0), 1),
@@ -269,28 +334,355 @@ class DRSBackend:
         }
         return payload
 
-    def request_review(self, camera_ids: list[int] | None = None) -> dict:
+    def preflight_checklist(
+        self,
+        selected_cameras: list[int] | None = None,
+        require_audio: bool = False,
+        require_gpu: bool = False,
+    ) -> dict:
+        """Tournament pre-match checklist.
+
+        Every item is auto-verified against live telemetry and rated
+        ``pass`` / ``warn`` / ``fail`` (``skip`` = not applicable). ``match_ready``
+        is True when no *required* item is failing. The operator chooses which
+        cameras are in use, so spare/unused indices never block readiness — that is
+        the "select cams available" control the dashboard renders one row per.
+        """
+        detected = list(self.camera_ids)
+        selected = [cid for cid in (selected_cameras or detected) if cid in detected]
+        if not selected:
+            selected = list(detected)
+        # Stable A/B/C… labels follow detection order, matching the operator's
+        # "Camera A/B/C" mental model while keeping the raw index in the detail.
+        letters = {cid: (chr(ord("A") + idx) if idx < 26 else str(cid)) for idx, cid in enumerate(detected)}
+
+        health = self.camera_manager.health()
+        buffer_capacity = max(1, int(BUFFER_SECONDS * TARGET_FPS))
+        items: list[dict] = []
+        fps_values: list[float] = []
+        replay_fractions: list[float] = []
+
+        # --- One connection row per selected camera ---
+        for cid in selected:
+            item = health.get(cid, {})
+            fps = float(item.get("fps", 0.0))
+            connected = float(item.get("connected", 0.0)) > 0 or (float(item.get("alive", 0.0)) > 0 and fps > 0)
+            buffered = int(item.get("buffered_frames", 0.0))
+            synthetic = bool(item.get("synthetic", 0.0))
+            fps_values.append(fps)
+            replay_fractions.append(min(1.0, buffered / buffer_capacity))
+            if connected:
+                status = "warn" if synthetic else "pass"
+                detail = f"{fps:.1f} fps — {'synthetic source (no live signal)' if synthetic else 'live'}"
+            else:
+                status = "fail"
+                detail = item.get("last_error") or "No frames — check USB / capture card / cable."
+            items.append(_pf_item(
+                f"camera_{cid}", f"Camera {letters.get(cid, cid)} connected", "cameras",
+                status, detail, required=True,
+                value={"camera_id": cid, "fps": round(fps, 2), "synthetic": synthetic},
+            ))
+
+        # --- FPS stable (aggregate across selected cameras) ---
+        if fps_values:
+            min_fps = min(fps_values)
+            if min_fps >= PREFLIGHT_MIN_FPS:
+                fps_status = "pass"
+                fps_detail = f"All selected cameras ≥ {PREFLIGHT_MIN_FPS:.0f} fps (lowest {min_fps:.1f})."
+            elif min_fps >= PREFLIGHT_WARN_FPS:
+                fps_status = "warn"
+                fps_detail = f"Lowest camera {min_fps:.1f} fps — below {PREFLIGHT_MIN_FPS:.0f} fps target."
+            else:
+                fps_status = "fail"
+                fps_detail = f"Lowest camera {min_fps:.1f} fps — capture unstable."
+        else:
+            fps_status, fps_detail = "fail", "No camera FPS available yet."
+        items.append(_pf_item("fps_stable", "FPS stable", "capture", fps_status, fps_detail,
+                              required=True, value={"min_fps": round(min(fps_values), 2) if fps_values else 0.0}))
+
+        # --- Calibration valid ---
+        calib = calibration_status_payload()
+        calibrated_ids = set(calib.get("camera_ids") or [])
+        uncalibrated = [cid for cid in selected if cid not in calibrated_ids]
+        if not calib.get("calibrated"):
+            cal_status = "fail"
+            cal_detail = "No calibration profiles. Run pitch calibration on the match cameras."
+        elif uncalibrated:
+            cal_status = "warn"
+            cal_detail = f"No profile for camera(s): {', '.join(str(letters.get(c, c)) for c in uncalibrated)}."
+        elif calib.get("readiness") == "good":
+            cal_status = "pass"
+            err = calib.get("homography_error_cm")
+            cal_detail = "All selected cameras calibrated" + (f" (avg error {err:.2f} cm)." if err else ".")
+        else:
+            cal_status = "warn"
+            cal_detail = "Calibration present but error above target — consider recalibrating."
+        items.append(_pf_item("calibration", "Calibration valid", "vision", cal_status, cal_detail,
+                              required=True, value={"quality_score": calib.get("quality_score"),
+                                                    "error_cm": calib.get("homography_error_cm")}))
+
+        # --- Models loaded ---
+        try:
+            from core.model_selector import DetectorModelSelector
+
+            _model_path, readiness = DetectorModelSelector().select()
+            if readiness.selected_model == "missing":
+                model_status, model_detail = "fail", readiness.reason
+            elif readiness.usable:
+                model_status = "pass"
+                model_detail = f"{readiness.selected_model} loaded" + (
+                    f" (mAP50 {readiness.map50})." if readiness.map50 is not None else "."
+                )
+            else:
+                model_status, model_detail = "warn", readiness.reason
+            model_value = {"model": readiness.selected_model, "path": readiness.model_path, "map50": readiness.map50}
+        except Exception as exc:  # noqa: BLE001 - never let a probe crash the checklist
+            model_status, model_detail, model_value = "warn", f"Model probe failed: {exc}", {}
+        items.append(_pf_item("models", "Models loaded", "vision", model_status, model_detail,
+                              required=True, value=model_value))
+
+        # --- Storage available ---
+        free_gb = _free_gb(RECORDINGS_DIR)
+        if free_gb >= PREFLIGHT_MIN_STORAGE_GB:
+            st_status, st_detail = "pass", f"{free_gb:.1f} GB free for recordings."
+        elif free_gb >= PREFLIGHT_WARN_STORAGE_GB:
+            st_status, st_detail = "warn", f"Only {free_gb:.1f} GB free — enough for a short session."
+        else:
+            st_status, st_detail = "fail", f"Only {free_gb:.1f} GB free — free up disk before recording."
+        items.append(_pf_item("storage", "Storage available", "system", st_status, st_detail,
+                              required=True, value={"free_gb": free_gb}))
+
+        # --- Replay buffer ready ---
+        if replay_fractions:
+            fill = min(replay_fractions)
+            if fill >= PREFLIGHT_REPLAY_READY_FRACTION:
+                rb_status = "pass"
+                rb_detail = f"Ring buffer {fill * 100:.0f}% filled (~{BUFFER_SECONDS}s replay window)."
+            elif fill > 0:
+                rb_status = "warn"
+                rb_detail = f"Buffer filling ({fill * 100:.0f}%) — let cameras run a few more seconds."
+            else:
+                rb_status, rb_detail = "fail", "Replay buffer empty — no frames captured yet."
+        else:
+            rb_status, rb_detail = "fail", "No cameras feeding the replay buffer."
+        items.append(_pf_item("replay_buffer", "Replay buffer ready", "capture", rb_status, rb_detail,
+                              required=True, value={"fill_fraction": round(min(replay_fractions), 3) if replay_fractions else 0.0}))
+
+        # --- Audio connected (optional unless the review type needs it) ---
+        audio_started = getattr(self, "audio_pipeline", None) is not None
+        if audio_started:
+            au_status, au_detail = "pass", "Audio capture running."
+        else:
+            au_status = "fail" if require_audio else "skip"
+            au_detail = "Audio capture not started." + ("" if require_audio else " Not required for this review type.")
+        items.append(_pf_item("audio", "Audio connected", "system", au_status, au_detail,
+                              required=require_audio, value={"started": audio_started}))
+
+        # --- GPU healthy (CPU fallback exists, so optional by default) ---
+        gpu = _gpu_status()
+        if gpu.get("available"):
+            gpu_status, gpu_detail = "pass", gpu.get("detail", "GPU ready.")
+        else:
+            gpu_status = "fail" if require_gpu else "warn"
+            gpu_detail = gpu.get("detail", "No GPU detected — running on CPU.")
+        items.append(_pf_item("gpu", "GPU healthy", "system", gpu_status, gpu_detail,
+                              required=require_gpu, value=gpu))
+
+        # --- Database writable (job/session persistence) ---
+        db_ok, db_detail = _path_writable(DATA_DIR / "testing")
+        items.append(_pf_item(
+            "database", "Database writable", "system",
+            "pass" if db_ok else "fail",
+            "Job/session database directory is writable." if db_ok else db_detail,
+            required=True, value={"path": str(DATA_DIR / "testing")},
+        ))
+
+        # --- Export folder writable (report/replay outputs) ---
+        exports_dir = DATA_DIR / "exports"
+        ex_ok, ex_detail = _path_writable(exports_dir)
+        items.append(_pf_item(
+            "export_folder", "Export folder writable", "system",
+            "pass" if ex_ok else "fail",
+            "Export directory is writable." if ex_ok else ex_detail,
+            required=True, value={"path": str(exports_dir)},
+        ))
+
+        # --- Aggregate: Match ready ---
+        blocking = [it["key"] for it in items if it["required"] and it["status"] == "fail"]
+        warnings = [it["key"] for it in items if it["status"] == "warn"]
+        match_ready = not blocking
+        summary = {state: sum(1 for it in items if it["status"] == state) for state in ("pass", "warn", "fail", "skip")}
+        items.append(_pf_item(
+            "match_ready", "Match ready", "summary",
+            "pass" if match_ready else "fail",
+            "All required checks passed — cleared for live operation."
+            if match_ready else f"{len(blocking)} required check(s) failing.",
+            required=True, value={"blocking": blocking},
+        ))
+
+        return {
+            "generated_at_ms": time.time() * 1000.0,
+            "cameras_detected": detected,
+            "cameras_selected": selected,
+            "require_audio": require_audio,
+            "require_gpu": require_gpu,
+            "items": items,
+            "match_ready": match_ready,
+            "blocking": blocking,
+            "warnings": warnings,
+            "summary": summary,
+        }
+
+    def request_review(
+        self,
+        camera_ids: list[int] | None = None,
+        review_type: str = "lbw",
+        camera_roles: dict | None = None,
+        primary_camera_id: int | None = None,
+    ) -> dict:
+        review_type = str(review_type or "lbw").lower()
         replay = self.create_replay()
-        self.current_decision = {
-            **self._sample_decision("PROCESSING"),
+        # One synchronized snapshot drives the whole review — every type sees the
+        # same frames, timestamps and per-camera sync telemetry.
+        snap = self.frame_buffer.snapshot()
+        decision = {
+            **self._processing_seed(),
             "camera_ids": camera_ids or self.camera_ids,
             "replay": replay,
+            "review_type": review_type,
             "explanation": "Review initiated. Live replay buffer captured for operator analysis.",
         }
+
+        # One interface for every review type: LBW / Wide / No Ball / Edge all run
+        # through run_review(ctx). Unknown types fall through with the seeded decision.
+        try:
+            ctx = self._build_review_context(review_type, camera_roles, primary_camera_id, snap)
+            analysis = ReviewEngine.execute(review_type, ctx)
+            if analysis:
+                decision.update(analysis)
+        except Exception as exc:
+            log.warning("Review analysis failed for {}: {}", review_type, exc)
+
+        # Uniform pipeline tail: identical synchronized telemetry and the same
+        # normalised ReviewResult for every review type, so the dashboard renders
+        # LBW / Wide / No Ball / Edge through one code path.
+        decision["camera_sync"] = snap.sync_report()
+        decision["review_result"] = build_review_result(review_type, decision, replay=replay)
+        # Project the analytical geometry into the render-ready overlay payload that
+        # both the replay video and the live dashboard draw through OverlayRenderer.
+        decision["overlay"] = build_overlay_payload(decision, calibrators=self.pipeline.calibrators)
+
+        # Auto-save the whole review (json + replay + key frames) to data/reviews/.
+        primary_cam = max(snap.frames, key=lambda cid: len(snap.frames[cid]), default=None)
+        replay_frames = snap.frames.get(primary_cam, []) if primary_cam is not None else []
+        log_info = self.review_logger.log(
+            decision,
+            frames=replay_frames,
+            calibration=calibration_status_payload(),
+            frame_timestamps=snap.timestamps,
+        )
+        if log_info.get("saved"):
+            decision["log"] = {key: log_info[key] for key in ("review_id", "dir", "artifacts") if key in log_info}
+            replay_meta = log_info.get("replay") or {}
+            if replay_meta.get("available"):
+                decision["review_result"]["replay"] = {
+                    "path": replay_meta.get("path"),
+                    "frame_count": replay_meta.get("frame_count"),
+                    "duration_s": replay_meta.get("duration_s"),
+                }
+
+        self.current_decision = decision
         self._save_session()
-        return {"decision": self.current_decision, "replay": replay}
+        activity_log.record(
+            "review_requested",
+            f"{review_type.upper()} review requested",
+            review_type=review_type,
+            cameras=decision.get("camera_ids"),
+        )
+        return {"decision": decision, "replay": replay}
+
+    def _build_review_context(
+        self,
+        review_type: str,
+        camera_roles: dict | None,
+        primary_camera_id: int | None,
+        snap,
+    ) -> ReviewContext:
+        primary = None
+        if primary_camera_id is not None:
+            try:
+                primary = int(primary_camera_id)
+            except (TypeError, ValueError):
+                primary = None
+        # Same shared engine the offline path uses — only the frame source differs.
+        return ReviewEngine.build_context(
+            review_type,
+            frames=snap.frames,
+            detector=self.pipeline.detector,
+            calibrators=self.pipeline.calibrators,
+            camera_roles=normalize_roles(camera_roles),
+            primary_camera_id=primary,
+            timestamps=snap.timestamps,
+            telemetry=snap.telemetry_dict(),
+            reference_timestamp_ms=snap.reference_timestamp_ms,
+        )
 
     def confirm_decision(self, outcome: str) -> dict:
+        # Records the confirmed verdict into the current match's review history and
+        # returns it. The RESULT → IDLE transition is a separate step: the operator
+        # UI follows this with /api/decision/reset once the verdict is acknowledged.
+        # The confirmed payload IS the real analysis produced by request_review —
+        # the operator's verdict is stamped onto it, never regenerated.
         status = "OUT" if outcome == "OUT" else "NOT_OUT"
-        self.current_decision = self._sample_decision(status)
+        decision = dict(self.current_decision or {})
+        system_recommendation = decision.get("outcome")
+        decision["status"] = status
+        decision["outcome"] = "OUT" if status == "OUT" else "NOT OUT"
+        decision["confirmed_at_ms"] = time.time() * 1000.0
+        for step in decision.get("timeline") or []:
+            if step.get("status") == "active":
+                step["status"] = "complete"
+        self.current_decision = decision
         review = {
             "id": f"review_{len(self.reviews) + 1}",
-            "time": time.time() * 1000.0,
+            "time": decision["confirmed_at_ms"],
             "over": f"{len(self.reviews) + 1}.0",
-            "decision": "OUT" if status == "OUT" else "NOT OUT",
-            "confidence": self.current_decision["overall_confidence"],
+            "type": str(decision.get("review_type") or "lbw").upper(),
+            "decision": decision["outcome"],
+            "system_recommendation": system_recommendation,
+            "confidence": decision.get("overall_confidence"),
+            "review_id": (decision.get("log") or {}).get("review_id"),
+            "provenance": self._provenance(),
         }
         self.reviews.insert(0, review)
+        self._save_session()
+        activity_log.record(
+            "decision_confirmed",
+            f"Decision confirmed: {decision['outcome']}",
+            review_type=review.get("type"),
+            confidence=review.get("confidence"),
+            system_recommendation=system_recommendation,
+        )
+        return self.current_decision
+
+    def _provenance(self) -> dict:
+        """Model + calibration identity captured at confirm time, so every review
+        answers \"which model/calibration produced this?\" months later."""
+        pipeline = getattr(self, "pipeline", None)
+        detector = getattr(pipeline, "detector", None)
+        calib = calibration_status_payload()
+        return {
+            "model": getattr(detector, "active_model_name", "none"),
+            "calibrated_camera_ids": calib.get("camera_ids", []),
+            "calibration_quality": calib.get("quality_score"),
+            "camera_ids": list(self.camera_ids),
+        }
+
+    def reset_decision(self) -> dict:
+        """Return to IDLE (WAITING). Used to clear the active review after the
+        verdict is confirmed/acknowledged, or to abandon a review without a verdict.
+        The completed review (if any) already lives in self.reviews."""
+        self.current_decision = self._waiting_decision()
         self._save_session()
         return self.current_decision
 
@@ -319,6 +711,7 @@ class DRSBackend:
                 writer.write(frame)
         finally:
             writer.release()
+        activity_log.record("replay_exported", "Replay exported", path=str(path))
         return path
 
     def _draw_replay_overlay(self, frame, index: int, total: int) -> None:
@@ -340,11 +733,131 @@ class DRSBackend:
             cv2.polylines(frame, [np.asarray(pts, dtype=np.int32)], False, (40, 255, 150), 3, cv2.LINE_AA)
             cv2.circle(frame, pts[min(index, len(pts) - 1)], 7, (255, 255, 255), -1, cv2.LINE_AA)
 
+    # ------------------------------------------------------------------ match
+    @property
+    def reviews(self) -> list[dict]:
+        """Live view of the current match's review history (newest first)."""
+        return self.match["reviews"]
+
+    def _new_match(
+        self,
+        name: str | None = None,
+        teams: dict | None = None,
+        overs=None,
+        session: dict | None = None,
+    ) -> dict:
+        # A match IS the review session (Roadmap "Review Session"): it carries the
+        # operator/venue/ground/tournament context plus the model + calibration in
+        # force when it started, so every review it holds is reproducible months later.
+        session = session or {}
+        provenance = self._provenance()
+        return {
+            "id": f"match_{int(time.time() * 1000)}",
+            "name": name or "Untitled Match",
+            "teams": teams or {},
+            "overs": overs,
+            "started_at": time.time() * 1000.0,
+            "ended_at": None,
+            "session": {
+                "operator": str(session.get("operator") or "").strip() or None,
+                "tournament": str(session.get("tournament") or "").strip() or None,
+                "venue": str(session.get("venue") or "").strip() or None,
+                "ground": str(session.get("ground") or "").strip() or None,
+                "active_model": provenance.get("model"),
+                "calibration_profile": session.get("calibration_profile")
+                or (f"{len(provenance.get('calibrated_camera_ids') or [])} camera(s)"
+                    if provenance.get("calibrated_camera_ids") else None),
+                "camera_ids": provenance.get("camera_ids"),
+            },
+            "reviews": [],
+        }
+
+    def current_match(self) -> dict:
+        m = self.match
+        return {
+            "id": m["id"],
+            "name": m.get("name", "Untitled Match"),
+            "teams": m.get("teams", {}),
+            "overs": m.get("overs"),
+            "started_at": m.get("started_at"),
+            "ended_at": m.get("ended_at"),
+            "session": m.get("session", {}),
+            "reviews": m["reviews"][:50],
+            "review_count": len(m["reviews"]),
+        }
+
+    def new_match(
+        self,
+        name: str | None = None,
+        teams: dict | None = None,
+        overs=None,
+        session: dict | None = None,
+    ) -> dict:
+        """Archive the current match to Session History (if it has any reviews),
+        then start a fresh empty match/session and return to IDLE."""
+        if self.match.get("reviews"):
+            self.match["ended_at"] = time.time() * 1000.0
+            self._archive_match(self.match)
+        self.match = self._new_match(name, teams, overs, session=session)
+        self.current_decision = self._waiting_decision()
+        self._save_session()
+        sess = self.match.get("session", {})
+        activity_log.record(
+            "session_started",
+            f"Session started: {self.match.get('name')}",
+            operator=sess.get("operator"), venue=sess.get("venue"),
+            ground=sess.get("ground"), model=sess.get("active_model"),
+        )
+        return self.current_match()
+
+    def _archive_match(self, match: dict) -> None:
+        try:
+            MATCHES_DIR.mkdir(parents=True, exist_ok=True)
+            archived = {**match, "archived_at": time.time() * 1000.0}
+            (MATCHES_DIR / f"{match['id']}.json").write_text(json.dumps(archived, indent=2), encoding="utf-8")
+        except Exception as exc:
+            log.warning("Could not archive match {}: {}", match.get("id"), exc)
+
+    def list_matches(self) -> list[dict]:
+        """Session History — archived matches, newest first (read-only summaries)."""
+        out: list[dict] = []
+        if MATCHES_DIR.exists():
+            for path in MATCHES_DIR.glob("match_*.json"):
+                try:
+                    m = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                session = m.get("session", {}) or {}
+                out.append({
+                    "id": m.get("id"),
+                    "name": m.get("name", "Untitled Match"),
+                    "started_at": m.get("started_at"),
+                    "ended_at": m.get("ended_at"),
+                    "archived_at": m.get("archived_at"),
+                    "operator": session.get("operator"),
+                    "venue": session.get("venue"),
+                    "ground": session.get("ground"),
+                    "active_model": session.get("active_model"),
+                    "review_count": len(m.get("reviews", [])),
+                })
+        out.sort(key=lambda x: x.get("archived_at") or 0, reverse=True)
+        return out
+
+    def get_match(self, match_id: str) -> dict | None:
+        path = MATCHES_DIR / f"{match_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    # ---------------------------------------------------------------- session
     def _save_session(self) -> None:
         try:
             SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
             SESSION_PATH.write_text(
-                json.dumps({"reviews": self.reviews[:50], "current_decision": self.current_decision}, indent=2),
+                json.dumps({"current_match": self.match, "current_decision": self.current_decision}, indent=2),
                 encoding="utf-8",
             )
         except Exception as exc:
@@ -355,10 +868,29 @@ class DRSBackend:
             return
         try:
             data = json.loads(SESSION_PATH.read_text(encoding="utf-8"))
-            self.reviews = list(data.get("reviews", []))
-            self.current_decision = data.get("current_decision") or self.current_decision
         except Exception as exc:
             log.warning("Could not load desktop session: {}", exc)
+            return
+        # The MATCH resumes across restarts (name/teams/overs + review history), so a
+        # crash mid-innings continues where it left off.
+        if isinstance(data.get("current_match"), dict):
+            self.match = data["current_match"]
+            self.match.setdefault("reviews", [])
+        elif "reviews" in data:  # migrate a legacy flat review list into a resumed match
+            self.match = self._new_match(name="Resumed Match")
+            self.match["reviews"] = list(data.get("reviews", []))
+        # The ACTIVE REVIEW never resumes: every launch starts IDLE (WAITING) so the
+        # operator sees "Request Review". If a review was in flight when the app closed,
+        # record it as INTERRUPTED rather than silently dropping or resuming it.
+        prev = data.get("current_decision") or {}
+        if prev.get("status") not in (None, "WAITING"):
+            self.match["reviews"].insert(0, {
+                "id": f"review_{len(self.match['reviews']) + 1}",
+                "time": time.time() * 1000.0,
+                "over": "--",
+                "decision": "INTERRUPTED",
+                "confidence": None,
+            })
 
     def _waiting_decision(self) -> dict:
         return {
@@ -416,38 +948,40 @@ class DRSBackend:
             log.debug("Pipeline tick skipped: {}", exc)
             self._last_detection = None
 
-    def _sample_decision(self, status: str) -> dict:
-        trajectory = [
-            {"x": -8.0 + index * 0.45, "y": math.sin(index * 0.16) * 0.18, "z": max(0.05, 1.2 - index * 0.035)}
-            for index in range(34)
-        ]
+    def _processing_seed(self) -> dict:
+        """Honest placeholder for a just-requested review. The review engine fills in
+        whatever it can actually measure; every field here is null/empty so the
+        dashboard shows "--" rather than a fabricated impact point, speed, wicket call
+        or confidence. (This replaces the old `_sample_decision`, which injected a fixed
+        sine trajectory + 0.88 confidences + 128.4 km/h that leaked to the operator as
+        if they were real analysis when the live pipeline couldn't measure them.)"""
         return {
-            "status": status,
-            "outcome": "OUT" if status == "OUT" else "NOT OUT" if status == "NOT_OUT" else "Processing review",
-            "overall_confidence": 0.88 if status in {"OUT", "NOT_OUT"} else 0.45,
-            "ball_confidence": 0.91,
-            "tracking_confidence": 0.86,
-            "calibration_confidence": 0.84,
-            "prediction_confidence": 0.82,
-            "model_confidence": 0.9,
-            "impact_point": {"x": 0.1, "y": 0.02, "z": 0.36},
-            "impact_marker": {"x": 0.1, "y": 0.02, "z": 0.36},
-            "bounce_point": {"x": -2.2, "y": 0.05, "z": 0.02},
-            "wicket_zone_status": "HITTING" if status == "OUT" else "MISSING",
-            "wicket_prediction": {"collision": {"x": 7.1, "y": 0.02, "z": 0.42}, "umpire_call": False},
-            "ball_speed_kmh": 128.4,
-            "trajectory": trajectory,
-            "predicted_extension": trajectory[-8:],
+            "status": "PROCESSING",
+            "outcome": "Processing review",
+            "overall_confidence": None,
+            "ball_confidence": None,
+            "tracking_confidence": None,
+            "calibration_confidence": None,
+            "prediction_confidence": None,
+            "model_confidence": None,
+            "impact_point": None,
+            "impact_marker": None,
+            "bounce_point": None,
+            "wicket_zone_status": "--",
+            "wicket_prediction": None,
+            "ball_speed_kmh": None,
+            "trajectory": [],
+            "predicted_extension": [],
             "timeline": [
                 {"label": "Appeal", "status": "complete"},
-                {"label": "Ball detected", "status": "complete"},
-                {"label": "Bounce detected", "status": "complete"},
-                {"label": "Impact detected", "status": "complete"},
-                {"label": "Decision generated", "status": "active" if status == "PROCESSING" else "complete"},
+                {"label": "Ball detected", "status": "pending"},
+                {"label": "Bounce detected", "status": "pending"},
+                {"label": "Impact detected", "status": "pending"},
+                {"label": "Decision generated", "status": "active"},
             ],
             "edge_analysis": {"edge_probability": 0.0, "events": []},
             "hotspot_analysis": {"contact_detected": False, "reason": "No contact heatmap for LBW review."},
-            "explanation": "Live prototype decision package generated from current replay buffer.",
+            "explanation": "Analyzing the captured replay buffer…",
         }
 
 
@@ -496,6 +1030,21 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
     def system_health() -> dict:
         return backend.system_health()
 
+    @app.get("/api/system/info")
+    def system_info_route() -> dict:
+        return system_info()
+
+    @app.get("/api/preflight")
+    def preflight(
+        cameras: str | None = Query(default=None, description="Comma-separated camera ids in use"),
+        require_audio: bool = Query(default=False),
+        require_gpu: bool = Query(default=False),
+    ) -> dict:
+        selected: list[int] | None = None
+        if cameras:
+            selected = [int(part) for part in cameras.split(",") if part.strip().lstrip("-").isdigit()]
+        return backend.preflight_checklist(selected, require_audio, require_gpu)
+
     @app.get("/api/calibration/status")
     async def calibration_status() -> dict:
         return calibration_status_payload()
@@ -512,10 +1061,27 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
             raise HTTPException(status_code=422, detail=f"Missing markers: {required - set(markers.keys())}")
         calibrator = ManualPitchCalibrator()
         profile = calibrator.save_profile(camera_id, markers, image_size)
+        activity_log.record(
+            "calibration_saved",
+            f"Calibration saved for camera {camera_id}",
+            camera_id=camera_id,
+            homography_error_cm=profile.homography_error_cm,
+        )
         return {
             "status": "saved",
             "camera_id": camera_id,
             "homography_error_cm": profile.homography_error_cm,
+        }
+
+    @app.delete("/api/calibration/cameras/{camera_id}")
+    async def delete_camera_calibration(camera_id: int) -> dict:
+        """Remove a saved per-camera pitch calibration profile."""
+        from core.pitch_calibration import ManualPitchCalibrator
+        deleted = ManualPitchCalibrator().delete_profile(camera_id)
+        return {
+            "deleted": deleted,
+            "camera_id": camera_id,
+            "status": calibration_status_payload(),
         }
 
     @app.post("/api/calibration/verify")
@@ -535,6 +1101,75 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
             "world_mm": {"lateral_mm": result[0], "along_mm": result[1]},
         }
 
+    @app.get("/api/calibration/profiles")
+    async def calibration_profiles() -> dict:
+        """List saved per-camera pitch profiles for the wizard cards + health summary."""
+        from core.pitch_calibration import ManualPitchCalibrator
+        calibrator = ManualPitchCalibrator()
+        profiles = []
+        for profile in calibrator.list_profiles():
+            error_cm = profile.homography_error_cm
+            profiles.append({
+                "camera_id": profile.camera_id,
+                "name": f"Camera {profile.camera_id}",
+                "camera": f"Cam {profile.camera_id}",
+                "homography_error_cm": error_cm,
+                "quality": _calibration_quality(error_cm),
+                "marker_count": len(profile.markers),
+                "image_size": list(profile.image_size),
+                "updated_at": profile.updated_at,
+                "markers": profile.markers,
+            })
+        return {"profiles": profiles, "configured_cameras": backend.camera_ids}
+
+    @app.post("/api/calibration/compute")
+    async def compute_calibration(body: dict = Body(...)) -> dict:
+        """Solve the homography from markers WITHOUT persisting — live quality preview."""
+        from core.pitch_calibration import ManualPitchCalibrator
+        markers = body.get("markers", {})
+        required = {"off_stump", "middle_stump", "leg_stump", "bowling_crease", "popping_crease"}
+        missing = required - set(markers.keys())
+        if missing:
+            raise HTTPException(status_code=422, detail=f"Missing markers: {sorted(missing)}")
+        try:
+            homography, error_cm = ManualPitchCalibrator().compute_homography(markers)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        return {
+            "homography": homography,
+            "homography_error_cm": error_cm,
+            "quality": _calibration_quality(error_cm),
+        }
+
+    @app.post("/api/calibration/auto-detect")
+    async def auto_detect_calibration(body: dict = Body(default_factory=dict)) -> dict:
+        """Propose a draggable marker template scaled to the frame.
+
+        Real stump/crease detection needs a trained model; until then this returns a
+        sensible pitch-shaped starting layout the operator nudges onto the markers.
+        """
+        image_size = body.get("image_size") or [1280, 720]
+        try:
+            width, height = int(image_size[0]), int(image_size[1])
+        except (TypeError, ValueError, IndexError):
+            width, height = 1280, 720
+        cx = width * 0.5
+        stump_y = height * 0.46
+        half = width * 0.045  # off/leg spread either side of middle
+        markers = {
+            "off_stump": {"x": round(cx - half, 1), "y": round(stump_y, 1)},
+            "middle_stump": {"x": round(cx, 1), "y": round(stump_y, 1)},
+            "leg_stump": {"x": round(cx + half, 1), "y": round(stump_y, 1)},
+            "bowling_crease": {"x": round(cx, 1), "y": round(height * 0.5, 1)},
+            "popping_crease": {"x": round(cx, 1), "y": round(height * 0.63, 1)},
+        }
+        return {
+            "markers": markers,
+            "method": "template",
+            "confidence": 0.0,
+            "note": "Proposed positions — drag each numbered marker onto the real stump base or crease line.",
+        }
+
     @app.get("/api/decision/current")
     def decision_current() -> dict:
         return backend.current_decision
@@ -543,9 +1178,13 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
     def decision_confirm(payload: dict = Body(default_factory=dict)) -> dict:
         return backend.confirm_decision(str(payload.get("outcome", "NOT_OUT")).upper())
 
+    @app.post("/api/decision/reset")
+    def decision_reset() -> dict:
+        return backend.reset_decision()
+
     @app.get("/api/reviews")
-    def reviews() -> list:
-        return backend.reviews
+    def reviews() -> dict:
+        return {"reviews": backend.reviews}
 
     @app.get("/api/reviews/{review_id}")
     def review_by_id(review_id: str) -> dict:
@@ -554,18 +1193,100 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
                 return review
         raise HTTPException(status_code=404, detail="Unknown review")
 
+    @app.get("/api/match/current")
+    def match_current() -> dict:
+        return backend.current_match()
+
+    @app.post("/api/match/new")
+    def match_new(payload: dict = Body(default_factory=dict)) -> dict:
+        name = str(payload.get("name") or "").strip() or None
+        # Session provenance travels either at the top level or under "session".
+        session = payload.get("session") if isinstance(payload.get("session"), dict) else {
+            key: payload.get(key)
+            for key in ("operator", "tournament", "venue", "ground", "calibration_profile")
+            if payload.get(key) is not None
+        }
+        return backend.new_match(
+            name=name,
+            teams=payload.get("teams"),
+            overs=payload.get("overs"),
+            session=session,
+        )
+
+    @app.get("/api/matches")
+    def matches_history() -> dict:
+        return {"matches": backend.list_matches()}
+
+    @app.get("/api/activity")
+    def activity(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+        return {"events": activity_log.recent(limit)}
+
+    @app.get("/api/matches/{match_id}")
+    def match_by_id(match_id: str) -> dict:
+        match = backend.get_match(match_id)
+        if match is None:
+            raise HTTPException(status_code=404, detail="Unknown match")
+        return match
+
+    @app.get("/api/review-types")
+    def review_types() -> dict:
+        """Capability contract for every registered review module. The dashboard
+        builds its review-type registry (labels, camera role, timeline stages,
+        evidence, replay mode, decision-card rows) from THIS — one source of truth,
+        so adding a module never requires re-declaring it in the renderer."""
+        from core.review_modules import describe_types
+
+        return {"types": describe_types()}
+
+    @app.get("/api/camera-roles")
+    def camera_roles_catalog() -> dict:
+        """Canonical camera roles (with icons) for the calibration role picker."""
+        from core.camera_roles import role_catalog
+        return {"roles": role_catalog()}
+
     @app.post("/api/appeal/request")
     def appeal_request(payload: dict = Body(default_factory=dict)) -> dict:
         camera_ids = payload.get("camera_ids") or backend.camera_ids
         if not isinstance(camera_ids, list):
             raise HTTPException(status_code=400, detail="camera_ids must be a list")
-        # Run full DRS appeal analysis on buffered frames
-        try:
-            analysis = backend.pipeline.run_appeal_analysis()
-            backend.current_decision.update(analysis)
-        except Exception as exc:
-            log.warning("Appeal analysis failed: {}", exc)
-        return backend.request_review([int(camera_id) for camera_id in camera_ids])
+        review_type = str(payload.get("review_type", "lbw")).lower()
+        camera_roles = payload.get("camera_roles") if isinstance(payload.get("camera_roles"), dict) else None
+        primary_camera_id = payload.get("primary_camera_id")
+        # The review engine runs the right analysis for the active review type and
+        # merges its output (wide_analysis / no_ball_analysis / ...) into the decision.
+        result = backend.request_review(
+            [int(camera_id) for camera_id in camera_ids],
+            review_type=review_type,
+            camera_roles=camera_roles,
+            primary_camera_id=primary_camera_id,
+        )
+        # LBW appeals additionally run the CANONICAL decision/replay pipeline — the exact
+        # same code path the Testing page uses (ONE implementation, no dashboard copy).
+        # The captured live-replay clip becomes a canonical job; the dashboard then polls
+        # the same /api/analyze/{id}/results and plays the same replay exports.
+        decision = result.get("decision") or {}
+        if review_type == "lbw":
+            clip = ((decision.get("review_result") or {}).get("replay") or {}).get("path")
+            if clip and Path(clip).is_file():
+                import threading
+                import uuid as _uuid
+
+                from core.testing_api import _run_job, db as testing_db
+                from core.testing_pipeline import AnalysisOptions
+
+                job_id = _uuid.uuid4().hex[:12]
+                testing_db.create_job(job_id, "1_camera", {"source": "live_appeal"}, str(clip), None)
+                threading.Thread(
+                    target=_run_job,
+                    args=(job_id, [Path(clip)], AnalysisOptions(use_calibration=False)),
+                    daemon=True,
+                ).start()
+                decision["canonical_job_id"] = job_id
+            else:
+                # honesty rule: never fabricate — say exactly why there is no replay
+                decision["canonical_job_id"] = None
+                decision["canonical_skip_reason"] = "no live replay clip captured for this appeal"
+        return result
 
     @app.get("/api/animation/trajectory")
     async def get_trajectory_animation() -> dict:
@@ -577,6 +1298,10 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
             "has_data": trajectory is not None,
             "decision_status": decision.get("status", "WAITING"),
         }
+
+    @app.get("/api/analysis-mode")
+    def get_analysis_mode() -> dict:
+        return backend.analysis_mode
 
     @app.post("/api/analysis-mode")
     def analysis_mode(payload: dict = Body(default_factory=dict)) -> dict:
@@ -774,20 +1499,185 @@ async def mjpeg_generator(backend: DRSBackend, camera_id: int):
 
 
 async def _watchdog_loop(backend: DRSBackend) -> None:
+    # Remember each camera's last known connected state so the activity log records
+    # transitions (connect/disconnect) rather than spamming an event every second.
+    last_connected: dict[int, bool] = {}
     while True:
         health = backend.camera_status()
         offline = [item for item in health["cameras"] if item["health_score"] < 0.35]
         if offline:
             log.warning("Camera watchdog detected unhealthy cameras: {}", [item["id"] for item in offline])
+        for item in health["cameras"]:
+            cid = item["id"]
+            connected = bool(item["connected"])
+            if cid in last_connected and last_connected[cid] != connected:
+                if connected:
+                    activity_log.record("camera_connected", f"Camera {cid} connected", camera_id=cid)
+                else:
+                    activity_log.record("camera_disconnected", f"Camera {cid} disconnected", camera_id=cid)
+            last_connected[cid] = connected
         if backend.active_replay is not None:
             backend.active_replay.tick()
         await asyncio.sleep(1.0)
 
 
+def _attach_testing_platform_routes(app: FastAPI) -> int:
+    """Fold the offline testing-platform routes into the single canonical backend.
+
+    This is what makes the Electron app talk to ONE API: the real dashboard /
+    review-engine / 5-marker-calibration routes defined above stay authoritative,
+    and only the routes unique to the upload/testing platform (jobs, analyze,
+    uploads, exports, per-camera snapshot calibration, and their websockets) are
+    pulled in. Anything this app already defines is left untouched, so there is
+    exactly one handler per (path, method) — keyed on the method too, so a GET the
+    core app owns does not shadow the testing platform's POST on the same path.
+    """
+    try:
+        from core.testing_api import create_testing_app
+        testing_app = create_testing_app()
+    except Exception as exc:  # never let the testing platform break the core API
+        log.warning("Testing-platform routes unavailable; serving core API only: {}", exc)
+        return 0
+
+    def route_keys(route) -> list[tuple[str, str]]:
+        path = getattr(route, "path", None)
+        if not path:
+            return []
+        methods = getattr(route, "methods", None)
+        if not methods:  # websocket routes carry no HTTP methods
+            return [(path, "WS")]
+        return [(path, method) for method in methods]
+
+    existing: set[tuple[str, str]] = set()
+    for route in app.router.routes:
+        existing.update(route_keys(route))
+
+    def is_ws_catchall(route) -> bool:
+        # The core app's /ws/{channel} matches ANY single /ws/<x> segment. Starlette
+        # matches routes in list order, so a literal /ws/review appended AFTER it is
+        # never reached (it 403'd). Literal /ws/... routes must sit before the catch-all.
+        path = getattr(route, "path", "") or ""
+        return path.startswith("/ws/") and "{" in path
+
+    added = 0
+    for route in testing_app.router.routes:
+        path = getattr(route, "path", None)
+        if not path or not (path.startswith("/api/") or path.startswith("/ws/")):
+            continue
+        keys = route_keys(route)
+        if any(key in existing for key in keys):
+            continue
+        if path.startswith("/ws/") and "{" not in path:
+            insert_at = next(
+                (i for i, r in enumerate(app.router.routes) if is_ws_catchall(r)),
+                len(app.router.routes),
+            )
+            app.router.routes.insert(insert_at, route)
+        else:
+            app.router.routes.append(route)
+        existing.update(keys)
+        added += 1
+    log.info("Unified backend: attached {} testing-platform routes", added)
+    return added
+
+
+def create_unified_app(camera_ids: list[int] | None = None, record: bool = False) -> FastAPI:
+    """The single backend the Electron app and the test suite talk to.
+
+    It is the live camera + review-engine + 5-marker-calibration API from
+    create_app(), with the offline upload/testing-platform routes (jobs, analyze,
+    uploads, exports, per-camera snapshot calibration) folded in on top. Every path
+    has exactly one handler: the core API is authoritative and only routes it does
+    not already define are pulled in from the testing platform.
+    """
+    app = create_app(camera_ids or list(CAMERA_IDS), record=record)
+    _attach_testing_platform_routes(app)
+
+    # The testing platform's own startup (stale-job recovery, capturing the serving
+    # loop for cross-thread WS broadcasts, the system broadcast loop) only ran under
+    # its standalone lifespan. In the unified app that lifespan was dropped, so wrap
+    # the core lifespan to run both — core first, then testing on top.
+    core_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def unified_lifespan(a: FastAPI) -> AsyncIterator[None]:
+        try:
+            from core import testing_api
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Testing-platform lifespan unavailable: {}", exc)
+            testing_api = None
+        async with core_lifespan(a):
+            if testing_api is not None:
+                await testing_api.start_background_services()
+            try:
+                yield
+            finally:
+                if testing_api is not None:
+                    await testing_api.stop_background_services()
+
+    app.router.lifespan_context = unified_lifespan
+    return app
+
+
 def run_api(camera_ids: list[int], record: bool, host: str, port: int) -> None:
     import uvicorn
 
-    uvicorn.run(create_app(camera_ids, record=record), host=host, port=port, log_level="info")
+    app = create_unified_app(camera_ids, record=record)
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+def _pf_item(
+    key: str,
+    label: str,
+    group: str,
+    status: str,
+    detail: str,
+    required: bool = True,
+    value: dict | None = None,
+) -> dict:
+    """One preflight checklist row. `status` is pass|warn|fail|skip."""
+    return {
+        "key": key,
+        "label": label,
+        "group": group,
+        "status": status,
+        "detail": detail,
+        "required": required,
+        "value": value or {},
+    }
+
+
+def _gpu_status() -> dict:
+    """Best-effort GPU probe via torch. PyTorch/CUDA absence is reported truthfully
+    but never raises — the detector falls back to CPU, so a missing GPU is a warning,
+    not a hard failure, unless the operator explicitly requires one."""
+    try:
+        import torch
+    except Exception:
+        return {"available": False, "percent": None, "device": None,
+                "detail": "PyTorch not installed — running on CPU."}
+    try:
+        if not torch.cuda.is_available():
+            return {"available": False, "percent": None, "device": None,
+                    "detail": "No CUDA device detected — running on CPU."}
+        index = torch.cuda.current_device()
+        name = torch.cuda.get_device_name(index)
+        used_percent = None
+        free_gb = total_gb = None
+        try:
+            free, total = torch.cuda.mem_get_info(index)
+            if total:
+                used_percent = round(1.0 - free / total, 3)
+                free_gb = round(free / (1024 ** 3), 2)
+                total_gb = round(total / (1024 ** 3), 2)
+        except Exception:
+            pass
+        return {"available": True, "percent": used_percent, "device": name,
+                "memory_free_gb": free_gb, "memory_total_gb": total_gb,
+                "detail": f"{name} ready."}
+    except Exception as exc:  # noqa: BLE001 - driver mismatch etc. must not crash the probe
+        return {"available": False, "percent": None, "device": None,
+                "detail": f"GPU probe failed: {exc}"}
 
 
 def _cpu_percent() -> float:
@@ -816,6 +1706,81 @@ def _free_gb(path: Path) -> float:
         return round(usage.free / (1024**3), 2)
     except Exception:
         return 0.0
+
+
+def _path_writable(path: Path) -> tuple[bool, str]:
+    """True if we can create+write a file under `path` (creating it if needed).
+    Used by the preflight checklist so 'Database/Export writable' is a real probe,
+    not an assumption."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True, "writable"
+    except Exception as exc:
+        return False, f"Not writable: {exc}"
+
+
+def system_info() -> dict:
+    """Static/slow-changing environment facts for the System page: runtime versions,
+    disk, memory, database size, git commit, and config summary. Everything an
+    operator needs to answer 'what exactly is this machine running?'."""
+    import platform
+    import sys
+
+    def _ver(module_name: str) -> str | None:
+        try:
+            mod = __import__(module_name)
+            return getattr(mod, "__version__", None)
+        except Exception:
+            return None
+
+    cuda = None
+    torch_ver = _ver("torch")
+    try:
+        import torch
+
+        cuda = torch.version.cuda if torch.cuda.is_available() else None
+    except Exception:
+        cuda = None
+
+    db_path = DATA_DIR / "testing" / "drs_testing.sqlite3"
+    db_size_mb = round(db_path.stat().st_size / (1024**2), 2) if db_path.exists() else 0.0
+
+    # Git commit if a working repo exists (the local .git may be broken/absent — then None).
+    git_commit = None
+    try:
+        head = DATA_DIR.parent / ".git" / "HEAD"
+        if head.exists():
+            ref = head.read_text(encoding="utf-8").strip()
+            if ref.startswith("ref:"):
+                ref_path = DATA_DIR.parent / ".git" / ref.split(" ", 1)[1].strip()
+                if ref_path.exists():
+                    git_commit = ref_path.read_text(encoding="utf-8").strip()[:10]
+            else:
+                git_commit = ref[:10]
+    except Exception:
+        git_commit = None
+
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "torch": torch_ver,
+        "cuda": cuda,
+        "opencv": _ver("cv2"),
+        "numpy": _ver("numpy"),
+        "ultralytics": _ver("ultralytics"),
+        "fastapi": _ver("fastapi"),
+        "executable": sys.executable,
+        "gpu": _gpu_status(),
+        "cpu_percent": round(_cpu_percent() * 100, 1),
+        "ram_percent": round(_ram_percent() * 100, 1),
+        "disk_free_gb": _free_gb(DATA_DIR),
+        "database": {"path": str(db_path), "size_mb": db_size_mb, "exists": db_path.exists()},
+        "git_commit": git_commit,
+        "data_dir": str(DATA_DIR),
+    }
 
 
 def main() -> None:

@@ -21,6 +21,7 @@ from config.settings import (
     FRAME_WIDTH,
     RECORDINGS_DIR,
     SYNC_TOLERANCE_MS,
+    SYNTHETIC_CAMERAS,
     TARGET_FPS,
     VIDEO_CODEC,
     VIDEO_EXT,
@@ -74,8 +75,14 @@ class CameraWorker(threading.Thread):
         while not self._stop_event.is_set():
             if not self._open_capture():
                 if not self.synthetic_on_fail:
-                    log.error("Camera {} is unavailable", self.camera_id)
-                    return
+                    # No synthetic fallback: stay alive but produce no frames, so
+                    # the camera reports as "not connected". Retry quietly in case
+                    # a camera is plugged in later.
+                    self.synthetic = False
+                    self.last_error = "not_connected"
+                    if self._stop_event.wait(1.5):
+                        break
+                    continue
                 log.warning("Camera {} unavailable; using synthetic feed while retrying", self.camera_id)
                 self.synthetic = True
                 self._run_synthetic_until_retry(started)
@@ -251,9 +258,11 @@ class ReplayController:
 class CameraManager:
     """Facade for capture, replay buffering, synchronized recording, and health."""
 
-    def __init__(self, camera_ids: Optional[list[int]] = None, record: bool = False):
+    def __init__(self, camera_ids: Optional[list[int]] = None, record: bool = False,
+                 synthetic_on_fail: Optional[bool] = None):
         self.camera_ids = camera_ids or CAMERA_IDS
         self.record = record
+        self.synthetic_on_fail = SYNTHETIC_CAMERAS if synthetic_on_fail is None else synthetic_on_fail
         self.workers: dict[int, CameraWorker] = {}
         self.writer: Optional[SyncVideoWriter] = None
         self.synchronizer = Synchronizer()
@@ -265,7 +274,7 @@ class CameraManager:
         for camera_id in self.camera_ids:
             if camera_id in self.workers and self.workers[camera_id].is_alive():
                 continue
-            worker = CameraWorker(camera_id, buffer_frames)
+            worker = CameraWorker(camera_id, buffer_frames, synthetic_on_fail=self.synthetic_on_fail)
             self.workers[camera_id] = worker
             worker.start()
         if self.record:
@@ -374,7 +383,7 @@ class CameraManager:
             old_worker.stop()
             old_worker.join(timeout=2.0)
         buffer_frames = int(BUFFER_SECONDS * TARGET_FPS)
-        new_worker = CameraWorker(camera_id, buffer_frames)
+        new_worker = CameraWorker(camera_id, buffer_frames, synthetic_on_fail=self.synthetic_on_fail)
         self.workers[camera_id] = new_worker
         new_worker.start()
         log.info("Camera {} restarted", camera_id)

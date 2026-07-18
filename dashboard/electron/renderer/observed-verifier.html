@@ -1,0 +1,57 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Observed Trajectory — standalone verifier</title>
+<!--
+  Second consumer of the SAME ObservedTrajectoryRenderer used by the Testing page, so the
+  two overlays can't drift apart. Local dev tool: drop a delivery clip + its observation
+  JSON (results.trajectory.observed) and inspect the tracked path over the raw video.
+-->
+<style>
+  body{background:#0b120e;color:#e6efe8;font:14px system-ui,"Segoe UI",sans-serif;margin:0;padding:22px}
+  h2{margin:0 0 4px} .muted{color:#86a091;margin:0 0 16px}
+  .row{display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  .stage{position:relative;width:960px;max-width:100%;background:#000;border-radius:8px;overflow:hidden}
+  video{width:960px;max-width:100%;display:block} canvas{position:absolute;inset:0;pointer-events:auto;cursor:crosshair}
+  #ctl{display:flex;gap:16px;margin:12px 0;flex-wrap:wrap} label{display:inline-flex;gap:6px;align-items:center;cursor:pointer}
+  #info{font-family:ui-monospace,Menlo,monospace;color:#86a091;font-size:12.5px}
+  input[type=file]{color:#cfe6d6}
+</style></head>
+<body>
+  <h2>Observed Trajectory — standalone verifier</h2>
+  <p class="muted">Uses the same <code>ObservedTrajectoryRenderer</code> as the Testing page. Video is master; the overlay is passive.</p>
+  <div class="row">
+    <label>Delivery clip <input id="vfile" type="file" accept="video/mp4,video/*"></label>
+    <label>Observation JSON <input id="ofile" type="file" accept=".json,application/json"></label>
+  </div>
+  <div class="stage"><video id="v" muted playsinline controls></video><canvas id="c"></canvas></div>
+  <div id="ctl">
+    <label><input type="checkbox" data-layer="centres" checked> Ball centres</label>
+    <label><input type="checkbox" data-layer="trajectory" checked> Trajectory</label>
+    <label><input type="checkbox" data-layer="confidence"> Confidence colour</label>
+    <label><input type="checkbox" data-layer="impact"> Impact marker</label>
+  </div>
+  <div id="info">Load a clip and its observation JSON.</div>
+<script type="module">
+import { ObservedTrajectoryRenderer } from "./components/ObservedTrajectoryRenderer.js";
+const v = document.getElementById("v"), c = document.getElementById("c"), info = document.getElementById("info");
+const r = new ObservedTrajectoryRenderer(c);
+let obs = null, fps = 30;
+r.onPick = (p) => { v.currentTime = p.frame_id / fps;
+  info.textContent = `Frame ${p.frame_id} · conf ${Number(p.confidence).toFixed(2)} · x=${Math.round(p.x_px)} y=${Math.round(p.y_px)} · ${p.real ? "observed" : "gap-fill"}`; };
+document.getElementById("vfile").onchange = (e) => { const f = e.target.files[0]; if (f) v.src = URL.createObjectURL(f); };
+document.getElementById("ofile").onchange = async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  obs = JSON.parse(await f.text());
+  fps = Number(obs.fps) || 30;
+  if (v.videoWidth) apply();
+};
+v.addEventListener("loadedmetadata", () => { if (obs) apply(); });
+function apply(){ const o = obs.observed || obs;
+  r.setObservation({ points: o.points, display_end_frame: o.display_end_frame,
+    videoW: v.videoWidth, videoH: v.videoHeight, impactFrame: obs.impactFrame ?? o.display_end_frame });
+  r.resize(v.clientWidth, v.clientHeight);
+  info.textContent = `${o.points.length} tracked points · display ends at frame ${o.display_end_frame ?? "—"} (${o.end_reason || ""})`; }
+(function loop(){ if (v.clientWidth && (v.clientWidth !== r.cssW || v.clientHeight !== r.cssH)) r.resize(v.clientWidth, v.clientHeight);
+  r.draw(Math.round(v.currentTime * fps)); requestAnimationFrame(loop); })();
+document.querySelectorAll("[data-layer]").forEach(cb => cb.onchange = () => r.setLayers({ [cb.dataset.layer]: cb.checked }));
+</script>
+</body></html>

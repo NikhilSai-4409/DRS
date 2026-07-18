@@ -1,0 +1,25 @@
+[
+  {
+    "time": "2026-07-04T16:34:33",
+    "action": "archive",
+    "model": "C:\\Users\\nikhi\\OneDrive\\Desktop\\DRS\\models\\cricket_ball_yolo11l_real_smoke.pt",
+    "dest": "C:\\Users\\nikhi\\OneDrive\\Desktop\\DRS\\models\\archive\\cricket_ball_yolo11l_real_smoke.pt"
+  },
+  {
+    "time": "2026-07-04T16:35:13",
+    "action": "delete",
+    "model": "C:\\Users\\nikhi\\OneDrive\\Desktop\\DRS\\models\\archive\\cricket_ball_yolo11l_real_smoke.pt"
+  },
+  {
+    "time": "2026-07-14T01:49:18",
+    "action": "promote",
+    "model": "ball_v5.pt",
+    "replaced": "ball_v5",
+    "validation_score": null,
+    "dataset": "Extracted Frames/0_MP4",
+    "epochs": 100,
+    "reason": "ball_v5: 98% detection on Delivery007, clean vertical path",
+    "by": "assistant",
+    "archived_previous": "best_20260714_014918.pt"
+  }
+]

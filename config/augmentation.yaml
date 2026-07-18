@@ -1,0 +1,31 @@
+# Configurable augmentation pipeline for DRS detector training.
+#
+# Each augmentation has an `enabled` toggle and a `magnitude`. Geometric and
+# core photometric augmentations are applied natively by the Ultralytics trainer
+# (training reads this file via training/augmentation.py). The photometric
+# "extras" (contrast, gamma, blur, noise, shadow) require the optional
+# `albumentations` package and are exposed for offline augmentation.
+
+# --- Geometric (native) ---
+scale:            {enabled: true,  magnitude: 0.35}    # +/- zoom fraction
+rotation:         {enabled: true,  magnitude: 2.0}     # degrees
+perspective:      {enabled: false, magnitude: 0.0005}
+horizontal_shift: {enabled: true,  magnitude: 0.04}    # translate fraction (x)
+vertical_shift:   {enabled: true,  magnitude: 0.04}    # translate fraction (y)
+random_crop:      {enabled: false, magnitude: 0.1}     # crop jitter fraction
+mosaic:           {enabled: true,  magnitude: 0.65}    # probability
+mixup:            {enabled: true,  magnitude: 0.05}    # probability
+horizontal_flip:  {enabled: true,  magnitude: 0.5}     # probability
+
+# --- Photometric (native HSV) ---
+brightness:       {enabled: true,  magnitude: 0.35}    # hsv value jitter
+hue:              {enabled: true,  magnitude: 0.015}   # hsv hue jitter
+saturation:       {enabled: true,  magnitude: 0.55}    # hsv saturation jitter
+
+# --- Photometric extras (require albumentations; offline) ---
+contrast:         {enabled: false, magnitude: 0.2}
+gamma:            {enabled: false, magnitude: 0.2}
+motion_blur:      {enabled: false, magnitude: 7}       # max kernel size (odd)
+gaussian_blur:    {enabled: false, magnitude: 3}       # max kernel size (odd)
+noise:            {enabled: false, magnitude: 0.02}    # variance fraction
+shadow:           {enabled: false, magnitude: 0.5}     # probability

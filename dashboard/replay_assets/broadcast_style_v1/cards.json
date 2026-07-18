@@ -1,0 +1,11 @@
+{
+  "_comment": "Glossy left-column cards, shared across all shots. Content is per-decision.",
+  "left": 70, "top": 0, "width": 430,
+  "cards": [
+    { "label": "ORIGINAL DECISION", "status": "NOT OUT", "tone": "green" },
+    { "gap": 360 },
+    { "label": "WICKETS", "status": "HITTING", "tone": "red" },
+    { "label": "IMPACT", "status": "IN-LINE", "tone": "red" },
+    { "label": "PITCHING", "status": "OUTSIDE OFF", "tone": "red" }
+  ]
+}

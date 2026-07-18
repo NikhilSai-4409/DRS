@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ from config.settings import (
     PITCH_WIDTH_M,
     STUMP_WIDTH_M,
 )
+from core.calibration_paths import get_intrinsics_path, get_legacy_path, get_pose_path
 from utils.helpers import load_json, save_json
 
 MARKER_KEYS = (
@@ -28,6 +29,22 @@ MARKER_KEYS = (
 )
 
 READINESS_PATH = CALIBRATION_DIR / "readiness.json"
+
+# The manual pitch profile used to share ``calibration_<id>.json`` with camera
+# intrinsics, so the two overwrote each other. It now writes ``pose_<id>.json``;
+# ``calibration_<id>.json`` is read only for backward compatibility.
+_POSE_MIGRATION_NOTIFIED: set[str] = set()
+
+
+def _notify_pose_migration(camera_id: int, legacy: Path, new: Path) -> None:
+    key = str(camera_id)
+    if key in _POSE_MIGRATION_NOTIFIED:
+        return
+    _POSE_MIGRATION_NOTIFIED.add(key)
+    print(
+        f"MIGRATION: camera {camera_id} pitch calibration loaded from legacy {legacy.name}; "
+        f"it will move to {new.name} on the next save."
+    )
 
 
 @dataclass(slots=True)
@@ -48,18 +65,32 @@ class ICCPitchDimensions:
 @dataclass(slots=True)
 class PitchCalibrationProfile:
     camera_id: int
+    type: str = "pose"
+    schema_version: int = 1
     method: str = "manual_pitch_markers"
-    version: int = 1
     image_size: tuple[int, int] = (0, 0)
     markers: dict[str, dict[str, float]] = field(default_factory=dict)
     world_dimensions: dict[str, float] = field(default_factory=ICCPitchDimensions().to_dict)
     homography: list[list[float]] | None = None
     homography_error_cm: float | None = None
+    intrinsics_source: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # Lead with the identifying metadata, matching intrinsics_<id>.json.
+        return {
+            "type": data.pop("type"),
+            "schema_version": data.pop("schema_version"),
+            "camera_id": data.pop("camera_id"),
+            **data,
+        }
+
+
+def _profile_from_dict(data: dict[str, Any]) -> PitchCalibrationProfile:
+    known = {f.name for f in fields(PitchCalibrationProfile)}
+    return PitchCalibrationProfile(**{k: v for k, v in data.items() if k in known})
 
 
 def default_icc_profile() -> dict[str, Any]:
@@ -171,36 +202,95 @@ class ManualPitchCalibrator:
             world_dimensions=self.dimensions.to_dict(),
             homography=homography,
             homography_error_cm=error_cm,
+            intrinsics_source=self._intrinsics_source(camera_id),
             created_at=now,
             updated_at=now,
         )
-        path = self.profile_path(camera_id)
+        path = self.pose_path(camera_id)
         save_json(profile.to_dict(), path)
         refresh_readiness_from_profiles()
         return profile
 
     def load_profile(self, camera_id: int) -> PitchCalibrationProfile | None:
-        path = self.profile_path(camera_id)
-        if not path.exists():
-            return None
-        data = load_json(path)
-        if data.get("method") != "manual_pitch_markers":
-            return None
-        return PitchCalibrationProfile(**data)
+        path = self.pose_path(camera_id)
+        if path.exists():
+            data = load_json(path)
+            if data.get("method") != "manual_pitch_markers":
+                return None
+            return _profile_from_dict(data)
+        legacy = self.legacy_path(camera_id)
+        if legacy.exists():
+            try:
+                data = load_json(legacy)
+            except Exception:
+                return None
+            if data.get("method") == "manual_pitch_markers":
+                _notify_pose_migration(camera_id, legacy, path)
+                return _profile_from_dict(data)
+        return None
 
     def list_profiles(self) -> list[PitchCalibrationProfile]:
-        profiles: list[PitchCalibrationProfile] = []
-        for path in sorted(CALIBRATION_DIR.glob("calibration_*.json")):
-            if path.name == "readiness.json":
-                continue
-            data = load_json(path)
-            if data.get("method") == "manual_pitch_markers":
-                profiles.append(PitchCalibrationProfile(**data))
-        return profiles
+        # Glob legacy first so a migrated pose_<id>.json takes precedence per camera.
+        by_camera: dict[Any, PitchCalibrationProfile] = {}
+        for pattern in ("calibration_*.json", "pose_*.json"):
+            for path in sorted(CALIBRATION_DIR.glob(pattern)):
+                if path.name == "readiness.json":
+                    continue
+                try:
+                    data = load_json(path)
+                except Exception:
+                    continue
+                if data.get("method") == "manual_pitch_markers":
+                    profile = _profile_from_dict(data)
+                    by_camera[profile.camera_id] = profile
+        return list(by_camera.values())
+
+    def delete_profile(self, camera_id: int) -> bool:
+        """Remove the saved manual pitch calibration for a camera (new + legacy files)."""
+        removed = False
+        pose = self.pose_path(camera_id)
+        if pose.exists():
+            pose.unlink()
+            removed = True
+        legacy = self.legacy_path(camera_id)
+        if legacy.exists():
+            try:
+                is_manual = load_json(legacy).get("method") == "manual_pitch_markers"
+            except Exception:
+                is_manual = False
+            if is_manual:
+                legacy.unlink()
+                removed = True
+        if removed:
+            refresh_readiness_from_profiles()
+        return removed
 
     @staticmethod
-    def profile_path(camera_id: int) -> Path:
-        return CALIBRATION_DIR / f"calibration_{camera_id}.json"
+    def _intrinsics_source(camera_id: int) -> str | None:
+        """Name of the file holding this camera's intrinsics, if any (debug metadata)."""
+        intr = get_intrinsics_path(camera_id, CALIBRATION_DIR)
+        if intr.exists():
+            return intr.name
+        legacy = get_legacy_path(camera_id, CALIBRATION_DIR)
+        if legacy.exists():
+            try:
+                if load_json(legacy).get("camera_matrix") is not None:
+                    return legacy.name
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def pose_path(camera_id: int) -> Path:
+        return get_pose_path(camera_id, CALIBRATION_DIR)
+
+    @staticmethod
+    def legacy_path(camera_id: int) -> Path:
+        return get_legacy_path(camera_id, CALIBRATION_DIR)
+
+    @staticmethod
+    def profile_path(camera_id: int) -> Path:  # backward-compatible alias
+        return ManualPitchCalibrator.pose_path(camera_id)
 
 
 def refresh_readiness_from_profiles() -> Path:
@@ -208,6 +298,8 @@ def refresh_readiness_from_profiles() -> Path:
     calibrator = ManualPitchCalibrator()
     profiles = calibrator.list_profiles()
     if not profiles:
+        if READINESS_PATH.exists():
+            READINESS_PATH.unlink()
         return READINESS_PATH
 
     errors = [item.homography_error_cm for item in profiles if item.homography_error_cm is not None]

@@ -1,0 +1,21 @@
+{
+  "background": "#5f8a44",
+  "grassStripeA": "#4f7836",
+  "grassStripeB": "#466d30",
+  "pitch": "#c2a56e",
+  "crease": "#f0ead8",
+  "stump": "#2b3a86",
+  "stumpBrand": "#dfe6f2",
+  "stumpGold": "#caa63a",
+  "bail": "#233066",
+  "tubeRed": "#d0263a",
+  "tubeBlue": "#2f57d8",
+  "ballPink": "#ff3ba0",
+  "ballPinkEmissive": "#7a0038",
+  "ballPurple": "#9a48d0",
+  "ballPurpleEmissive": "#2a0050",
+  "cardHeaderTop": "#2aa6e0",
+  "cardHeaderBottom": "#0a4d82",
+  "cardGreen": ["#3ac24a", "#1c8a2e"],
+  "cardRed": ["#e8433f", "#b81f1f"]
+}

@@ -1,0 +1,13 @@
+# Stable detector class list.
+# IDs are assigned by list position and must be append-only.
+classes:
+  - cricket_ball
+  - bat
+  - pad
+  - stumps
+  - batter
+  - bowler
+  - wicketkeeper
+  - umpire
+  - popping_crease
+  - bowling_crease

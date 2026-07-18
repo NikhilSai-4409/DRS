@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import math
 import os
 import shutil
 import socket
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -31,10 +31,27 @@ from core.pitch_calibration import (
 )
 from core.testing_database import TestingDatabase
 from core.testing_pipeline import AnalysisOptions, DeliveryTestingPipeline, OUTPUT_DIR, UPLOAD_DIR
+from core import lbw_validation
+from core.model_registry import ModelRegistry
 from core.ws_hub import CHANNELS, WSBroadcastHub
 from utils.logger import get_logger
 
 log = get_logger("testing_api")
+
+
+def _calibration_quality(error_cm: float | None) -> dict[str, Any]:
+    """Map a homography reprojection error (cm) to a star rating + operator label."""
+    if error_cm is None:
+        return {"stars": 0, "label": "Not calibrated", "level": "missing"}
+    if error_cm < 1.0:
+        return {"stars": 5, "label": "Excellent", "level": "excellent"}
+    if error_cm < 2.0:
+        return {"stars": 4, "label": "Good", "level": "good"}
+    if error_cm < 3.5:
+        return {"stars": 3, "label": "Fair", "level": "fair"}
+    if error_cm < 5.0:
+        return {"stars": 2, "label": "Needs recalibration", "level": "warn"}
+    return {"stars": 1, "label": "Poor — redo capture", "level": "poor"}
 
 
 DB_PATH = Path("data/testing/drs_testing.sqlite3")
@@ -42,6 +59,91 @@ CALIBRATION_DIR = Path("data/calibration")
 CALIBRATION_PROFILES_PATH = Path("config/calibration_profiles.json")
 db = TestingDatabase(DB_PATH)
 pipeline = DeliveryTestingPipeline()
+# Pipelines for explicitly-selected models are cached so re-testing the same model
+# doesn't reload YOLO weights each run. None → the default pipeline above.
+_pipeline_cache: dict[str, DeliveryTestingPipeline] = {}
+
+
+def _pipeline_for(model_path: str | None) -> DeliveryTestingPipeline:
+    if not model_path:
+        return pipeline
+    key = str(model_path)
+    if key not in _pipeline_cache:
+        _pipeline_cache[key] = DeliveryTestingPipeline(model_path=model_path)
+    return _pipeline_cache[key]
+
+
+# One validation run at a time; the UI polls /api/testing/validation/runs for state.
+_validation_state: dict[str, Any] = {"status": "idle", "run_id": None, "error": None, "started": None}
+
+
+def _run_validation(model: str | None, calibration: str | None, limit: int | None) -> None:
+    """Background task: run the LBW ground-truth set through the REAL pipeline."""
+    _validation_state.update(
+        {"status": "running", "run_id": None, "error": None,
+         "started": datetime.now().isoformat(timespec="seconds")}
+    )
+    try:
+        def run_clip(spec, model_path):
+            return _pipeline_for(model_path).process(
+                f"val_{spec.id}", [Path(spec.path)], AnalysisOptions(model_path=model_path)
+            )
+
+        run = lbw_validation.validate(
+            model_override=model,
+            calibration_override=calibration,
+            limit=limit,
+            run_clip=run_clip,
+        )
+        _validation_state.update({"status": "complete", "run_id": run.run_id})
+        log.info(
+            "[API] Validation run {} complete: {}/{} = {:.1f}%",
+            run.run_id, run.correct, run.scored, run.accuracy * 100,
+        )
+    except Exception as exc:  # never let a bad run wedge the state as 'running'
+        _validation_state.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+        log.error("[API] Validation run failed: {}", exc, exc_info=True)
+
+
+# Model A-vs-B comparison on the validation set (one at a time).
+_compare_state: dict[str, Any] = {"status": "idle", "error": None, "result": None}
+
+
+def _run_compare(model_a: str | None, model_b: str | None, limit: int | None) -> None:
+    """Background: run the validation set with model A and model B, diff the verdicts."""
+    _compare_state.update({"status": "running", "error": None, "result": None})
+    try:
+        def run_clip(spec, model_path):
+            return _pipeline_for(model_path).process(
+                f"cmp_{spec.id}", [Path(spec.path)], AnalysisOptions(model_path=model_path)
+            )
+
+        run_a = lbw_validation.validate(model_override=model_a, limit=limit, run_clip=run_clip, write=False)
+        run_b = lbw_validation.validate(model_override=model_b, limit=limit, run_clip=run_clip, write=False)
+        a_by = {c.id: c for c in run_a.clips}
+        clips = []
+        for cb in run_b.clips:
+            ca = a_by.get(cb.id)
+            clips.append({
+                "id": cb.id,
+                "expected": cb.expected_verdict,
+                "a_verdict": ca.actual_verdict if ca else None,
+                "b_verdict": cb.actual_verdict,
+                "a_correct": bool(ca and ca.match),
+                "b_correct": bool(cb.match),
+            })
+        _compare_state.update({"status": "complete", "result": {
+            "model_a": model_a or "default", "model_b": model_b or "default",
+            "accuracy_a": run_a.accuracy, "accuracy_b": run_b.accuracy,
+            "correct_a": run_a.correct, "correct_b": run_b.correct, "scored": run_b.scored,
+            "clips": clips,
+        }})
+        log.info("[API] Compare complete: A {:.1f}% vs B {:.1f}%", run_a.accuracy * 100, run_b.accuracy * 100)
+    except Exception as exc:
+        _compare_state.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+        log.error("[API] Compare failed: {}", exc, exc_info=True)
+
+
 ws_hub = WSBroadcastHub()
 START_TIME = time.time()
 MAX_CAMERAS = 6
@@ -94,18 +196,45 @@ async def _system_broadcast_loop() -> None:
         await asyncio.sleep(1.0)
 
 
-@asynccontextmanager
-async def _lifespan(_app: FastAPI):
+# The event loop serving the API. Analysis jobs run in worker threads with no loop
+# of their own, so schedule_broadcast() uses this reference to marshal WS pushes back
+# onto the serving loop — without it every job-progress event was silently dropped.
+_main_loop: "asyncio.AbstractEventLoop | None" = None
+_system_broadcast_task: "asyncio.Task | None" = None
+
+
+async def start_background_services() -> None:
+    """Run the testing-platform startup: capture the serving loop, recover stale
+    jobs, and start the system broadcast loop. Called from both the standalone
+    testing app lifespan and the unified backend lifespan so behaviour is identical."""
+    global _main_loop, _system_broadcast_task
+    _main_loop = asyncio.get_running_loop()
     cleaned, _job_ids = cleanup_stale_jobs(15)
     log.info("[API] Stale job cleanup: {} jobs recovered.", cleaned)
-    broadcast_task = asyncio.create_task(_system_broadcast_loop())
-    yield
-    broadcast_task.cancel()
-    try:
-        await broadcast_task
-    except asyncio.CancelledError:
-        pass
+    if _system_broadcast_task is None or _system_broadcast_task.done():
+        _system_broadcast_task = asyncio.create_task(_system_broadcast_loop())
+
+
+async def stop_background_services() -> None:
+    global _main_loop, _system_broadcast_task
+    if _system_broadcast_task is not None:
+        _system_broadcast_task.cancel()
+        try:
+            await _system_broadcast_task
+        except asyncio.CancelledError:
+            pass
+        _system_broadcast_task = None
+    _main_loop = None
     log.info("[API] Shutdown complete.")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    await start_background_services()
+    try:
+        yield
+    finally:
+        await stop_background_services()
 
 
 def create_testing_app() -> FastAPI:
@@ -117,18 +246,6 @@ def create_testing_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.websocket("/ws/{channel}")
-    async def websocket_channel(websocket: WebSocket, channel: str) -> None:
-        if channel not in CHANNELS:
-            await websocket.close(code=1008)
-            return
-        await ws_hub.connect(channel, websocket)
-        try:
-            while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            await ws_hub.disconnect(channel, websocket)
 
     @app.websocket("/ws/job/{job_id}")
     async def websocket_job_channel(websocket: WebSocket, job_id: str) -> None:
@@ -197,17 +314,9 @@ def create_testing_app() -> FastAPI:
             "analysis_mode": analysis_mode,
         }
 
-    @app.get("/api/health")
-    def health() -> dict[str, Any]:
-        return health_payload()
-
     @app.get("/api/testing/health")
     def testing_health() -> dict[str, Any]:
         return health_payload()
-
-    @app.get("/api/cameras/fps")
-    def camera_fps() -> dict[str, Any]:
-        return camera_fps_payload()
 
     @app.post("/api/cameras/{camera_id}/reconnect")
     def reconnect_camera(camera_id: int) -> dict[str, Any]:
@@ -226,133 +335,6 @@ def create_testing_app() -> FastAPI:
         connected_camera_count = max(1, min(connected_camera_count, camera_id - 1))
         schedule_broadcast("system", {"type": "camera_disconnect", "camera_id": camera_id, "status": "offline"})
         return {"camera_id": camera_id, "status": "offline", "cameras": camera_fps_payload()}
-
-    @app.get("/api/live/{camera_id}.jpg")
-    def live_camera_frame(camera_id: int) -> Response:
-        if camera_id < 1 or camera_id > MAX_CAMERAS or camera_id > connected_camera_count:
-            raise HTTPException(status_code=404, detail="Camera not available")
-        frame = _synthetic_live_frame(camera_id, thermal_overlay=analysis_mode["id"] == "thermal_demo")
-        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
-        if not ok:
-            raise HTTPException(status_code=500, detail="Could not encode live frame")
-        return Response(
-            content=encoded.tobytes(),
-            media_type="image/jpeg",
-            headers={"Cache-Control": "no-store", "X-Camera-Status": "synthetic"},
-        )
-
-    @app.get("/api/decision/current")
-    def decision_current() -> dict[str, Any]:
-        return current_decision
-
-    @app.get("/api/system/health")
-    def system_health() -> dict[str, Any]:
-        return system_health_payload()
-
-    @app.get("/api/analysis-mode")
-    def get_analysis_mode() -> dict[str, Any]:
-        return analysis_mode
-
-    @app.post("/api/analysis-mode")
-    def set_analysis_mode(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-        mode_id = str(payload.get("mode", "visible"))
-        if mode_id == "thermal_demo":
-            analysis_mode.update(
-                {
-                    "id": "thermal_demo",
-                    "label": "Mode B - demonstration thermal overlay",
-                    "description": "Investor demo overlay. Simulated heat colors are presentation graphics, not real thermal data.",
-                }
-            )
-        else:
-            analysis_mode.update(
-                {
-                    "id": "visible",
-                    "label": "Mode A - visible-spectrum approximation",
-                    "description": "Frame differencing and motion-energy analysis. No thermal inference is claimed.",
-                }
-            )
-        return analysis_mode
-
-    @app.post("/api/appeal/request")
-    async def request_appeal(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-        camera_ids = _validated_camera_ids(payload.get("camera_ids") or list(range(1, connected_camera_count + 1)))
-        resolved = resolve_dashboard_decision(camera_ids, status="PROCESSING")
-        current_decision.update(resolved)
-        await ws_hub.broadcast("review", {"type": "appeal_started", "camera_ids": camera_ids})
-        await ws_hub.broadcast("decision", {"type": "decision_update", "decision": current_decision})
-        log.info("[API] Appeal requested for cameras {}", camera_ids)
-        return {"ok": True, "camera_ids": camera_ids, "decision": current_decision}
-
-    @app.post("/api/decision/confirm")
-    async def confirm_decision(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-        outcome = str(payload.get("outcome", "")).upper()
-        if outcome not in {"OUT", "NOT_OUT"}:
-            raise HTTPException(status_code=400, detail="outcome must be OUT or NOT_OUT")
-        resolved = resolve_dashboard_decision(list(range(1, connected_camera_count + 1)))
-        current_decision.update(resolved)
-        current_decision["status"] = outcome
-        current_decision["outcome"] = "OUT" if outcome == "OUT" else "NOT OUT"
-        current_decision["decision"] = current_decision["outcome"]
-        _store_review(current_decision)
-        await ws_hub.broadcast("decision", {"type": "decision_confirmed", "decision": current_decision})
-        log.info("[API] Decision confirmed: {}", outcome)
-        return current_decision
-
-    @app.get("/api/reviews")
-    def reviews() -> dict[str, Any]:
-        return {"reviews": list(reversed(review_history[-50:]))}
-
-    @app.get("/api/reviews/{review_id}")
-    def review_detail(review_id: str) -> dict[str, Any]:
-        for review in review_history:
-            if review["id"] == review_id:
-                return review
-        raise HTTPException(status_code=404, detail="Review not found")
-
-    @app.get("/api/calibration/status")
-    def calibration_status() -> dict[str, Any]:
-        return calibration_status_payload()
-
-    @app.get("/api/calibration/profiles")
-    def calibration_profiles() -> list[dict[str, Any]]:
-        return _load_calibration_profiles()
-
-    @app.post("/api/calibration/save")
-    def save_calibration_profile(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        image_points = payload.get("image_points") or []
-        world_points = payload.get("world_points") or _default_world_points()
-        if len(image_points) != 9 or len(world_points) != 9:
-            raise HTTPException(status_code=400, detail="Exactly 9 image_points and 9 world_points are required")
-
-        profile_id = uuid.uuid4().hex
-        profile = {
-            "id": profile_id,
-            "name": str(payload.get("name") or "Untitled calibration"),
-            "ground": str(payload.get("ground") or "Unknown ground"),
-            "camera": str(payload.get("camera") or "Camera A (end-on)"),
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "rms_error_px": _estimate_rms_error_px(image_points),
-            "image_points": image_points,
-            "world_points": world_points,
-            "camera_matrix": payload.get("camera_matrix") or _identity_camera_matrix(),
-            "dist_coeffs": payload.get("dist_coeffs") or [0, 0, 0, 0, 0],
-            "rvec": payload.get("rvec") or [0, 0, 0],
-            "tvec": payload.get("tvec") or [0, 0, 0],
-        }
-        profiles = _load_calibration_profiles()
-        profiles.append(profile)
-        _save_calibration_profiles(profiles)
-        return {"profile_id": profile_id, "rms_error": profile["rms_error_px"], "status": "saved", "profile": profile}
-
-    @app.post("/api/calibration/auto-detect")
-    def auto_detect_calibration_points(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        image_data = str(payload.get("image") or "")
-        frame = _decode_base64_image(image_data)
-        if frame is None:
-            raise HTTPException(status_code=400, detail="image base64 payload is required")
-        points, confidence = _auto_detect_reference_points(frame)
-        return {"detected_points": points, "confidence": confidence}
 
     @app.get("/api/calibration/default-profile")
     def calibration_default_profile() -> dict[str, Any]:
@@ -391,6 +373,23 @@ def create_testing_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         log.info("[API] Saved manual pitch calibration for camera {}", camera_id)
         return {"saved": True, "profile": profile.to_dict(), "status": calibration_status_payload()}
+
+    @app.delete("/api/calibration/cameras/{camera_id}")
+    def delete_camera_calibration(camera_id: int) -> dict[str, Any]:
+        deleted = ManualPitchCalibrator().delete_profile(camera_id)
+        snapshot = _calibration_snapshot_path(camera_id)
+        snapshot_deleted = False
+        if snapshot.exists():
+            snapshot.unlink()
+            snapshot_deleted = True
+        if deleted:
+            log.info("[API] Removed manual pitch calibration for camera {}", camera_id)
+        return {
+            "deleted": deleted,
+            "snapshot_deleted": snapshot_deleted,
+            "camera_id": camera_id,
+            "status": calibration_status_payload(),
+        }
 
     @app.get("/api/calibration/cameras/{camera_id}/snapshot")
     def get_camera_calibration_snapshot(camera_id: int) -> FileResponse:
@@ -445,6 +444,254 @@ def create_testing_app() -> FastAPI:
 
             refresh_readiness_from_profiles()
         return {"saved": True, "path": str(dest), "status": calibration_status_payload()}
+
+    @app.get("/api/testing/models")
+    def list_testing_models() -> dict[str, Any]:
+        """List the .pt models available for testing, grouped by folder. The Testing
+        page populates its Model dropdown from this so the model the operator picks is
+        the one actually loaded for analysis (no hidden default)."""
+        from config.settings import BASE_DIR
+
+        models_root = BASE_DIR / "models"
+
+        def scan(label: str, folder: Path) -> dict[str, Any] | None:
+            if not folder.exists():
+                return None
+            items = []
+            for path in sorted(folder.glob("*.pt")):
+                try:
+                    size_mb = round(path.stat().st_size / 1_000_000, 1)
+                except OSError:
+                    size_mb = None
+                items.append({"name": path.name, "path": str(path), "size_mb": size_mb})
+            return {"group": label, "models": items} if items else None
+
+        def scan_recursive(label: str, folder: Path | None) -> dict[str, Any] | None:
+            if folder is None or not folder.exists():
+                return None
+            items = []
+            for path in sorted(folder.rglob("*.pt")):
+                try:
+                    size_mb = round(path.stat().st_size / 1_000_000, 1)
+                except OSError:
+                    size_mb = None
+                items.append({"name": str(path.relative_to(folder)).replace("\\", "/"), "path": str(path), "size_mb": size_mb})
+            return {"group": label, "models": items} if items else None
+
+        # Vision Studio workspace models (the handoff): read the workspace root from the
+        # dev config and list <workspace>/Models/**.pt so freshly-trained models show up.
+        vs_models = None
+        try:
+            import yaml
+            _cfg = yaml.safe_load((BASE_DIR / "config" / "development.yaml").read_text(encoding="utf-8")) or {}
+            _ws = (_cfg.get("vision_studio") or {}).get("workspace")
+            if _ws:
+                _ws_path = Path(_ws)
+                _ws_path = _ws_path if _ws_path.is_absolute() else BASE_DIR / _ws_path
+                vs_models = _ws_path / "Models"
+        except Exception:
+            vs_models = None
+
+        groups = [g for g in (
+            scan("Production", models_root / "production"),
+            scan("Candidates", models_root / "candidates"),
+            scan_recursive("Vision Studio", vs_models),
+            scan("Models", models_root),  # top-level *.pt (non-recursive)
+        ) if g]
+        default = next((g["models"][0]["path"] for g in groups if g["group"] == "Production" and g["models"]), None)
+        if default is None and groups and groups[0]["models"]:
+            default = groups[0]["models"][0]["path"]
+        return {"groups": groups, "default": default}
+
+    @app.post("/api/testing/promote")
+    def promote_model(payload: dict = Body(default_factory=dict)) -> dict[str, Any]:
+        """Promote a tested model to production. Delegates to the model registry —
+        the SINGLE promotion implementation — so this and /api/models/promote behave
+        identically. Accepts a registry id or an arbitrary model_path (browsed file)."""
+        raw = str(payload.get("id") or payload.get("model_path") or "")
+        if not raw:
+            raise HTTPException(status_code=400, detail="id or model_path required")
+        reg = ModelRegistry()
+        by = payload.get("by") or "operator"
+        reason = payload.get("reason")
+        try:
+            if reg.get(raw) is not None:
+                rec = reg.promote(raw, reason=reason, by=by)          # a registry model
+            else:
+                rec = reg.promote_source(raw, reason=reason, by=by)   # external/browsed .pt
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _pipeline_cache.clear()  # live/testing analysis reloads the new production model
+        log.info("[API] Promoted {} to production", rec.name)
+        return {"ok": True, "promoted": rec.name, "production": rec.path, "archived_previous": None}
+
+    @app.post("/api/testing/rollback")
+    def rollback_model() -> dict[str, Any]:
+        """Roll production back to the previous model. Delegates to the registry."""
+        try:
+            rec = ModelRegistry().rollback(by="operator")
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _pipeline_cache.clear()
+        log.info("[API] Rolled back production to {}", rec.name)
+        return {"ok": True, "restored": rec.name}
+
+    # --- LBW ground-truth validation (engineer tooling) -------------------- #
+    # Thin wiring over core.lbw_validation. The engine is interface-independent;
+    # the CLI (scripts/validate_lbw.py) drives the exact same code.
+    @app.get("/api/testing/validation/manifest")
+    def validation_manifest() -> dict[str, Any]:
+        """The labelled validation set: clips + their known (expected) verdicts."""
+        from dataclasses import asdict as _asdict
+
+        try:
+            m = lbw_validation.load_manifest()
+        except FileNotFoundError:
+            return {"description": "", "defaults": {}, "clips": [], "exists": False}
+        return {
+            "description": m.description,
+            "defaults": m.defaults,
+            "clips": [_asdict(c) for c in m.clips],
+            "exists": True,
+        }
+
+    @app.get("/api/testing/validation/runs")
+    def validation_runs() -> dict[str, Any]:
+        """History of validation runs (compact summaries) + current run state."""
+        return {"runs": lbw_validation.load_history(), "state": dict(_validation_state)}
+
+    @app.get("/api/testing/validation/runs/{run_id}")
+    def validation_run_detail(run_id: str) -> dict[str, Any]:
+        """Full per-clip report for one run."""
+        safe = "".join(ch for ch in run_id if ch.isalnum() or ch in {"_", "-"})
+        report = lbw_validation.RUNS_DIR / safe / "report.json"
+        if not report.exists():
+            raise HTTPException(status_code=404, detail="Validation run not found")
+        return json.loads(report.read_text(encoding="utf-8"))
+
+    @app.post("/api/testing/validation/run")
+    def validation_run_start(
+        background_tasks: BackgroundTasks, payload: dict = Body(default_factory=dict)
+    ) -> dict[str, Any]:
+        """Kick off a validation run in the background (one at a time)."""
+        if _validation_state.get("status") == "running":
+            raise HTTPException(status_code=409, detail="A validation run is already in progress")
+        try:
+            manifest = lbw_validation.load_manifest()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not manifest.clips:
+            raise HTTPException(status_code=400, detail="Validation manifest has no clips")
+        model = payload.get("model") or None
+        calibration = payload.get("calibration") or None
+        limit = payload.get("limit")
+        background_tasks.add_task(_run_validation, model, calibration, limit)
+        return {"status": "queued", "clips": len(manifest.clips)}
+
+    # --- Model Manager (single source of truth for every detector model) --- #
+    @app.get("/api/models")
+    def models_list() -> dict[str, Any]:
+        reg = ModelRegistry()
+        return {
+            "models": [r.to_dict() for r in reg.list()],
+            "history": reg.deployment_history()[-20:],
+            "compare": {k: v for k, v in _compare_state.items() if k != "result"},
+        }
+
+    @app.post("/api/models/promote")
+    def models_promote(payload: dict = Body(default_factory=dict)) -> dict[str, Any]:
+        model_id = str(payload.get("id") or "")
+        try:
+            rec = ModelRegistry().promote(model_id, reason=payload.get("reason"), by=payload.get("by") or "operator")
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _pipeline_cache.clear()  # next analysis reloads the newly-promoted production model
+        return {"ok": True, "production": rec.to_dict()}
+
+    @app.post("/api/models/rollback")
+    def models_rollback() -> dict[str, Any]:
+        try:
+            rec = ModelRegistry().rollback()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _pipeline_cache.clear()
+        return {"ok": True, "production": rec.to_dict()}
+
+    @app.post("/api/models/archive")
+    def models_archive(payload: dict = Body(default_factory=dict)) -> dict[str, Any]:
+        try:
+            rec = ModelRegistry().archive_model(str(payload.get("id") or ""))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "model": rec.to_dict()}
+
+    @app.post("/api/models/delete")
+    def models_delete(payload: dict = Body(default_factory=dict)) -> dict[str, Any]:
+        try:
+            result = ModelRegistry().delete(str(payload.get("id") or ""))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, **result}
+
+    @app.post("/api/models/notes")
+    def models_notes(payload: dict = Body(default_factory=dict)) -> dict[str, Any]:
+        try:
+            rec = ModelRegistry().set_notes(str(payload.get("id") or ""), str(payload.get("notes") or ""))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "model": rec.to_dict()}
+
+    @app.post("/api/models/compare")
+    def models_compare(background_tasks: BackgroundTasks, payload: dict = Body(default_factory=dict)) -> dict[str, Any]:
+        if _compare_state.get("status") == "running":
+            raise HTTPException(status_code=409, detail="A comparison is already in progress")
+        reg = ModelRegistry()
+        model_a = payload.get("model_a")  # a registry id/path, or null for the default/production model
+        model_b = payload.get("model_b")
+        for m in (model_a, model_b):
+            if m and reg.get(str(m)) is None:
+                raise HTTPException(status_code=404, detail=f"Model not found: {m}")
+        try:
+            manifest = lbw_validation.load_manifest()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not manifest.clips:
+            raise HTTPException(status_code=400, detail="Validation manifest has no clips to compare on")
+        # resolve ids to real paths for the pipeline
+        path_a = str(reg.get(str(model_a)).path) if model_a else None
+        path_b = str(reg.get(str(model_b)).path) if model_b else None
+        background_tasks.add_task(_run_compare, path_a, path_b, payload.get("limit"))
+        return {"status": "queued", "clips": len(manifest.clips)}
+
+    @app.get("/api/models/compare")
+    def models_compare_state() -> dict[str, Any]:
+        return dict(_compare_state)
+
+    @app.post("/api/testing/uploads")
+    async def upload_only(
+        video: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        """Upload a clip WITHOUT queuing the full analysis pipeline. Used by the
+        Testing page's per-review-type runner: selecting Wide / Run Out / Stumping
+        uploads here, then POST /api/testing/jobs/{id}/review/{type} runs ONLY that
+        module through the shared ReviewEngine — no LBW code executes."""
+        job_id = uuid.uuid4().hex[:12]
+        job_upload_dir = UPLOAD_DIR / job_id
+        job_upload_dir.mkdir(parents=True, exist_ok=True)
+        path = await _save_upload(video, job_upload_dir / _clean_name(video.filename, "camera_0.mp4"))
+        db.create_job(job_id, "upload_only", {"upload_only": True}, path, None)
+        db.update_job(job_id, "uploaded")
+        return {"job_id": job_id, "status": "uploaded", "video": path.name}
 
     @app.post("/api/testing/jobs")
     async def create_job(
@@ -557,6 +804,24 @@ def create_testing_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Animation export not available")
         return FileResponse(path, media_type="video/mp4")
 
+    @app.post("/api/testing/jobs/{job_id}/review/{review_type}")
+    def run_review_on_job(job_id: str, review_type: str) -> dict[str, Any]:
+        """Run ONE review type on an uploaded clip through the shared ReviewEngine —
+        the exact code path the live 'Request Review' uses, just fed from the recorded
+        file. Lets Wide / No Ball / Run Out / Edge be validated on recorded 120/240 FPS
+        deliveries without a live camera rig."""
+        job_id = _clean_job_id(job_id)
+        job_dir = UPLOAD_DIR / job_id
+        videos = sorted(job_dir.glob("*.mp4")) if job_dir.exists() else []
+        if not videos:
+            raise HTTPException(status_code=404, detail="No uploaded video for this job")
+        from core.review_engine import run_review_on_video
+
+        analysis = run_review_on_video(str(videos[0]), review_type)
+        if analysis is None:
+            raise HTTPException(status_code=422, detail="Could not read frames or unknown review type")
+        return {"job_id": job_id, "review_type": review_type.lower(), "video": videos[0].name, "analysis": analysis}
+
     @app.post("/api/test/upload")
     async def upload_test_job(
         background_tasks: BackgroundTasks,
@@ -599,6 +864,8 @@ def create_testing_app() -> FastAPI:
             "pdf": "pdf",
             "video": "analyzed_video",
             "animation": "animation_video",
+            "replay_players": "replay_players",
+            "replay_review": "replay_review",
         }
         key = key_map.get(export_name)
         if key is None or key not in exports:
@@ -712,11 +979,22 @@ def _empty_decision(camera_ids: list[int], status: str | None = None) -> dict[st
 
 
 def schedule_broadcast(channel: str, payload: dict[str, Any]) -> None:
+    # Called from two contexts: (1) inside the event loop (schedule directly) and
+    # (2) from a job worker thread with no running loop — where the old code hit
+    # RuntimeError and silently dropped the event. Marshal onto the captured serving
+    # loop instead so /ws/job/{id} subscribers actually receive progress.
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(ws_hub.broadcast(channel, payload))
+        return
     except RuntimeError:
         pass
+    loop = _main_loop
+    if loop is not None and loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(ws_hub.broadcast(channel, payload), loop)
+        except Exception:
+            pass
 
 
 def schedule_job_broadcast(job_id: str, payload: dict[str, Any]) -> None:
@@ -934,6 +1212,21 @@ def _dashboard_results_payload(job_id: str, result: dict[str, Any]) -> dict[str,
     detection_rate = len(detected) / max(1, frames)
     bounce = first_camera.get("bounce_point_px")
     impact = first_camera.get("impact_point_px")
+    # Prefer the canonical trajectory the pipeline now emits (observed + predicted +
+    # validity). Fall back to the legacy synthesis only for older jobs that predate it,
+    # so the frontend consumes exactly one trajectory contract when it's available.
+    canonical_trajectory = result.get("trajectory")
+    trajectory_payload = (
+        canonical_trajectory
+        if isinstance(canonical_trajectory, dict) and "observed" in canonical_trajectory
+        else {
+            "release_point": _track_point_to_world(tracks[0]) if tracks else None,
+            "bounce_point": _point_list_to_xyz(bounce),
+            "impact_point": _point_list_to_xyz(impact),
+            "predicted_stumps": decision.get("wicket_prediction"),
+            "points": decision.get("trajectory", []),
+        }
+    )
     payload = {
         **result,
         "job_id": job_id,
@@ -949,13 +1242,8 @@ def _dashboard_results_payload(job_id: str, result: dict[str, Any]) -> dict[str,
             "detection_rate": round(detection_rate, 3),
             "avg_confidence": round(avg_confidence, 3),
         },
-        "trajectory": {
-            "release_point": _track_point_to_world(tracks[0]) if tracks else None,
-            "bounce_point": _point_list_to_xyz(bounce),
-            "impact_point": _point_list_to_xyz(impact),
-            "predicted_stumps": decision.get("wicket_prediction"),
-            "points": decision.get("trajectory", []),
-        },
+        "trajectory": trajectory_payload,
+        "diagnostics": result.get("diagnostics"),
         "lbw_gates": _lbw_gate_payload(summary, decision),
         "decision": {
             "verdict": _normal_verdict(decision.get("status") or decision.get("decision")),
@@ -1086,22 +1374,24 @@ def _store_review(decision: dict[str, Any]) -> None:
     )
 
 
-def _cpu_percent() -> float:
+def _cpu_percent() -> float | None:
+    # Honest: if psutil isn't available we report None ("--" in the UI) rather than a
+    # sine-wave fake that reads as a real load graph. psutil is in requirements.txt.
     try:
         import psutil
 
         return float(psutil.cpu_percent(interval=None))
     except Exception:
-        return round(18.0 + (math.sin(time.time() / 9.0) + 1.0) * 11.0, 1)
+        return None
 
 
-def _ram_percent() -> float:
+def _ram_percent() -> float | None:
     try:
         import psutil
 
         return float(psutil.virtual_memory().percent)
     except Exception:
-        return round(42.0 + (math.cos(time.time() / 11.0) + 1.0) * 7.0, 1)
+        return None
 
 
 def _storage_payload() -> dict[str, Any]:
@@ -1132,15 +1422,33 @@ def _clean_name(filename: str | None, fallback: str) -> str:
     return safe or fallback
 
 
+# Analysis jobs are SERIALIZED: one pipeline run at a time. Two concurrent runs double the
+# YOLO/tracking memory and (with the replay renders on top) exhausted system commit —
+# Windows resource-exhaustion events killed the whole desktop app (observed 2026-07-17,
+# python.exe at 5.7GB with two overlapping jobs). A second Analyze click now WAITS in the
+# queue instead of running in parallel.
+_job_lock = threading.Lock()
+
+
 def _run_job(job_id: str, videos: list[Path], options: AnalysisOptions) -> None:
     db.update_job(job_id, "processing")
     job_progress[job_id] = _initial_job_progress(job_id)
+    if not _job_lock.acquire(blocking=False):
+        _update_job_progress(job_id, "Queued (another analysis is running)...", 2)
+        _job_lock.acquire()
+    try:
+        _run_job_locked(job_id, videos, options)
+    finally:
+        _job_lock.release()
+
+
+def _run_job_locked(job_id: str, videos: list[Path], options: AnalysisOptions) -> None:
     _update_job_progress(job_id, "Extracting frames...", 8)
     schedule_broadcast("review", {"type": "job_processing", "job_id": job_id})
     try:
         log.info("[API] Starting analysis for job {} with {} video(s)", job_id, len(videos))
         _update_job_progress(job_id, "Detecting ball...", 25)
-        result = pipeline.process(job_id, videos, options)
+        result = _pipeline_for(options.model_path).process(job_id, videos, options)
         frames_done = sum(int(cam.get("frames_processed", 0)) for cam in result.get("cameras", []))
         ball_detected = sum(int(cam.get("real_detection_count", 0)) for cam in result.get("cameras", []))
         _update_job_progress(job_id, "Tracking...", 55, frames_done=frames_done, frames_processed=frames_done, ball_detected=ball_detected)

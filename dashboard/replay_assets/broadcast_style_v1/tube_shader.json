@@ -1,0 +1,10 @@
+{
+  "_comment": "One continuous tube; per-vertex colour interpolates start->end across the impact.",
+  "colorStart": "#d0263a",
+  "colorEnd": "#2f57d8",
+  "blend": [0.43, 0.57],
+  "tubularSegments": 220,
+  "radialSegments": 24,
+  "curveType": "catmullrom",
+  "curveTension": 0.5
+}

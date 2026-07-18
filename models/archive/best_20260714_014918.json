@@ -1,0 +1,18 @@
+{
+  "model_name": "ball_v5",
+  "class": "Ball",
+  "dataset": "Extracted Frames/1_mov",
+  "training_date": "2026-07-02T14:40:16",
+  "epochs": 100,
+  "image_size": 640,
+  "batch_size": "Auto",
+  "images": 1138,
+  "mAP50": 0.9675370683216588,
+  "mAP50_95": 0.6917162924400979,
+  "precision": 0.9312860011584573,
+  "recall": 0.9298245614035088,
+  "parent_model": "ball_v2",
+  "ultralytics_version": "8.4.78",
+  "device": "NVIDIA GeForce RTX 5060 (CUDA)",
+  "notes": ""
+}

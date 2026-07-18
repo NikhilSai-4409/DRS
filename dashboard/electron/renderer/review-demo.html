@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Review Mode overlay demo</title>
+    <style>
+      body { margin: 0; background: #0b0f0d; color: #ddd; font-family: system-ui; display: grid; place-items: center; min-height: 100vh; gap: 12px; }
+      canvas { width: 960px; height: 540px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,.5); background: #12241a; }
+      .row { display: flex; gap: 10px; align-items: center; }
+      button, select { background: #1c2a22; color: #ddd; border: 1px solid #33463b; border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <canvas id="c" width="1280" height="720"></canvas>
+    <div class="row">
+      <button id="play">▶ Play</button>
+      <button id="full">Show full</button>
+      <select id="theme"><option value="broadcast">Broadcast</option><option value="ipl">IPL</option></select>
+      <select id="speed" aria-label="Playback speed">
+        <option value="0.1">0.1x</option>
+        <option value="0.25">0.25x</option>
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="2">2x</option>
+      </select>
+      <span id="prog">t = —</span>
+    </div>
+    <script type="module">
+      import { ReviewPlayer } from "./overlay/overlay-renderer.js";
+
+      const measured  = [[500,140],[522,190],[544,242],[566,300],[586,362],[604,430],[622,520]];
+      const predicted = [[622,520],[650,486],[680,452],[708,420],[732,394],[752,372]];
+      const shadow    = [[500,608],[540,610],[585,612],[622,614],[680,614],[732,612],[752,610]];
+      const payload = {
+        review_type: "lbw", verdict: "OUT", confidence: 0.94,
+        measurements: [{ label: "Impact", value: "in line" }, { label: "Ball speed", value: "131 km/h" }],
+        measured_px: measured.map((p) => [p[0], p[1], 0]),
+        predicted_px: predicted.map((p) => [p[0], p[1], 0]),
+        shadow_px: shadow,
+        bounce_px: { x: 586, y: 362 }, impact_px: { x: 622, y: 520 },
+        stumps_px: [{ x: 742, y: 392 }, { x: 752, y: 388 }, { x: 764, y: 392 }],
+        hitting: true,
+        decision_cards: [
+          { label: "ORIGINAL DECISION", value: "OUT", status: "out" },
+          { label: "PITCHING", value: "IN LINE", status: "info" },
+          { label: "IMPACT", value: "IN LINE", status: "info" },
+          { label: "WICKETS", value: "HITTING", status: "out" },
+        ],
+      };
+
+      const player = new ReviewPlayer(document.getElementById("c"));
+      player.setPayload(payload);
+      player.onProgress = (p) => { document.getElementById("prog").textContent = `t = ${(p * player.director.duration).toFixed(1)}s`; };
+      player.seek(0.97); // start showing the full overlay
+      document.getElementById("play").onclick = () => player.restart();
+      document.getElementById("full").onclick = () => player.seek(0.97);
+      document.getElementById("theme").onchange = (e) => { player.setTheme(e.target.value); player.seek(0.97); };
+      document.getElementById("speed").onchange = (e) => { player.setSpeed(Number(e.target.value)); player.restart(); };
+      window.__player = player;   // test hook
+    </script>
+  </body>
+</html>

@@ -12,7 +12,7 @@ What already exists:
 - LBW decision service and Law 36 logic: `core/drs_decision.py`, `core/lbw.py`, `core/lbw_engine.py`, `core/decision_mapper.py`
 - WebSocket/API foundation: `core/api_server.py`, `core/testing_api.py`, `core/ws_hub.py`
 - Existing Electron shell and dashboard: `dashboard/electron/main.js`, `dashboard/electron/preload.js`, `dashboard/electron/renderer/*`
-- Existing calibration scaffolding: `core/calibration.py`, `core/pitch_calibration.py`, `scripts/calibrate.py`, `dashboard/electron/renderer/calibration.*`
+- Existing calibration scaffolding: `core/calibration.py`, `core/pitch_calibration.py`, `scripts/calibrate.py`, `dashboard/electron/renderer/components/CalibrationModal.js`
 - Existing training script: `scripts/train_yolo_drs.py`
 - Available local footage: `12345/*.MTS`
 - Available pitch reference images: `E:\PRIVATE\AVCHD\BDMV\PITCH img\*.jpeg`
@@ -98,9 +98,7 @@ Modify:
 - `core/calibration.py`
 - `core/pitch_calibration.py`
 - `scripts/calibrate.py`
-- `dashboard/electron/renderer/calibration.html`
-- `dashboard/electron/renderer/calibration.js`
-- `dashboard/electron/renderer/calibration.css`
+- `dashboard/electron/renderer/components/CalibrationModal.js` (standalone calibration.html/.js/.css removed 2026-07-17; the workspace is the only calibration UI)
 - `config/settings.py`
 - `tests/test_pitch_calibration.py`
 
@@ -486,9 +484,7 @@ Modify:
 - `dashboard/electron/renderer/index.html`
 - `dashboard/electron/renderer/renderer.js`
 - `dashboard/electron/renderer/styles.css`
-- `dashboard/electron/renderer/calibration.html`
-- `dashboard/electron/renderer/calibration.js`
-- `dashboard/electron/renderer/calibration.css`
+- `dashboard/electron/renderer/components/CalibrationModal.js` (standalone calibration.html/.js/.css removed 2026-07-17)
 - `README.md`
 - `QUICK_START.md`
 

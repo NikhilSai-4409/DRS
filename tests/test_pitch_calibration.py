@@ -55,7 +55,8 @@ def test_save_and_load_profile_per_camera(tmp_path: Path, monkeypatch: pytest.Mo
     loaded = calibrator.load_profile(1)
     assert loaded is not None
     assert loaded.markers == sample_markers
-    assert (tmp_path / "calibration_1.json").exists()
+    assert (tmp_path / "pose_1.json").exists()
+    assert not (tmp_path / "calibration_1.json").exists()  # no longer collides with intrinsics
 
 
 def test_refresh_readiness_from_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sample_markers: dict) -> None:
@@ -91,3 +92,14 @@ def test_missing_marker_raises(sample_markers: dict[str, dict[str, float]]) -> N
     calibrator = ManualPitchCalibrator()
     with pytest.raises(ValueError, match="Missing markers"):
         calibrator.compute_homography(incomplete)
+
+
+def test_pitch_mm_pixel_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sample_markers: dict) -> None:
+    monkeypatch.setattr("core.pitch_calibration.CALIBRATION_DIR", tmp_path)
+    calibrator = ManualPitchCalibrator()
+    calibrator.save_profile(1, sample_markers, (1280, 720))
+    pitch_mm = calibrator.pixel_to_pitch_mm(1, 180.0, 298.0)
+    assert pitch_mm is not None
+    px, py = calibrator.pitch_mm_to_pixel(1, pitch_mm[0], pitch_mm[1])
+    assert px == pytest.approx(180.0, abs=2.0)
+    assert py == pytest.approx(298.0, abs=2.0)

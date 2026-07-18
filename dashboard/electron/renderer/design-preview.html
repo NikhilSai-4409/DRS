@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cricket DRS — design preview</title>
+<style>
+  :root{
+    --bg:#0a0e14;
+    --glass:rgba(20,26,34,0.60); --glass-strong:rgba(26,34,44,0.82);
+    --stroke:rgba(255,255,255,0.08); --stroke2:rgba(255,255,255,0.14);
+    --txt:#e8edf3; --txt2:#9fb0c0; --txt3:#64748b;
+    --accent:#3b82f6; --accent2:#60a5fa; --live:#22c55e; --warn:#f59e0b; --danger:#ef4444;
+    --r:14px; --ease:cubic-bezier(.4,0,.2,1);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;color:var(--txt);
+    background:radial-gradient(1200px 600px at 80% -10%,rgba(59,130,246,.10),transparent 60%),
+      radial-gradient(900px 500px at -10% 110%,rgba(34,197,94,.06),transparent 60%),var(--bg);overflow:hidden}
+  .app{display:grid;grid-template-rows:48px 1fr;height:100vh}
+
+  .toolbar{display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--glass-strong);
+    backdrop-filter:blur(16px);border-bottom:1px solid var(--stroke)}
+  .logo{display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:.4px}
+  .logo .mark{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;
+    background:linear-gradient(135deg,var(--accent),#1e40af);font-size:12px;color:#fff}
+  .tb-sep{width:1px;height:22px;background:var(--stroke2)}
+  .tb-item{font-size:12px;color:var(--txt2);display:flex;flex-direction:column;line-height:1.25}
+  .tb-item b{color:var(--txt);font-size:13px;font-weight:600}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;padding:4px 10px;
+    border-radius:999px;background:rgba(34,197,94,.12);color:#86efac;border:1px solid rgba(34,197,94,.35)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--live);animation:pulse 1.6s infinite}
+  .spacer{flex:1}.chips{display:flex;gap:8px;flex-wrap:wrap}
+  .chip{font-size:11px;color:var(--txt2);background:var(--glass);border:1px solid var(--stroke);border-radius:10px;
+    padding:5px 9px;display:flex;align-items:center;gap:6px;white-space:nowrap}
+  .chip b{color:var(--txt);font-weight:600}.chip .led{width:6px;height:6px;border-radius:50%;background:var(--live)}
+
+  .body{display:grid;grid-template-columns:74px 1fr;min-height:0}
+  .sidebar{display:flex;flex-direction:column;gap:6px;padding:14px 8px;background:var(--glass);
+    backdrop-filter:blur(16px);border-right:1px solid var(--stroke)}
+  .nav{display:flex;flex-direction:column;align-items:center;gap:5px;padding:11px 4px;border-radius:12px;
+    color:var(--txt2);cursor:pointer;border-left:3px solid transparent;transition:all 120ms var(--ease)}
+  .nav .ic{font-size:19px}.nav small{font-size:9.5px;font-weight:600}
+  .nav:hover{background:rgba(59,130,246,.10);color:var(--txt);transform:translateX(2px);box-shadow:0 0 18px rgba(59,130,246,.18) inset}
+  .nav.active{background:rgba(59,130,246,.16);color:#fff;border-left-color:var(--accent);box-shadow:0 0 22px rgba(59,130,246,.22) inset}
+
+  .main{position:relative;min-height:0;overflow:hidden}
+  .view{position:absolute;inset:0;padding:14px;display:none;overflow:auto}
+  .view.show{display:block;animation:viewin 350ms var(--ease)}
+  .card{background:var(--glass);backdrop-filter:blur(16px);border:1px solid var(--stroke);border-radius:var(--r);
+    padding:13px;animation:cardin 250ms var(--ease) backwards}
+  .card h3{font-size:11px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.6px;
+    margin-bottom:9px;display:flex;align-items:center;justify-content:space-between}
+  .btn{font-size:12px;font-weight:600;color:var(--txt);background:rgba(59,130,246,.14);border:1px solid rgba(59,130,246,.4);
+    border-radius:9px;padding:6px 11px;cursor:pointer;transition:all 120ms var(--ease)}
+  .btn:hover{background:rgba(59,130,246,.26);transform:translateY(-1px)}
+  .btn.ghost{background:transparent;border-color:var(--stroke2);color:var(--txt2)}
+  .btn.sm{padding:5px 9px;font-size:11px}
+
+  /* LIVE layout: cameras 40% | center | analysis */
+  .grid-live{display:grid;grid-template-columns:40% 1fr 25%;gap:12px;height:100%}
+  .camwrap{display:grid;grid-template-rows:auto 1fr;gap:10px;min-height:0}
+  .camgrid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:10px;min-height:0}
+  .cam{position:relative;border-radius:12px;overflow:hidden;background:#0b1018;border:2px solid var(--live);
+    animation:liveborder 2.4s infinite;min-height:0}
+  .cam.warn{border-color:var(--warn);animation:warnpulse 2s infinite}
+  .cam .feed{position:absolute;inset:0;background:repeating-linear-gradient(135deg,#0f1722 0 12px,#0c131c 12px 24px)}
+  .cam .feed::after{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 30%,rgba(120,170,255,.10) 48%,transparent 60%);
+    transform:translateX(-100%);animation:shimmer 6s infinite}
+  .cam .tag{position:absolute;top:7px;left:7px;font-size:10px;font-weight:700;letter-spacing:.5px;padding:3px 7px;border-radius:6px;
+    background:rgba(34,197,94,.92);color:#06281a;display:flex;align-items:center;gap:5px}
+  .cam .tag .lv{width:6px;height:6px;border-radius:50%;background:#06281a;animation:pulse 1.4s infinite}
+  .cam .tag.bad{background:rgba(245,158,11,.92);color:#3a2600}
+  .cam .name{position:absolute;top:7px;right:9px;font-size:11px;font-weight:600}
+  .cam .info{position:absolute;left:0;right:0;bottom:0;padding:8px;font-size:10px;line-height:1.5;
+    background:linear-gradient(transparent,rgba(0,0,0,.82))}
+  .cam .info .row1{font-size:12px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+  .cam .info .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px 10px;color:#b9c6d3;margin-top:3px}
+  .sync-ok{color:#86efac;font-weight:700}.sync-bad{color:#fbbf24;font-weight:700}
+
+  .center{display:grid;grid-template-rows:1.4fr 1fr;gap:12px;min-height:0}
+  .scene{position:relative;border-radius:10px;overflow:hidden;background:radial-gradient(120% 120% at 50% 0,#11202e,#0a121a);
+    border:1px solid var(--stroke);min-height:0}
+  .pitch{position:absolute;left:50%;bottom:12%;transform:translateX(-50%) rotateX(60deg);width:120px;height:62%;
+    background:rgba(122,93,60,.32);border:1px solid rgba(200,160,110,.4);border-radius:4px}
+  .ball{position:absolute;width:13px;height:13px;border-radius:50%;background:#fff;box-shadow:0 0 14px #fff,0 0 24px var(--accent2);opacity:0}
+  .pt-label{position:absolute;font-size:9.5px;font-weight:600;padding:2px 6px;border-radius:5px;opacity:0;transition:opacity .3s}
+  .review-veil{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:13px;
+    color:var(--accent2);font-weight:600;letter-spacing:1px;background:rgba(4,7,11,.45);opacity:0;pointer-events:none;transition:opacity .3s}
+
+  .decision{position:relative;text-align:center;display:flex;flex-direction:column;justify-content:center}
+  .badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.6px;padding:5px 12px;border-radius:999px;
+    background:rgba(59,130,246,.15);color:var(--accent2);border:1px solid rgba(59,130,246,.4);margin:0 auto}
+  .stage{font-size:13px;color:var(--accent2);font-weight:600;letter-spacing:.5px;height:18px;margin-top:8px}
+  .dtitle{font-size:34px;font-weight:700;margin:4px 0;transition:all 700ms var(--ease)}
+  .gauges{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px}
+  .gauge{display:flex;flex-direction:column;align-items:center;gap:4px}
+  .gauge svg{transform:rotate(-90deg)}.gauge .val{font-size:17px;font-weight:700}
+  .gauge small{font-size:9.5px;color:var(--txt2);text-transform:uppercase;letter-spacing:.5px}
+
+  .analysis{display:grid;grid-template-rows:auto auto auto auto;gap:12px;min-height:0;align-content:start}
+  canvas.wave{width:100%;height:56px;display:block}
+  .hotspot{height:84px;border-radius:10px;border:1px solid var(--stroke);position:relative;overflow:hidden;
+    background:radial-gradient(70% 90% at 50% 70%,#1a2230,#0c131c)}
+  .bat{position:absolute;left:42%;bottom:6px;width:10px;height:62px;background:#162130;border:1px solid var(--stroke2);border-radius:3px;transform:rotate(8deg)}
+  .pad{position:absolute;left:54%;bottom:6px;width:26px;height:54px;background:#101a26;border:1px solid var(--stroke2);border-radius:5px}
+  .hsball{position:absolute;left:46%;top:34%;width:9px;height:9px;border-radius:50%;background:#cbd5e1}
+  .heat{position:absolute;left:48%;top:34%;width:30px;height:30px;border-radius:50%;transform:translate(-50%,-50%) scale(0);
+    background:radial-gradient(circle,#fde68a,#f97316 50%,transparent 72%)}
+  .timeline-wrap{position:relative;padding-top:5px}
+  .track{position:absolute;height:2px;background:#1f2937;left:7%;right:7%;top:5px}
+  .track i{position:absolute;left:0;top:0;height:100%;width:0;background:var(--live);transition:width .35s linear;box-shadow:0 0 8px var(--live)}
+  .timeline{display:flex;justify-content:space-between}
+  .node{display:flex;flex-direction:column;align-items:center;gap:5px;font-size:9px;color:var(--txt3);cursor:pointer;flex:1}
+  .node .pt{width:11px;height:11px;border-radius:50%;background:#1f2937;border:2px solid #334155;transition:all .2s}
+  .node.done .pt{background:var(--live);border-color:var(--live);box-shadow:0 0 12px rgba(34,197,94,.7)}
+  .node.done{color:var(--txt)}.node:hover .pt{transform:scale(1.3)}
+  .playback{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt2)}
+  .playback .pb{width:30px;height:30px;border-radius:8px;border:1px solid var(--stroke2);background:transparent;color:var(--txt);cursor:pointer}
+  .playback .pb:hover{background:rgba(59,130,246,.16)}
+
+  /* AI pipeline */
+  .counters{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+  .counter{background:var(--glass);border:1px solid var(--stroke);border-radius:12px;padding:15px}
+  .counter small{font-size:11px;color:var(--txt2);text-transform:uppercase;letter-spacing:.5px}
+  .counter .num{font-size:28px;font-weight:700;margin-top:5px}
+  .pipe{display:flex;align-items:stretch;gap:0;margin-bottom:16px}
+  .pstep{flex:1;background:var(--glass);border:1px solid var(--stroke);border-radius:12px;padding:13px;position:relative}
+  .pconn{align-self:center;width:26px;height:2px;background:#283546;position:relative;flex:none}
+  .pconn.done{background:var(--live);box-shadow:0 0 8px var(--live)}
+  .pstep .n{font-size:9.5px;color:var(--txt3);font-weight:700;letter-spacing:1px}
+  .pstep .name{font-size:13px;font-weight:600;margin-top:5px}
+  .pstep .st{margin-top:9px;font-size:10.5px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+  .pstep .st .d{width:8px;height:8px;border-radius:50%;background:currentColor}
+  .pstep.done{border-color:rgba(34,197,94,.45)}.pstep.done .st{color:#86efac}
+  .pstep.active{border-color:rgba(59,130,246,.55);box-shadow:0 0 22px rgba(59,130,246,.16) inset}
+  .pstep.active .st{color:var(--accent2)}.pstep.active .st .d{animation:pulse 1s infinite}
+  .pstep.pending .st{color:var(--txt3)}.pstep.pending .st .d{background:#475569}
+  .graphs{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
+  .graph small{font-size:10px;color:var(--txt2);text-transform:uppercase;letter-spacing:.5px}
+  .graph .gv{font-size:17px;font-weight:700;margin:2px 0 4px}
+
+  /* models */
+  .models{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+  .mcard{background:var(--glass);border:1px solid var(--stroke);border-radius:14px;padding:17px}
+  .mcard.prod{border-color:rgba(34,197,94,.4);box-shadow:0 0 26px rgba(34,197,94,.1) inset}
+  .mcard .role{font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--txt2)}
+  .mcard .role.p{color:#86efac}.mcard .big{font-size:32px;font-weight:700;margin:7px 0}
+  .mcard .delta{color:#86efac;font-size:13px;font-weight:600}
+  .mcard .acts{display:flex;gap:8px;margin-top:12px}
+  table.cmp{width:100%;border-collapse:collapse;font-size:13px}
+  table.cmp th,table.cmp td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--stroke)}
+  table.cmp th{color:var(--txt2);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  table.cmp td.win{color:#86efac;font-weight:600}
+
+  /* calib + system */
+  .calib{display:grid;grid-template-columns:200px 1fr 230px;gap:12px;height:100%}
+  .profiles div{padding:9px 11px;border-radius:10px;border:1px solid var(--stroke);margin-bottom:8px;font-size:13px;cursor:pointer}
+  .profiles div.sel{border-color:rgba(59,130,246,.5);background:rgba(59,130,246,.12)}
+  .ref{position:relative;border-radius:10px;border:1px solid var(--stroke);
+    background:repeating-conic-gradient(#0e1622 0 25%,#0a121a 0 50%) 0 0/38px 38px;min-height:250px;overflow:hidden}
+  .corner{position:absolute;width:8px;height:8px;border:2px solid #4ade80;border-radius:50%;box-shadow:0 0 8px #4ade80;
+    transform:scale(0);animation:pop .3s var(--ease) forwards}
+  .metrics div{display:flex;justify-content:space-between;font-size:13px;padding:8px 0;border-bottom:1px solid var(--stroke)}
+  .good{color:#86efac}
+  .sys{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  .sg{background:var(--glass);border:1px solid var(--stroke);border-radius:12px;padding:15px;text-align:center}
+  .sg small{font-size:10.5px;color:var(--txt2);text-transform:uppercase;letter-spacing:.5px}
+  .sg .v{font-size:24px;font-weight:700;margin:6px 0}
+  .sg .b{height:6px;border-radius:999px;background:#172033;overflow:hidden}
+  .sg .b i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .6s var(--ease)}
+
+  .toasts{position:absolute;top:12px;right:14px;display:flex;flex-direction:column;gap:9px;z-index:20}
+  .toast{display:flex;align-items:center;gap:10px;padding:10px 13px;border-radius:12px;font-size:12.5px;background:var(--glass-strong);
+    backdrop-filter:blur(16px);border:1px solid rgba(34,197,94,.4);color:var(--txt);animation:slidein .35s var(--ease)}
+  .toast .tk{width:19px;height:19px;border-radius:50%;background:rgba(34,197,94,.2);color:#86efac;display:grid;place-items:center;font-size:11px}
+
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  @keyframes liveborder{0%,100%{box-shadow:0 0 0 1px rgba(34,197,94,.25),0 0 16px rgba(34,197,94,.10)}50%{box-shadow:0 0 0 1px rgba(34,197,94,.5),0 0 26px rgba(34,197,94,.26)}}
+  @keyframes warnpulse{0%,100%{box-shadow:0 0 0 1px rgba(245,158,11,.3),0 0 14px rgba(245,158,11,.10)}50%{box-shadow:0 0 0 1px rgba(245,158,11,.55),0 0 28px rgba(245,158,11,.3)}}
+  @keyframes shimmer{0%,70%{transform:translateX(-100%)}85%,100%{transform:translateX(100%)}}
+  @keyframes viewin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  @keyframes cardin{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  @keyframes slidein{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:none}}
+  @keyframes pop{to{transform:scale(1)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="toolbar">
+    <div class="logo"><div class="mark">DRS</div> CricketVision</div>
+    <div class="tb-sep"></div>
+    <div class="tb-item"><span>Match</span><b>State T20 — SF2</b></div>
+    <div class="tb-item"><span>Clock</span><b id="clock">--:--:--</b></div>
+    <div class="tb-item"><span>Match timer</span><b id="mtimer">00:00</b></div>
+    <span class="pill"><span class="dot"></span> LIVE</span>
+    <div class="spacer"></div>
+    <div class="chips">
+      <div class="chip"><span class="led"></span>GPU <b>RTX 5060</b></div>
+      <div class="chip">CUDA <b id="c-cuda">61°C</b></div>
+      <div class="chip">RAM <b id="c-ram">9.4 GB</b></div>
+      <div class="chip">Infer <b id="c-inf">11 ms</b></div>
+      <div class="chip"><span class="led"></span>Sync <b id="c-sync">2.1 ms</b></div>
+    </div>
+  </div>
+
+  <div class="body">
+    <nav class="sidebar">
+      <div class="nav active" data-view="live"><span class="ic">📹</span><small>Live DRS</small></div>
+      <div class="nav" data-view="ai"><span class="ic">🧠</span><small>AI Dev</small></div>
+      <div class="nav" data-view="models"><span class="ic">🚀</span><small>Models</small></div>
+      <div class="nav" data-view="calib"><span class="ic">🎯</span><small>Calib</small></div>
+      <div class="nav" data-view="sys"><span class="ic">📊</span><small>System</small></div>
+    </nav>
+
+    <div class="main">
+      <div class="toasts" id="toasts"></div>
+
+      <!-- LIVE -->
+      <section class="view show" data-panel="live">
+        <div class="grid-live">
+          <div class="camwrap">
+            <div class="card" style="padding:9px 13px"><h3 style="margin:0">Cameras <span style="color:#86efac" id="cam-conn">3 / 4 synced</span></h3></div>
+            <div class="camgrid" id="camgrid"></div>
+          </div>
+
+          <div class="center">
+            <div class="card scene" style="padding:0;animation-delay:.05s">
+              <div style="position:absolute;top:10px;left:12px;font-size:11px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.6px;z-index:2">3D trajectory · <span style="color:var(--accent2)">Hawk-Eye</span></div>
+              <div class="pitch"></div>
+              <svg id="trajsvg" style="position:absolute;inset:0;width:100%;height:100%" viewBox="0 0 460 300" preserveAspectRatio="none"></svg>
+              <div class="ball" id="ball"></div>
+              <div class="pt-label" id="lab-rel" style="background:rgba(255,255,255,.16);color:#fff">Release</div>
+              <div class="pt-label" id="lab-bnc" style="background:rgba(245,158,11,.2);color:#fde68a">Bounce</div>
+              <div class="pt-label" id="lab-imp" style="background:rgba(239,68,68,.2);color:#fca5a5">Impact</div>
+              <div class="pt-label" id="lab-stp" style="background:rgba(59,130,246,.2);color:#93c5fd">Stumps</div>
+              <div class="review-veil" id="veil">REVIEW REQUESTED</div>
+            </div>
+            <div class="card decision" style="animation-delay:.1s">
+              <span class="badge" id="dbadge">● LIVE</span>
+              <div class="stage" id="stage">Listening for appeal…</div>
+              <div class="dtitle" id="dtitle" style="color:var(--txt)">Waiting</div>
+              <div class="gauges" id="gauges" style="visibility:hidden">
+                <div class="gauge"><svg width="58" height="58" id="g1"></svg><div class="val" id="g1v">0%</div><small>Detection</small></div>
+                <div class="gauge"><svg width="58" height="58" id="g2"></svg><div class="val" id="g2v">0%</div><small>Tracking</small></div>
+                <div class="gauge"><svg width="58" height="58" id="g3"></svg><div class="val" id="g3v">0%</div><small>Impact</small></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="analysis">
+            <div class="card" style="animation-delay:.12s"><h3>UltraEdge <span id="ue-conf" style="color:var(--txt3)">no edge</span></h3><canvas class="wave" id="wave"></canvas></div>
+            <div class="card" style="animation-delay:.15s"><h3>HotSpot <span style="color:var(--txt3)">thermal</span></h3>
+              <div class="hotspot"><div class="bat"></div><div class="pad"></div><div class="hsball"></div><div class="heat" id="heat"></div></div></div>
+            <div class="card" style="animation-delay:.18s"><h3>Review timeline</h3>
+              <div class="timeline-wrap"><div class="track"><i id="trackfill"></i></div>
+                <div class="timeline" id="timeline">
+                  <div class="node"><span class="pt"></span>Release</div><div class="node"><span class="pt"></span>Bounce</div>
+                  <div class="node"><span class="pt"></span>Impact</div><div class="node"><span class="pt"></span>Pad</div>
+                  <div class="node"><span class="pt"></span>Predict</div><div class="node"><span class="pt"></span>Decision</div>
+                </div></div></div>
+            <div class="card" style="animation-delay:.2s"><h3>Replay <span id="frlabel" style="color:var(--txt3)">frame 0 · 00:00.0</span></h3>
+              <div class="playback"><button class="pb">⏮</button><button class="pb">◀</button><button class="pb">▶</button><button class="pb">⏭</button>
+                <span style="margin-left:auto" id="bspeed">— km/h</span></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- AI -->
+      <section class="view" data-panel="ai">
+        <div class="counters">
+          <div class="counter"><small>Videos</small><div class="num" data-count="125">0</div></div>
+          <div class="counter"><small>Frames</small><div class="num" data-count="43182">0</div></div>
+          <div class="counter"><small>Labels</small><div class="num" data-count="42700">0</div></div>
+          <div class="counter"><small>Datasets</small><div class="num" data-count="4">0</div></div>
+        </div>
+        <div class="pipe" id="pipe"></div>
+        <div class="card">
+          <h3>Training · YOLO11 · RTX 5060 <span style="color:var(--accent2)" id="epoch">epoch 57 / 200</span></h3>
+          <div class="graphs" id="graphs"></div>
+        </div>
+      </section>
+
+      <!-- MODELS -->
+      <section class="view" data-panel="models">
+        <div class="models">
+          <div class="mcard prod"><div class="role p">● Production · active</div><div class="big">91.2%</div>
+            <div style="color:var(--txt2);font-size:12px">YOLO11 · deployed Jun 27</div>
+            <div class="acts"><button class="btn ghost sm">Metrics</button><button class="btn ghost sm">Rollback</button></div></div>
+          <div class="mcard"><div class="role">Candidate · v004</div><div class="big">91.8% <span class="delta">+0.6%</span></div>
+            <div style="color:var(--txt2);font-size:12px">trained today · 30 imgs</div>
+            <div class="acts"><button class="btn ghost sm">Compare</button><button class="btn sm">Deploy</button></div></div>
+        </div>
+        <div class="card"><h3>Comparison · production vs candidate</h3>
+          <table class="cmp"><thead><tr><th>Metric</th><th>Production</th><th>Candidate v004</th></tr></thead><tbody>
+            <tr><td>Precision</td><td>0.901</td><td class="win">0.914</td></tr>
+            <tr><td>Recall</td><td>0.887</td><td class="win">0.902</td></tr>
+            <tr><td>F1</td><td>0.894</td><td class="win">0.908</td></tr>
+            <tr><td>mAP50</td><td>0.912</td><td class="win">0.918</td></tr>
+            <tr><td>FPS</td><td class="win">142</td><td>138</td></tr>
+            <tr><td>Latency</td><td class="win">7.0 ms</td><td>7.2 ms</td></tr>
+            <tr><td>Parameters</td><td>25.3 M</td><td>25.3 M</td></tr>
+            <tr><td>GFLOPs</td><td>86.9</td><td>86.9</td></tr>
+          </tbody></table></div>
+      </section>
+
+      <!-- CALIB -->
+      <section class="view" data-panel="calib">
+        <div class="calib">
+          <div class="card profiles"><h3>Profiles</h3><div class="sel">Cam 1 · ground A</div><div>Cam 2 · ground A</div><div>Cam 3 · ground A</div><div>+ New profile</div></div>
+          <div class="card"><h3>Reference · <span style="color:var(--accent2)">ChArUco</span> <span id="cdet" style="color:#86efac">detecting…</span></h3><div class="ref" id="ref"></div></div>
+          <div class="card"><h3>Quality</h3>
+            <div class="metrics"><div><span>RMS error</span><b class="good">1.1 px</b></div><div><span>Corners</span><b id="cn">0 / 54</b></div>
+              <div><span>Board found</span><b class="good">Yes</b></div><div><span>Distortion</span><b>k1 −0.21</b></div><div><span>Homography</span><b class="good">3.4 cm</b></div></div>
+            <div style="display:flex;flex-direction:column;gap:8px;margin-top:13px"><button class="btn">Capture board</button><button class="btn ghost">Solve</button><button class="btn ghost">Save profile</button></div></div>
+        </div>
+      </section>
+
+      <!-- SYSTEM -->
+      <section class="view" data-panel="sys">
+        <div class="sys" id="sys"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id), pad=n=>String(n).padStart(2,"0"), t0=Date.now();
+const lerp=(a,b,t)=>a+(b-a)*t, jit=(v,d)=>v+(Math.random()*2-1)*d;
+
+/* clock + match timer */
+setInterval(()=>{const d=new Date();$("clock").textContent=pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
+  const s=Math.floor((Date.now()-t0)/1000);$("mtimer").textContent=pad(Math.floor(s/60))+":"+pad(s%60);},1000);
+
+/* toolbar telemetry jitter (alive) */
+setInterval(()=>{$("c-cuda").textContent=Math.round(jit(61,2))+"°C";$("c-ram").textContent=jit(9.4,.2).toFixed(1)+" GB";
+  $("c-inf").textContent=Math.round(jit(11,1.4))+" ms";$("c-sync").textContent=jit(2.1,.4).toFixed(1)+" ms";},1400);
+
+/* camera cards */
+const camData=[
+  {n:"Cam 1",ok:true,fps:29.9},{n:"Cam 2",ok:true,fps:30.0},
+  {n:"Cam 3",ok:true,fps:29.8},{n:"Cam 4",ok:false,fps:0}];
+$("camgrid").innerHTML=camData.map((c,i)=>`
+  <div class="cam ${c.ok?'':'warn'}" style="animation-delay:${i*.4}s">
+    <div class="feed" style="animation-delay:${i*1.4}s"></div>
+    <div class="tag ${c.ok?'':'bad'}">${c.ok?'<span class="lv"></span>LIVE':'RECONNECT'}</div>
+    <div class="name">${c.n}</div>
+    <div class="info"><div class="row1"><span class="fps" data-base="${c.fps}">${c.ok?c.fps.toFixed(1)+' FPS':'-- FPS'}</span>
+      <span class="${c.ok?'sync-ok':'sync-bad'}">${c.ok?'SYNC OK':'SYNC LOST'}</span></div>
+      <div class="grid"><span>⏱ 1/1000</span><span>◎ f2.8</span><span>🔍 2.4x</span>
+        <span>⬇ ${c.ok?'0':'14'}</span><span>↔ ${c.ok?'8ms':'—'}</span><span>🌡 ${c.ok?'42°':'—'}</span></div></div>
+  </div>`).join("");
+setInterval(()=>{document.querySelectorAll(".cam .fps").forEach(el=>{const b=+el.dataset.base;if(b>0)el.textContent=jit(b,.12).toFixed(1)+" FPS";});},900);
+
+/* gauges */
+function gauge(id,pct,color){const el=$(id);if(!el)return;const r=23,c=2*Math.PI*r;
+  el.innerHTML=`<circle cx="29" cy="29" r="${r}" stroke="#1f2937" stroke-width="6" fill="none"/>
+    <circle cx="29" cy="29" r="${r}" stroke="${color}" stroke-width="6" fill="none" stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${c}"/>`;
+  const a=el.querySelectorAll("circle")[1];requestAnimationFrame(()=>{a.style.transition="stroke-dashoffset 700ms cubic-bezier(.4,0,.2,1)";a.style.strokeDashoffset=c*(1-pct/100);});}
+function countTo(id,to,suf){const el=$(id);let c=0;const iv=setInterval(()=>{c+=Math.max(1,Math.round(to/30));if(c>=to){c=to;clearInterval(iv);}el.textContent=c+suf;},20);}
+
+/* continuous oscilloscope */
+const wv=$("wave");let spike=0;
+function drawWave(){if(!wv)return;const w=wv.width=wv.clientWidth*2,h=wv.height=112,ctx=wv.getContext("2d");
+  const cur=(Date.now()/7)%w;ctx.clearRect(0,0,w,h);
+  ctx.strokeStyle="rgba(96,165,250,.65)";ctx.lineWidth=2;ctx.beginPath();
+  for(let x=0;x<w;x++){const base=Math.sin((x+Date.now()/40)/9)*5;const sp=(spike>0&&Math.abs(x-cur)<16)?Math.sin((x-cur)/2)*36*spike:0;
+    const y=h/2+base+sp;x?ctx.lineTo(x,y):ctx.moveTo(x,y);}ctx.stroke();
+  ctx.strokeStyle="rgba(34,197,94,.9)";ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(cur,8);ctx.lineTo(cur,h-8);ctx.stroke();
+  if(spike>0)spike=Math.max(0,spike-.012);requestAnimationFrame(drawWave);}
+drawWave();
+
+/* trajectory: build a multi-colour self-drawing path */
+const svg=$("trajsvg");
+const arc="M 70 40 Q 150 120 210 175 T 320 235";       // release->bounce->impact (white/yellow/orange/red)
+const pred="M 320 235 L 405 270";                        // blue prediction to stumps
+svg.innerHTML=`<defs><linearGradient id="grad" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#ffffff"/><stop offset=".4" stop-color="#fbbf24"/><stop offset=".7" stop-color="#f97316"/><stop offset="1" stop-color="#ef4444"/></linearGradient></defs>
+  <path id="parc" d="${arc}" fill="none" stroke="url(#grad)" stroke-width="3" stroke-linecap="round"/>
+  <path id="ppred" d="${pred}" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-dasharray="3 6"/>
+  <circle cx="320" cy="235" r="6" fill="#ef4444" opacity="0"/>`;
+const parc=$("parc"),ppred=$("ppred"),La=parc.getTotalLength(),Lp=ppred.getTotalLength();
+parc.style.strokeDasharray=La;ppred.style.strokeDasharray=Lp;
+function resetTraj(){parc.style.transition="none";ppred.style.transition="none";parc.style.strokeDashoffset=La;ppred.style.strokeDashoffset=Lp;
+  $("ball").style.opacity=0;["lab-rel","lab-bnc","lab-imp","lab-stp"].forEach(i=>$(i).style.opacity=0);}
+resetTraj();
+function placeLabel(id,len,path){const p=path.getPointAtLength(len);const r=svg.getBoundingClientRect(),s=svg.closest(".scene").getBoundingClientRect();
+  const x=(p.x/460)*r.width+(r.left-s.left),y=(p.y/300)*r.height+(r.top-s.top);const el=$(id);el.style.left=x+"px";el.style.top=(y-18)+"px";}
+function drawTraj(){parc.style.transition="stroke-dashoffset 1.5s linear";parc.style.strokeDashoffset=0;
+  const b=$("ball");b.style.opacity=1;b.animate([{offset:0,offsetDistance:"0%"},{offset:1,offsetDistance:"100%"}],{duration:1500,easing:"linear",fill:"forwards"});
+  b.style.offsetPath=`path("${arc}")`;
+  setTimeout(()=>{placeLabel("lab-rel",0,parc);$("lab-rel").style.opacity=1;},150);
+  setTimeout(()=>{placeLabel("lab-bnc",La*.45,parc);$("lab-bnc").style.opacity=1;},700);
+  setTimeout(()=>{placeLabel("lab-imp",La,parc);$("lab-imp").style.opacity=1;},1500);}
+function drawPred(){ppred.style.transition="stroke-dashoffset .6s linear";ppred.style.strokeDashoffset=0;
+  setTimeout(()=>{placeLabel("lab-stp",Lp,ppred);$("lab-stp").style.opacity=1;svg.querySelector("circle").setAttribute("opacity","1");},600);}
+
+/* review sequence — the heart of "alive" */
+const stages=["Review requested","Tracking…","Predicting…","UltraEdge…","HotSpot…","Decision"];
+const nodes=()=>[...document.querySelectorAll("#timeline .node")];
+function reviewCycle(){
+  nodes().forEach(n=>n.classList.remove("done"));$("trackfill").style.width="0";
+  $("gauges").style.visibility="hidden";$("heat").style.transition="none";$("heat").style.transform="translate(-50%,-50%) scale(0)";
+  $("dtitle").textContent="Waiting";$("dtitle").style.color="var(--txt)";$("dbadge").textContent="● LIVE";
+  $("ue-conf").textContent="no edge";$("cdet")&&0;resetTraj();
+  let s=0;const veil=$("veil");
+  $("stage").textContent=stages[0];veil.style.opacity=1;setTimeout(()=>veil.style.opacity=0,900);
+  setTimeout(drawTraj,300);
+  [["Release",700],["Bounce",1050],["Impact",1600]].forEach(([_,t],i)=>setTimeout(()=>{nodes()[i].classList.add("done");$("trackfill").style.width=((i+1)/6*86+7)+"%";},t));
+  setTimeout(()=>$("stage").textContent=stages[1],1800);
+  setTimeout(()=>{nodes()[3].classList.add("done");$("trackfill").style.width=(4/6*86+7)+"%";$("frlabel").textContent="frame 184 · 00:06.1";$("bspeed").textContent="138 km/h";},2100);
+  setTimeout(()=>{$("stage").textContent=stages[2];drawPred();nodes()[4].classList.add("done");$("trackfill").style.width=(5/6*86+7)+"%";},2400);
+  setTimeout(()=>{$("stage").textContent=stages[3];spike=1;$("ue-conf").textContent="edge 0.12";},2900);
+  setTimeout(()=>{$("stage").textContent=stages[4];$("heat").style.transition="transform .6s cubic-bezier(.4,0,.2,1)";$("heat").style.transform="translate(-50%,-50%) scale(1)";},3300);
+  setTimeout(()=>{$("stage").textContent="";$("dbadge").textContent="DECISION";$("dtitle").textContent="OUT";$("dtitle").style.color="#fca5a5";
+    $("gauges").style.visibility="visible";gauge("g1",93,"#22c55e");gauge("g2",88,"#60a5fa");gauge("g3",95,"#22c55e");
+    countTo("g1v",93,"%");countTo("g2v",88,"%");countTo("g3v",95,"%");nodes()[5].classList.add("done");$("trackfill").style.width="93%";},3800);
+  setTimeout(()=>{$("dbadge").textContent="● LIVE";$("stage").textContent="Listening for appeal…";$("dtitle").textContent="Waiting";$("dtitle").style.color="var(--txt)";},7000);
+}
+reviewCycle();setInterval(reviewCycle,8500);
+
+/* toasts */
+function toast(m){const t=document.createElement("div");t.className="toast";t.innerHTML='<span class="tk">✓</span> '+m;$("toasts").appendChild(t);
+  setTimeout(()=>{t.style.transition="opacity .4s";t.style.opacity=0;setTimeout(()=>t.remove(),400);},3400);}
+setTimeout(()=>toast("Dataset v004 imported · 30 images"),1500);
+setTimeout(()=>toast("Candidate v004 trained · mAP 91.8%"),4200);
+setInterval(()=>toast("Sync re-locked · drift 2.1 ms"),16000);
+
+/* AI pipeline */
+const steps=[["Videos","done"],["Frames","done"],["Vision Studio","done"],["Validate","done"],["Train","active"],["Evaluate","pending"],["Deploy","pending"]];
+$("pipe").innerHTML=steps.map((s,i)=>`<div class="pstep ${s[1]}"><div class="n">STEP ${i+1}</div><div class="name">${s[0]}</div>
+  <div class="st"><span class="d"></span>${s[1]==='done'?'Done':s[1]==='active'?'Running':'Pending'}</div></div>`+
+  (i<steps.length-1?`<div class="pconn ${s[1]==='done'?'done':''}"></div>`:"")).join("");
+
+/* training live graphs */
+const metrics=[["Loss",.214,false],["Precision",.914,true],["Recall",.902,true],["mAP50",.918,true],["mAP50-95",.731,true]];
+$("graphs").innerHTML=metrics.map((m,i)=>`<div class="graph"><small>${m[0]}</small><div class="gv" id="gv${i}">—</div>
+  <svg viewBox="0 0 100 40" style="width:100%;height:46px"><polyline id="pl${i}" fill="none" stroke="${m[2]?'#60a5fa':'#f59e0b'}" stroke-width="2" points=""/></svg></div>`).join("");
+const series=metrics.map(m=>{const up=m[2];return Array.from({length:24},(_,k)=>{const t=k/23;return up?m[1]*(0.55+0.45*t):m[1]*(2-t*0.9);});});
+function pushEpoch(){metrics.forEach((m,i)=>{const up=m[2];const last=series[i][series[i].length-1];
+  const nv=up?Math.min(m[1]+.01,last+jit(.004,.006)):Math.max(.18,last+jit(-.002,.004));series[i].push(nv);if(series[i].length>24)series[i].shift();
+  const max=Math.max(...series[i]),min=Math.min(...series[i]),rng=(max-min)||1;
+  $("pl"+i).setAttribute("points",series[i].map((v,k)=>`${(k/23*100).toFixed(1)},${(38-((v-min)/rng)*34).toFixed(1)}`).join(" "));
+  $("gv"+i).textContent=up?(nv*100).toFixed(1)+"%":nv.toFixed(3);});}
+pushEpoch();setInterval(pushEpoch,1500);
+let ep=57;setInterval(()=>{ep=Math.min(200,ep+1);$("epoch").textContent="epoch "+ep+" / 200";},1500);
+
+/* nav */
+const navs=[...document.querySelectorAll(".nav")];
+navs.forEach(n=>n.addEventListener("click",()=>{navs.forEach(x=>x.classList.remove("active"));n.classList.add("active");
+  const v=n.dataset.view;document.querySelectorAll(".view").forEach(s=>s.classList.toggle("show",s.dataset.panel===v));
+  if(v==="ai")document.querySelectorAll("[data-count]").forEach(el=>{let c=0,t=+el.dataset.count,st=Math.max(1,Math.round(t/40));
+    const iv=setInterval(()=>{c+=st;if(c>=t){c=t;clearInterval(iv);}el.textContent=c.toLocaleString();},18);});
+  if(v==="calib")runCorners();if(v==="sys")runSys();}));
+
+/* calibration corners appear one-by-one */
+let cornerTimer=null;
+function runCorners(){const ref=$("ref");ref.innerHTML="";let i=0;clearInterval(cornerTimer);
+  cornerTimer=setInterval(()=>{for(let k=0;k<3&&i<54;k++,i++){const c=document.createElement("div");c.className="corner";
+    c.style.left=(10+(i%9)*9)+"%";c.style.top=(18+Math.floor(i/9)*13)+"%";ref.appendChild(c);}
+    $("cn").textContent=i+" / 54";if(i>=54){clearInterval(cornerTimer);$("cdet").textContent="board found";}},90);}
+
+/* system monitor (alive bars) */
+const sysM=[["CPU",34,"%"],["GPU",72,"%"],["VRAM",61,"%"],["CUDA",61,"°C"],["RAM",58,"%"],["SSD",71,"%"],["Cam bw",430," Mb/s"],["Net",12," ms"]];
+$("sys").innerHTML=sysM.map((m,i)=>`<div class="sg"><small>${m[0]}</small><div class="v" id="sv${i}">${m[1]}${m[2]}</div><div class="b"><i id="sb${i}" style="width:${Math.min(100,m[1])}%"></i></div></div>`).join("");
+function runSys(){sysM.forEach((m,i)=>{const v=Math.round(jit(m[1],m[1]*.08));$("sv"+i).textContent=v+m[2];$("sb"+i).style.width=Math.min(100,v)+"%";});}
+setInterval(()=>{if(document.querySelector('[data-panel="sys"]').classList.contains("show"))runSys();},1200);
+</script>
+</body>
+</html>

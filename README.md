@@ -143,7 +143,7 @@ Public model and dataset notes are in `docs\PUBLIC_BASELINES.md`. The public bas
 
 ## Calibration
 
-Capture checkerboard images for each camera under final match placement, zoom, focus, and exposure.
+Capture ChArUco board images for each camera under final match placement, zoom, focus, and exposure.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\calibrate.py --cameras 0,1 --images-dir data\calibration\images

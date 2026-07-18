@@ -115,9 +115,9 @@ No unrelated Desktop files were deleted.
 | `dashboard/electron/renderer/components/PitchMap2D.js` | 2D pitch map renderer. | ACTIVE | Results panel imports it. | NO |
 | `dashboard/electron/renderer/hooks/useAnalysisJob.js` | Job WebSocket/polling helper. | ACTIVE | Testing panel imports it. | NO |
 | `dashboard/electron/renderer/hooks/useCalibrationProfiles.js` | Calibration CRUD helper. | ACTIVE | Testing/calibration UI imports it. | NO |
-| `dashboard/electron/renderer/calibration.html` | Older standalone calibration page. | SUPERSEDED | Calibration modal now exists, but this may still be useful fallback. | REVIEW |
-| `dashboard/electron/renderer/calibration.js` | Older standalone calibration page logic. | SUPERSEDED | Review after modal is fully verified. | REVIEW |
-| `dashboard/electron/renderer/calibration.css` | Older standalone calibration page styles. | SUPERSEDED | Review after modal is fully verified. | REVIEW |
+| `dashboard/electron/renderer/calibration.html` | Older standalone calibration page. | REMOVED | Deleted 2026-07-17; CalibrationWorkspace (CalibrationModal.js) is the only calibration UI. | DONE |
+| `dashboard/electron/renderer/calibration.js` | Older standalone calibration page logic. | REMOVED | Deleted 2026-07-17 with calibration.html. | DONE |
+| `dashboard/electron/renderer/calibration.css` | Older standalone calibration page styles. | REMOVED | Deleted 2026-07-17 with calibration.html. | DONE |
 | `dashboard/electron/index.html` | Older root-level Electron page. | SUPERSEDED | Current app loads `renderer/index.html`. | REVIEW |
 | `dashboard/electron/renderer.js` | Older root-level Electron renderer. | SUPERSEDED | Current app loads `renderer/renderer.js`. | REVIEW |
 | `dashboard/electron/styles.css` | Older root-level Electron styles. | SUPERSEDED | Current app loads `renderer/styles.css`. | REVIEW |

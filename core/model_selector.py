@@ -9,6 +9,8 @@ from typing import Any
 
 
 MODEL_CANDIDATES = [
+    ("drs_production", Path("models/production/best.pt")),
+    ("custom_cricket_yolo11l_real", Path("models/cricket_ball_yolo11l_real.pt")),
     ("yolo11x", Path("yolo11x.pt")),
     ("yolo11x", Path("models/yolo11x.pt")),
     ("yolo11l", Path("yolo11l.pt")),
@@ -47,6 +49,13 @@ class DetectorModelSelector:
             path = Path(requested)
             readiness = self._readiness_for(path, "requested", metrics)
             return path, readiness
+
+        # The production model is whatever the registry says is production — the
+        # single source of truth, not a hardcoded path. Falls through to the legacy
+        # candidate list only if the registry has no production model.
+        production = self._registry_production()
+        if production is not None and production.exists():
+            return production, self._readiness_for(production, "drs_production", metrics)
 
         for family, path in MODEL_CANDIDATES:
             if path.exists():
@@ -95,6 +104,15 @@ class DetectorModelSelector:
             usable=usable,
             reason=reason,
         )
+
+    def _registry_production(self) -> Path | None:
+        """Ask the registry for the production model (lazy import avoids any cycle)."""
+        try:
+            from core.model_registry import ModelRegistry
+
+            return ModelRegistry().production_model_path()
+        except Exception:
+            return None
 
     def _load_metrics(self) -> dict[str, Any]:
         if not self.metrics_path.exists():

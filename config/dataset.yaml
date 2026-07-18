@@ -1,0 +1,16 @@
+# Production dataset registry for the Cricket DRS detector.
+#
+# Dataset versions live here. The detector class list lives in
+# config/classes.yaml and training/data.yaml is generated from both files.
+
+# The dataset version currently used for training/validation/inference.
+# Build new data into a fresh version and promote it by changing this value.
+active: production
+
+# All dataset versions under training/datasets/. Old versions are never
+# overwritten; collect new data into the next version slot.
+datasets:
+  - dataset_v1
+  - dataset_v2
+  - dataset_v3
+  - production

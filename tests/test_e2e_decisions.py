@@ -18,7 +18,7 @@ def test_lbw_decision(clip, expected, synthetic_e2e_env):
     del synthetic_e2e_env
     path = Path("tests/fixtures/scenarios") / clip
     pipeline = DeliveryTestingPipeline()
-    result = pipeline.process(f"e2e_{path.stem}", [path], AnalysisOptions(max_frames=90))
+    result = pipeline.process(f"e2e_{path.stem}", [path], AnalysisOptions(max_frames=90, replay_generation=False))
     actual = result["summary"]["lbw_recommendation"]
     assert actual == expected, (
         f"{clip}: expected {expected}, got {actual}\n"

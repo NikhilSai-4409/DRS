@@ -1,5 +1,5 @@
 param(
-    [int]$ApiPort = 8766,
+    [int]$ApiPort = 8765,
     [int]$FrontendPort = 5173,
     [switch]$SkipModelDownload
 )

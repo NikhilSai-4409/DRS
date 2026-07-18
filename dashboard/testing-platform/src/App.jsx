@@ -15,6 +15,9 @@ import {
   Video,
 } from "lucide-react";
 import "./styles.css";
+import "./drs-widgets.css";
+import DrsReviewAnimation from "./DrsReviewAnimation";
+import WicketImpactPanel from "./WicketImpactPanel";
 
 const API = "http://127.0.0.1:8765";
 
@@ -33,6 +36,7 @@ function App() {
   const [files, setFiles] = useState([]);
   const [options, setOptions] = useState(defaultOptions);
   const [job, setJob] = useState(null);
+  const [showBroadcast, setShowBroadcast] = useState(false);
   const [progress, setProgress] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [backend, setBackend] = useState("checking");
@@ -201,10 +205,19 @@ function App() {
                 ⚠ Using estimated geometry -- import calibration data for accurate LBW decisions.
               </div>
             )}
+            <div className="broadcast-preview-bar">
+              <button
+                type="button"
+                className={`broadcast-preview-btn ${showBroadcast ? "on" : ""}`}
+                onClick={() => setShowBroadcast((v) => !v)}
+              >
+                {showBroadcast ? "▾ Hide broadcast replay" : "▸ Preview broadcast replay"}
+              </button>
+            </div>
+            {showBroadcast && <DrsReviewAnimation summary={summary} />}
             <ReviewPlayer
               originalFile={files[0]}
               analyzedSrc={result ? exportUrl("video") : null}
-              animationSrc={result ? exportUrl("animation") : null}
               fps={fps}
             />
             <div className="evidence-grid">
@@ -236,6 +249,10 @@ function App() {
             <Metric label="Uncertainty" value={summary ? `${Math.round(summary.uncertainty * 100)}%` : "--"} />
             <Metric label="Tracking reliability" value={summary?.reliability || "--"} />
             <Metric label="Failed gates" value={summary?.gate?.failed_gates?.length ? summary.gate.failed_gates.join(", ") : "none"} />
+          </Panel>
+
+          <Panel title="Wickets · ball impact" icon={<CheckCircle2 size={18} />}>
+            <WicketImpactPanel summary={summary} />
           </Panel>
 
           <Panel title="Export features" icon={<Download size={18} />}>
@@ -315,7 +332,7 @@ function CalibrationBanner({ status, onImport }) {
   );
 }
 
-function ReviewPlayer({ originalFile, analyzedSrc, animationSrc, fps }) {
+function ReviewPlayer({ originalFile, analyzedSrc, fps }) {
   const originalRef = useRef(null);
   const analyzedRef = useRef(null);
   const [sideBySide, setSideBySide] = useState(false);
@@ -397,7 +414,7 @@ function ReviewPlayer({ originalFile, analyzedSrc, animationSrc, fps }) {
           Side by side
         </button>
       </div>
-      <div className={`video-grid ${sideBySide ? "side-by-side" : ""}`}>
+      <div className="video-grid two">
         <VideoPane
           title="Original video"
           src={originalUrl}
@@ -414,7 +431,6 @@ function ReviewPlayer({ originalFile, analyzedSrc, animationSrc, fps }) {
           onPlay={() => syncPlay(true)}
           onPause={() => syncPlay(false)}
         />
-        {!sideBySide && <VideoPane title="Clean DRS animation" src={animationSrc} />}
       </div>
     </div>
   );

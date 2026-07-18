@@ -1,0 +1,8 @@
+{
+  "hemisphere": { "sky": "#bfd8ff", "ground": "#40662c", "intensity": 0.55 },
+  "ambient": 0.35,
+  "sun": {
+    "color": "#fff2d8", "intensity": 1.7, "position": [4.5, 8, 3.5],
+    "shadow": { "mapSize": 2048, "bounds": 6, "near": 1, "far": 30, "bias": -0.0004 }
+  }
+}

@@ -351,8 +351,14 @@ p {
   gap: 12px;
 }
 
-.video-grid.side-by-side {
+.video-grid.side-by-side,
+.video-grid.two {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.video-grid.two {
+  height: auto;
+  min-height: 0;
 }
 
 .video-pane {

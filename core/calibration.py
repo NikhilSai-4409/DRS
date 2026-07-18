@@ -2,20 +2,84 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 
-from config.settings import CALIBRATION_DIR, CHECKERBOARD_SIZE, SQUARE_SIZE_MM
+from config.settings import (
+    CALIBRATION_DIR,
+    CHARUCO_DICTIONARY_ID,
+    CHARUCO_MARKER_SIZE_MM,
+    CHARUCO_SQUARE_SIZE_MM,
+    CHARUCO_SQUARES_X,
+    CHARUCO_SQUARES_Y,
+)
+from core.calibration_paths import get_intrinsics_path, get_legacy_path
 from utils.helpers import save_json
 from utils.helpers import load_json
 
 
 PROFILE_DIR = Path("config/calibration_profiles")
+
+# --- calibration storage paths (intrinsics separated from pitch pose) --------
+# Historically both camera intrinsics AND the manual pitch profile were written to
+# ``calibration_<id>.json``, so one calibration silently overwrote the other. They
+# now live in dedicated files; ``calibration_<id>.json`` is read only for backward
+# compatibility (with a one-time migration notice) and never written.
+_INTRINSICS_MIGRATION_NOTIFIED: set[str] = set()
+
+
+def intrinsics_path(camera_id: int | str) -> Path:
+    return get_intrinsics_path(camera_id, CALIBRATION_DIR)
+
+
+def legacy_calibration_path(camera_id: int | str) -> Path:
+    return get_legacy_path(camera_id, CALIBRATION_DIR)
+
+
+def _notify_intrinsics_migration(camera_id: int | str, legacy: Path, new: Path) -> None:
+    key = str(camera_id)
+    if key in _INTRINSICS_MIGRATION_NOTIFIED:
+        return
+    _INTRINSICS_MIGRATION_NOTIFIED.add(key)
+    print(
+        f"MIGRATION: camera {camera_id} intrinsics loaded from legacy {legacy.name}; "
+        f"they will move to {new.name} on the next intrinsics save."
+    )
+
+
+def load_intrinsics_data(camera_id: int | str) -> Optional[dict]:
+    """Return the intrinsics JSON for a camera, or None.
+
+    Prefers ``intrinsics_<id>.json``; falls back to a legacy ``calibration_<id>.json``
+    that actually holds intrinsics (has a ``camera_matrix``), emitting a one-time notice.
+    """
+    new = intrinsics_path(camera_id)
+    if new.exists():
+        try:
+            return load_json(new)
+        except Exception as exc:
+            print(f"WARNING: could not read intrinsics from {new}: {exc}")
+            return None
+    legacy = legacy_calibration_path(camera_id)
+    if legacy.exists():
+        try:
+            data = load_json(legacy)
+        except Exception:
+            return None
+        if isinstance(data, dict) and data.get("camera_matrix") is not None:
+            _notify_intrinsics_migration(camera_id, legacy, new)
+            return data
+    return None
+
+
+def _camera_calibration_from_dict(data: dict) -> "CameraCalibration":
+    known = {f.name for f in fields(CameraCalibration)}
+    return CameraCalibration(**{k: v for k, v in data.items() if k in known})
 PITCH_WORLD_POINTS = np.array(
     [
         [-1.32, 0.0, 0.0],
@@ -42,6 +106,46 @@ PITCH_POINT_LABELS = [
     "Striker stumps - right top",
 ]
 
+# Along-pitch coordinate of the striker's stumps in this world frame (Y=0 at the bowling
+# crease, +Y toward the striker; see PITCH_WORLD_POINTS).
+STRIKER_STUMPS_ALONG_M = 20.12
+
+
+def summarize_ground_trajectory(project, points_px, timestamps_s, bounce_px=None,
+                                stump_along_m: float = STRIKER_STUMPS_ALONG_M) -> dict:
+    """Physics sanity summary for a calibrated delivery — NOT a renderer, just numbers.
+
+    ``project`` maps an image pixel to world GROUND metres (X lateral, Y along-pitch from
+    the bowling crease, Z up). Projecting a flight pixel to the ground plane gives the
+    ball's ground-shadow (parallax) — fine for a sanity check and exact at the bounce
+    (which is on the ground). Returns ground-shadow speed (km/h) and the bounce location,
+    so you can eyeball whether the canonical calibration produces physically sane values
+    BEFORE wiring it into the pipeline."""
+    world: list[tuple[float, float, float]] = []
+    for (x, y), t in zip(points_px, timestamps_s):
+        try:
+            wx, wy, _ = project(float(x), float(y))
+        except Exception:
+            continue
+        world.append((wx, wy, float(t)))
+    speeds: list[float] = []
+    for (ax, ay, ta), (bx, by, tb) in zip(world, world[1:]):
+        dt = tb - ta
+        if dt > 0:
+            speeds.append(float(np.hypot(bx - ax, by - ay)) / dt * 3.6)
+    speeds.sort()
+    ground_speed = speeds[len(speeds) // 2] if speeds else 0.0
+    bounce = None
+    if bounce_px is not None:
+        try:
+            bx, by, _ = project(float(bounce_px[0]), float(bounce_px[1]))
+            bounce = {"along_m": round(by, 2), "lateral_m": round(bx, 2),
+                      "from_stumps_m": round(stump_along_m - by, 2)}
+        except Exception:
+            bounce = None
+    return {"ground_speed_kmh": round(ground_speed, 1), "bounce": bounce,
+            "points_projected": len(world), "points_total": len(points_px)}
+
 
 @dataclass(slots=True)
 class CameraCalibration:
@@ -56,20 +160,38 @@ class CameraCalibration:
 
 
 class MultiCameraCalibrator:
-    """Calibrates cameras from checkerboard images and estimates pitch-plane homography."""
+    """Calibrates cameras from the canonical ChArUco board image set."""
 
     def __init__(
         self,
-        checkerboard_size: tuple[int, int] = CHECKERBOARD_SIZE,
-        square_size_mm: float = SQUARE_SIZE_MM,
+        squares_x: int = CHARUCO_SQUARES_X,
+        squares_y: int = CHARUCO_SQUARES_Y,
+        square_size_mm: float = CHARUCO_SQUARE_SIZE_MM,
+        marker_size_mm: float = CHARUCO_MARKER_SIZE_MM,
+        dictionary_name: str = CHARUCO_DICTIONARY_ID,
     ) -> None:
-        self.checkerboard_size = checkerboard_size
+        if not hasattr(cv2, "aruco"):
+            raise RuntimeError("OpenCV ArUco is unavailable; install opencv-contrib-python>=4.9")
+
+        self.squares_x = squares_x
+        self.squares_y = squares_y
         self.square_size_mm = square_size_mm
-        self.object_template = self._make_object_template()
+        self.marker_size_mm = marker_size_mm
+        self.dictionary_name = dictionary_name
+
+        dictionary_id = getattr(cv2.aruco, dictionary_name)
+        self.dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+        self.board = cv2.aruco.CharucoBoard(
+            (squares_x, squares_y),
+            square_size_mm,
+            marker_size_mm,
+            self.dictionary,
+        )
+        self.detector = cv2.aruco.CharucoDetector(self.board)
 
     def calibrate_camera(self, camera_id: int, image_paths: list[Path]) -> CameraCalibration:
-        object_points: list[np.ndarray] = []
-        image_points: list[np.ndarray] = []
+        all_charuco_corners: list[np.ndarray] = []
+        all_charuco_ids: list[np.ndarray] = []
         image_size: Optional[tuple[int, int]] = None
 
         for image_path in image_paths:
@@ -78,19 +200,25 @@ class MultiCameraCalibrator:
                 continue
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             image_size = (gray.shape[1], gray.shape[0])
-            found, corners = cv2.findChessboardCorners(gray, self.checkerboard_size)
-            if not found:
+            charuco_corners, charuco_ids, _, _ = self.detector.detectBoard(gray)
+
+            # Four non-collinear ChArUco corners are the mathematical minimum
+            # for a useful board pose; richer views improve calibration quality.
+            if charuco_ids is None or charuco_corners is None or len(charuco_ids) < 4:
                 continue
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
-            refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-            object_points.append(self.object_template)
-            image_points.append(refined)
+            all_charuco_corners.append(charuco_corners.astype(np.float32))
+            all_charuco_ids.append(charuco_ids.astype(np.int32))
 
-        if not object_points or image_size is None:
-            raise ValueError(f"No checkerboard detections found for camera {camera_id}")
+        if not all_charuco_corners or image_size is None:
+            raise ValueError(f"No usable ChArUco detections found for camera {camera_id}")
 
-        rms, camera_matrix, dist, rvecs, tvecs = cv2.calibrateCamera(
-            object_points, image_points, image_size, None, None
+        rms, camera_matrix, dist, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
+            all_charuco_corners,
+            all_charuco_ids,
+            self.board,
+            image_size,
+            None,
+            None,
         )
         calibration = CameraCalibration(
             camera_id=camera_id,
@@ -177,11 +305,21 @@ class MultiCameraCalibrator:
         return save_json([asdict(item) for item in calibrations], path)
 
     def save_per_camera(self, calibration: CameraCalibration) -> Path:
-        return save_json(asdict(calibration), CALIBRATION_DIR / f"calibration_{calibration.camera_id}.json")
+        payload = {
+            "type": "intrinsics",
+            "schema_version": 1,
+            "camera_id": calibration.camera_id,
+            # UTC, matching pose_<id>.json so timestamps are comparable across both files.
+            "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            **asdict(calibration),
+        }
+        return save_json(payload, intrinsics_path(calibration.camera_id))
 
     def load_per_camera(self, camera_id: int) -> CameraCalibration:
-        data = load_json(CALIBRATION_DIR / f"calibration_{camera_id}.json")
-        return CameraCalibration(**data)
+        data = load_intrinsics_data(camera_id)
+        if data is None:
+            raise FileNotFoundError(f"No intrinsics calibration for camera {camera_id}")
+        return _camera_calibration_from_dict(data)
 
     def draw_reprojection(
         self,
@@ -201,14 +339,6 @@ class MultiCameraCalibrator:
         for point in projected.reshape(-1, 2):
             cv2.circle(frame, tuple(point.astype(int)), 4, (0, 255, 255), -1, cv2.LINE_AA)
         return frame
-
-    def _make_object_template(self) -> np.ndarray:
-        cols, rows = self.checkerboard_size
-        points = np.zeros((rows * cols, 3), np.float32)
-        points[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
-        points *= self.square_size_mm
-        return points
-
 
 class PitchCalibrator:
     """Single-camera pitch calibration using nine clicked pitch landmarks."""
@@ -368,8 +498,8 @@ class PitchCalibrator:
         image_points: list[list[float]],
     ) -> dict:
         image_size = (int(frame.shape[1]), int(frame.shape[0]))
-        camera_matrix = self._initial_camera_matrix(image_size)
-        dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+        # Use REAL ChArUco intrinsics when they exist; only guess as a loud fallback.
+        camera_matrix, dist_coeffs, intrinsics_source, warnings = self._load_intrinsics(camera_id, image_size)
         ok, rvec, tvec = cv2.solvePnP(
             self.world_points.astype(np.float32),
             np.asarray(image_points, dtype=np.float32),
@@ -388,6 +518,8 @@ class PitchCalibrator:
             "camera_id": str(camera_id),
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "rms_error_px": rms,
+            "intrinsics_source": intrinsics_source,   # "charuco" | "estimated"
+            "warnings": warnings,                     # persisted so the profile self-declares
             "image_size": list(image_size),
             "image_points": [[float(x), float(y)] for x, y in image_points],
             "world_points": self.world_points.astype(float).tolist(),
@@ -396,6 +528,30 @@ class PitchCalibrator:
             "camera_matrix": camera_matrix.astype(float).tolist(),
             "dist_coeffs": dist_coeffs.reshape(-1).astype(float).tolist(),
         }
+
+    def _load_intrinsics(self, camera_id: int | str, image_size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, str, list[str]]:
+        """Prefer REAL ChArUco intrinsics (from scripts/calibrate.py →
+        data/calibration/intrinsics_<id>.json) over a guessed pinhole. Reads a legacy
+        calibration_<id>.json when the new file is absent. Falls back to an estimate with
+        a loud warning (printed AND persisted into the profile) so nobody — now or in six
+        months — mistakes a fabricated pinhole for a measured camera."""
+        data = load_intrinsics_data(camera_id)
+        if data is not None:
+            try:
+                camera_matrix = np.asarray(data["camera_matrix"], dtype=np.float64)
+                raw_dist = data.get("distortion_coeffs")
+                if raw_dist is None:
+                    raw_dist = data.get("dist_coeffs", [[0.0, 0.0, 0.0, 0.0, 0.0]])
+                dist_coeffs = np.asarray(raw_dist, dtype=np.float64).reshape(-1, 1)
+                if camera_matrix.shape == (3, 3):
+                    return camera_matrix, dist_coeffs, "charuco", []
+            except Exception as exc:
+                print(f"WARNING: could not read intrinsics for camera {camera_id}: {exc}")
+        warning = ("No ChArUco calibration found for this camera. Pose solved using estimated "
+                   "pinhole intrinsics (focal=max(w,h), no distortion). Ground geometry is approximate.")
+        print(f"WARNING: no intrinsic calibration for camera {camera_id} ({intrinsics_path(camera_id)}).")
+        print(f"         {warning}")
+        return self._initial_camera_matrix(image_size), np.zeros((5, 1), dtype=np.float64), "estimated", [warning]
 
     def _require_profile(self) -> dict:
         if self.profile is None:

@@ -25,6 +25,7 @@ from utils.logger import get_logger
 
 log = get_logger("ball_detector")
 CRICKET_MODEL_PATH = Path("models/cricket_ball_yolov8.pt")
+REAL_MATCH_MODEL_PATH = Path("models/cricket_ball_yolo11l_real.pt")
 GENERIC_YOLO_MODEL_PATH = Path("yolo11l.pt")
 BALL_CLASS_IDS = {0}
 SPORTS_BALL_CLASS_ID = 32
@@ -91,6 +92,7 @@ class BallDetector:
     ) -> None:
         self.device = device
         self.export_results = export_results
+        self.imgsz = YOLO_IMG_SIZE  # inference resolution; callers may override per-detect
         self.preprocessor = FramePreprocessor()
         self.model: Any = None
         self.model_readiness: ModelReadiness | None = None
@@ -112,7 +114,22 @@ class BallDetector:
 
         global BALL_CLASS_IDS
         if model_path is None:
-            if CRICKET_MODEL_PATH.exists():
+            from core.model_registry import ModelRegistry
+
+            production = ModelRegistry().production_model_path()
+            if production is not None and production.exists():
+                # The registry is the single source of truth for the live model.
+                # select(None) now resolves to this same production model.
+                selected_path, readiness = DetectorModelSelector().select(None)
+                BALL_CLASS_IDS = {0}
+                self.using_coco_fallback = False
+                log.info("[DRS] Using production model from registry: {} -- class filter: {}", selected_path.name, BALL_CLASS_IDS)
+            elif REAL_MATCH_MODEL_PATH.exists():
+                selected_path, readiness = DetectorModelSelector().select(REAL_MATCH_MODEL_PATH)
+                BALL_CLASS_IDS = {0}
+                self.using_coco_fallback = False
+                log.info("[DRS] Using real-match cricket model -- class filter: {}", BALL_CLASS_IDS)
+            elif CRICKET_MODEL_PATH.exists():
                 selected_path, readiness = DetectorModelSelector().select(CRICKET_MODEL_PATH)
                 BALL_CLASS_IDS = {0}
                 self.using_coco_fallback = False
@@ -155,12 +172,17 @@ class BallDetector:
         timestamp_ms: float,
         camera_id: int = 0,
         preprocess: bool = True,
+        imgsz: int | None = None,
     ) -> DetectionResult:
         if self.model is None:
             return DetectionResult(frame_id, timestamp_ms, camera_id, [], 0.0)
 
         input_frame = self.preprocessor(frame) if preprocess else frame
         started = time.perf_counter()
+
+        # Larger imgsz preserves a small/fast ball in wide 1080p/4K footage that
+        # 640 would downscale away. Falls back to the detector default.
+        size = int(imgsz) if imgsz else self.imgsz
 
         device = self.device
         if self._gpu_failed:
@@ -171,7 +193,7 @@ class BallDetector:
                 source=input_frame,
                 conf=YOLO_CONF_THRESH,
                 iou=YOLO_IOU_THRESH,
-                imgsz=YOLO_IMG_SIZE,
+                imgsz=size,
                 device=device,
                 verbose=False,
             )
@@ -185,7 +207,7 @@ class BallDetector:
                         source=input_frame,
                         conf=YOLO_CONF_THRESH,
                         iou=YOLO_IOU_THRESH,
-                        imgsz=YOLO_IMG_SIZE,
+                        imgsz=size,
                         device="cpu",
                         verbose=False,
                     )

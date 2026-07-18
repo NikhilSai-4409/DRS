@@ -39,6 +39,11 @@ models/*.pt
 !models/.gitkeep
 models/best.pt
 
+# Model registry (Phase 8): keep dir scaffolding, never commit weights
+models/production/*.pt
+models/experiments/
+models/archive/*.pt
+
 .DS_Store
 Thumbs.db
 logs/
@@ -47,8 +52,79 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 12345/
+
+# Legacy training scaffolding (superseded by training/dataset/)
 training/images/
 training/labels/
 training/review/
+
+# Production datasets (versioned): never commit heavy media; structure kept via .gitkeep.
+# Small calibration profiles, metadata and exports stay versionable.
+training/datasets/**/images/**
+training/datasets/**/labels/**
+training/datasets/**/videos/**
+training/datasets/**/audio/**
+!**/.gitkeep
+
+# Dataset pipeline staging area (extracted frames, candidate labels, review queue)
+training/staging/
+
+# Training run outputs and TensorBoard logs
+models/training_runs/
+models/checkpoint_backups/
+runs/
+reports/
+
 data/electron-user-data/
 data/training_smoke/
+
+# AI-development dataset tooling (development/): ignore heavy media by extension
+# so directory scaffolding (.gitkeep) stays trackable.
+dataset/**/*.mp4
+dataset/**/*.mov
+dataset/**/*.avi
+dataset/**/*.mts
+dataset/**/*.m2ts
+dataset/**/*.mkv
+dataset/**/*.jpg
+dataset/**/*.jpeg
+dataset/**/*.png
+dataset/**/*.zip
+
+# UltraEdge audio training data (heavy)
+training/ultraedge/**/*.wav
+training/ultraedge/**/*.flac
+training/ultraedge/**/*.mp3
+training/ultraedge/**/*.npy
+training/ultraedge/**/*.png
+
+# Candidate model weights
+models/candidates/*.pt
+
+# Stray base/model weights and generated calibration boards at repo root
+/yolo11l.pt
+/yolo11x.pt
+/yolo26n.pt
+/charuco_board_*.pdf
+/charuco_board_*.png
+
+# Vision Studio user data workspace (large footage/frames/datasets/models — not tracked)
+/vision_studio_workspace/
+
+# Vision Studio app workspace under development/ (8+ GB: venv, frames, models)
+development/vision_studio/
+
+# Generated analysis outputs and rendered replay previews
+analysis/
+replay_previews/
+
+# Runtime session state (decisions, match archive, per-review artifacts incl. replay mp4s)
+data/decisions/
+data/matches/
+data/reviews/
+data/*.pid
+data/inventory.json
+data/inventory_test.json
+
+# Claude Code local settings (launch.json + dev_preview.py ARE tracked project tooling)
+.claude/settings.local.json

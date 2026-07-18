@@ -1,0 +1,7 @@
+{
+  "grass": { "roughness": 1, "stripeBands": 8, "textureRepeat": 14 },
+  "pitch": { "roughness": 1, "widthM": 3.05, "lengthM": 20.12 },
+  "ball": { "roughness": 0.35, "clearcoat": 0.5, "radius": 0.05 },
+  "tubeCore": { "roughness": 0.75, "clearcoat": 0.2, "clearcoatRoughness": 0.85, "opacity": 0.64, "radius": 0.023 },
+  "tubeGlow": { "opacity": 0.14, "radius": 0.05 }
+}

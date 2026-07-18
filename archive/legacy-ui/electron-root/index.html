@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cricket DRS Command Center</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="tournament-header">
+        <section class="brand-block">
+          <div class="logo-mark"><img id="tournament-logo" alt="" /><span>DRS</span></div>
+          <div>
+            <h1 id="tournament-name"></h1>
+            <span id="venue-name"></span>
+          </div>
+        </section>
+
+        <section class="scoreboard">
+          <div class="team-card"><span id="team-a-label"></span><strong id="score-line"></strong></div>
+          <div class="over-card"><strong id="over-ball"></strong><span>Overs</span></div>
+          <div class="versus">VS</div>
+          <div class="team-card"><span id="team-b-label"></span><strong id="innings-line"></strong></div>
+          <div class="target-card"><span>Target</span><strong id="target-line"></strong></div>
+          <div class="target-card"><span>RRR</span><strong id="rrr-line"></strong></div>
+          <div class="status-card"><span>Status</span><strong id="match-status"></strong><small id="review-clock">00:00</small></div>
+        </section>
+
+        <section class="header-actions">
+          <span id="backend-status" class="offline">Backend offline</span>
+          <button id="preflight-open" class="icon-button" title="Pre-match checklist">Checklist</button>
+          <button id="settings-open" class="icon-button" title="Settings">Settings</button>
+          <button id="operator-open" class="icon-button" title="Operations">System</button>
+          <div class="profile-chip">TO</div>
+        </section>
+      </header>
+
+      <section class="review-selector">
+        <span>Select review type</span>
+        <button data-mode="LBW">LBW</button>
+        <button data-mode="EDGE">Edge</button>
+        <button data-mode="NO_BALL">No Ball</button>
+        <button data-mode="RUN_OUT">Run Out</button>
+        <button data-mode="STUMPING">Stumping</button>
+        <label>Main <select id="big-camera"></select></label>
+        <label>Secondary <select id="small-camera"></select></label>
+        <label>Frame <input id="frame-index" type="number" min="0" value="0" /></label>
+      </section>
+
+      <section class="workspace-grid">
+        <article class="panel main-review">
+          <div class="camera-title">
+            <div><span>Main review camera</span><strong id="big-camera-title">CAM ?</strong></div>
+            <em id="sync-chip">SYNC -- ms</em>
+          </div>
+          <div class="video-stage">
+            <img id="big-feed" class="feed-image" alt="Selected big camera feed" />
+            <canvas id="trajectory-canvas" class="overlay-canvas"></canvas>
+            <aside class="tracking-legend">
+              <div><i class="dot green"></i><span>Pitching point</span><strong id="pitching-location"></strong></div>
+              <div><i class="dot red"></i><span>Impact point</span><strong id="impact-location"></strong></div>
+              <div><i class="dot amber"></i><span>Wicket zone</span><strong id="wicket-probability"></strong></div>
+              <div><i class="dot green"></i><span>Prediction</span><strong id="prediction-mini">Tracking</strong></div>
+            </aside>
+            <div class="impact-marker"><span>Impact</span></div>
+            <div class="wicket-zone"></div>
+          </div>
+          <footer class="camera-controls">
+            <span class="live-pill">Live</span>
+            <button data-command="capture-replay">Replay Delivery</button>
+            <button data-command="prev">Frame -1</button>
+            <button data-command="next">Frame +1</button>
+            <button data-command="play">Live Mode</button>
+            <output id="status">Operator ready</output>
+          </footer>
+        </article>
+
+        <article class="panel decision-panel">
+          <header class="panel-head">
+            <div><span>Decision</span><strong id="review-type"></strong></div>
+            <em id="confidence-chip"></em>
+          </header>
+          <div class="decision-result" id="decision-result"></div>
+          <div class="decision-meter"><span></span></div>
+          <dl class="decision-list">
+            <div><dt>Umpire's call</dt><dd id="umpire-call"></dd></div>
+            <div><dt>Confidence</dt><dd id="decision-accuracy"></dd></div>
+            <div><dt>Edge score</dt><dd id="edge-score"></dd></div>
+            <div><dt>Predicted path</dt><dd id="prediction-feed"></dd></div>
+          </dl>
+        </article>
+
+        <aside class="right-rail">
+          <article class="panel secondary-cameras">
+            <header class="panel-head">
+              <div><span>Secondary Camera</span><strong id="small-camera-title">CAM ?</strong></div>
+              <em>Camera matrix</em>
+            </header>
+            <div class="secondary-feed">
+              <img id="small-feed" class="feed-image" alt="Selected small camera feed" />
+            </div>
+            <div id="camera-status-grid" class="status-grid"></div>
+          </article>
+
+          <article class="panel model-panel">
+            <header class="panel-head">
+              <div><span>3D Trajectory</span><strong>Impact Simulation</strong></div>
+              <em>Replay ready</em>
+            </header>
+            <canvas id="pitch-3d"></canvas>
+          </article>
+
+          <article class="rail-grid">
+            <div class="panel pitch-panel">
+              <header class="panel-head"><div><span>Pitch map</span><strong>Line & length</strong></div></header>
+              <canvas id="pitch-map"></canvas>
+            </div>
+            <div class="panel monitor-panel">
+              <header class="panel-head"><div><span>System status</span><strong>Processing</strong></div></header>
+              <div class="system-list">
+                <div><span>Cameras</span><strong id="camera-count">--</strong></div>
+                <div><span>FPS Avg</span><strong id="fps-metric">--</strong></div>
+                <div><span>Latency</span><strong id="latency-metric">-- ms</strong></div>
+                <div><span>Inference</span><strong id="inference-metric">-- ms</strong></div>
+                <div><span>Network</span><strong id="network-metric">OK</strong></div>
+              </div>
+            </div>
+            <div class="panel ball-panel">
+              <header class="panel-head"><div><span>Ball analytics</span><strong>Delivery</strong></div></header>
+              <div class="system-list">
+                <div><span>Ball speed</span><strong id="ball-speed-readout">-- km/h</strong></div>
+                <div><span>Spin rate</span><strong id="spin-readout">-- rpm</strong></div>
+                <div><span>Swing</span><strong id="swing-readout">--</strong></div>
+                <div><span>CRR</span><strong id="crr-line"></strong></div>
+              </div>
+            </div>
+          </article>
+        </aside>
+
+        <article class="panel bottom-card logs-card">
+          <header class="panel-head"><div><span>Live logs</span><strong>System Events</strong></div></header>
+          <div id="live-logs" class="log-list"></div>
+        </article>
+
+        <article class="panel bottom-card reviews-card">
+          <header class="panel-head"><div><span>Recent reviews</span><strong>Review History</strong></div></header>
+          <div id="review-history" class="review-history"></div>
+        </article>
+
+        <article class="panel bottom-card analytics-card">
+          <header class="panel-head"><div><span>AI predictions</span><strong>Analytics</strong></div></header>
+          <div class="analytics-summary">
+            <div><span>Reviews</span><strong id="review-count">0</strong></div>
+            <div><span>CRR</span><strong id="crr-line-copy"></strong></div>
+            <div><span>Session</span><strong id="session-duration">00:00</strong></div>
+          </div>
+          <div class="chart-strip">
+            <canvas id="speed-chart"></canvas>
+            <canvas id="accuracy-chart"></canvas>
+          </div>
+        </article>
+
+        <article class="panel bottom-card timeline-card">
+          <header class="panel-head"><div><span>Event timeline</span><strong>Session Flow</strong></div></header>
+          <canvas id="timeline-chart"></canvas>
+        </article>
+
+        <article class="panel bottom-card hidden-charts">
+          <canvas id="swing-chart"></canvas>
+          <canvas id="bounce-chart"></canvas>
+        </article>
+      </section>
+
+      <aside id="operator-drawer" class="operator-drawer" aria-hidden="true">
+        <header>
+          <div><span>Operator Panel</span><strong>Tournament Control</strong></div>
+          <button id="operator-close" class="icon-button">Close</button>
+        </header>
+        <button data-command="preflight">Pre-Match Checklist</button>
+        <button data-command="start-match">Start Match</button>
+        <button data-command="pause-match">Pause Match</button>
+        <button data-command="end-match">End Match</button>
+        <button data-command="save-session">Save Session</button>
+        <button data-command="export-review">Export Review</button>
+        <button data-command="generate-report">Generate Report</button>
+        <button data-command="diagnostics">System Diagnostics</button>
+      </aside>
+
+      <section id="settings-modal" class="modal-backdrop" aria-hidden="true">
+        <form id="settings-form" class="settings-modal">
+          <header>
+            <div><span>Configuration</span><strong>Match & System Settings</strong></div>
+            <button id="settings-close" type="button" class="icon-button">Close</button>
+          </header>
+          <div class="settings-grid">
+            <fieldset>
+              <legend>Tournament Configuration</legend>
+              <label>Tournament Name <input name="tournament" /></label>
+              <label>Tournament Logo <input name="tournamentLogo" type="file" accept="image/*" /></label>
+              <label>Venue Name <input name="venue" /></label>
+              <label>Match Date <input name="matchDate" type="date" /></label>
+              <label>Umpire Name <input name="umpire" /></label>
+              <label>Third Umpire Name <input name="thirdUmpire" /></label>
+            </fieldset>
+            <fieldset>
+              <legend>Match Configuration</legend>
+              <label>Team A Name <input name="teamA" /></label>
+              <label>Team A Logo <input name="teamALogo" type="file" accept="image/*" /></label>
+              <label>Team B Name <input name="teamB" /></label>
+              <label>Team B Logo <input name="teamBLogo" type="file" accept="image/*" /></label>
+              <label>Match Type <select name="matchType"><option>T20</option><option>ODI</option><option>Test</option><option>Custom</option></select></label>
+              <label>Match Status <input name="status" /></label>
+            </fieldset>
+            <fieldset>
+              <legend>Live Match Control</legend>
+              <label>Current Innings <input name="innings" type="number" min="1" max="4" /></label>
+              <label>Current Over <input name="over" /></label>
+              <label>Ball Number <input name="ball" type="number" min="0" max="6" /></label>
+              <label>Runs <input name="runs" type="number" min="0" /></label>
+              <label>Wickets <input name="wickets" type="number" min="0" max="10" /></label>
+              <label>Target Score <input name="target" type="number" min="0" /></label>
+              <label>Required Run Rate <input name="requiredRunRate" /></label>
+              <label>Current Run Rate <input name="currentRunRate" /></label>
+            </fieldset>
+            <fieldset>
+              <legend>DRS Review Controls</legend>
+              <label>Review Type <select name="reviewType"><option>LBW</option><option>Edge</option><option>No Ball</option><option>Run Out</option><option>Stumping</option></select></label>
+              <label>Decision <select name="decision"><option>Out</option><option>Not Out</option><option>Umpire Call</option></select></label>
+              <label>Confidence <input name="confidence" type="range" min="0" max="100" /></label>
+            </fieldset>
+            <fieldset class="camera-settings">
+              <legend>Camera Management</legend>
+              <div id="camera-settings-list"></div>
+              <button id="add-camera" type="button">Add Camera</button>
+            </fieldset>
+          </div>
+          <footer>
+            <button id="reset-settings" type="button">Reset</button>
+            <button type="submit">Save Settings</button>
+          </footer>
+        </form>
+      </section>
+
+      <section id="preflight-modal" class="modal-backdrop" aria-hidden="true">
+        <div class="preflight-modal">
+          <header>
+            <div><span>Pre-Match</span><strong>Operator Checklist</strong></div>
+            <button id="preflight-close" type="button" class="icon-button">Close</button>
+          </header>
+          <div class="preflight-config">
+            <div class="pf-block">
+              <span class="pf-label">Cameras in use</span>
+              <div id="preflight-camera-select" class="pf-camera-select"></div>
+            </div>
+            <div class="pf-block pf-toggles">
+              <label class="pf-toggle"><input type="checkbox" id="pf-require-audio" /> Require audio<small>Edge / snicko reviews</small></label>
+              <label class="pf-toggle"><input type="checkbox" id="pf-require-gpu" /> Require GPU<small>Block on CPU-only</small></label>
+              <label class="pf-toggle"><input type="checkbox" id="pf-autorefresh" checked /> Auto-refresh<small>Every 2s</small></label>
+            </div>
+          </div>
+          <div id="preflight-list" class="preflight-list"></div>
+          <footer>
+            <div id="preflight-banner" class="preflight-banner pending">Run checks to verify readiness</div>
+            <button id="preflight-run" type="button">Run Checks</button>
+          </footer>
+        </div>
+      </section>
+    </main>
+    <script src="renderer.js"></script>
+  </body>
+</html>

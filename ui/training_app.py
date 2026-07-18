@@ -26,7 +26,7 @@ class TrainingApplication(tk.Tk):
         self.process: subprocess.Popen[str] | None = None
         self.output_queue: queue.Queue[str] = queue.Queue()
         self.status_var = tk.StringVar(value="Ready")
-        self.data_var = tk.StringVar(value=str(settings.PROJECT_ROOT / "training" / "drs_yolo_dataset.yaml"))
+        self.data_var = tk.StringVar(value=str(settings.PROJECT_ROOT / "training" / "data.yaml"))
         self.model_var = tk.StringVar(value="yolo11l.pt")
         self.epochs_var = tk.StringVar(value="120")
         self.imgsz_var = tk.StringVar(value="1280")

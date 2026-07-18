@@ -139,7 +139,13 @@ class SingleBallByteTracker:
         return frame
 
     def reset(self) -> None:
+        # Re-acquire a fresh track after a long gap, but KEEP the accumulated
+        # trajectory so the full delivery path survives detection dropouts (the
+        # ball is often detected in only ~half the frames). Without this the
+        # history is wiped on every gap and the exported trajectory ends empty.
+        saved_history = self.history
         self.__init__(self.fps, self.high_threshold, self.low_threshold, self.max_gap, self.max_jump_px)
+        self.history = saved_history
 
     def _initialize(self, x: float, y: float) -> None:
         state = np.array([[x], [y], [0], [0]], dtype=np.float32)

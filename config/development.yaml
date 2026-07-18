@@ -1,0 +1,43 @@
+# AI-development tooling configuration.
+# These paths are intentionally separate from the live DRS runtime.
+development_root: development
+dataset_root: dataset
+training_root: training
+
+vision_studio:
+  # App code lives in the DRS repo (underscore, no spaces — avoids shell/PyInstaller quoting).
+  project_path: development/vision_studio
+  entry_point: development/vision_studio/main.py
+  executable: development/vision_studio/dist/VisionStudio/VisionStudio.exe
+  # Data workspace is a DEDICATED desktop folder (sibling of the app code), so
+  # datasets/footage/models never mix with the source tree — and no external-drive
+  # dependency. Holds the user's relocated data (was development/vision_studio/output).
+  workspace: vision_studio_workspace
+  dataset: dataset_v3
+  model: models/production/best.pt
+  dataset_folder: vision_studio_workspace
+  training_folder: training
+  models_folder: models/production
+  pid_file: data/vision_studio.pid
+  recent_projects:
+    - vision_studio_workspace
+    - training/datasets/production
+
+dataset:
+  raw_videos: dataset/raw_videos
+  versions: dataset/versions
+  active: dataset/active
+  calibration: dataset/calibration
+  frame_output: dataset/extracted_frames
+  exports: dataset/exports
+  metadata: dataset/metadata
+
+models:
+  production: models/production
+  candidates: models/candidates
+  archive: models/archive
+  evaluation_reports: models/evaluation/reports
+
+reports:
+  validation: training/reports/validation
+  training: training/reports

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "drs-dashboard",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [".claude/dev_preview.py"],
+      "port": 8793
+    }
+  ]
+}

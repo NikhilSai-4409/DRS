@@ -1,0 +1,11 @@
+{
+  "positions": [-0.108, 0, 0.108],
+  "radius": 0.027,
+  "height": 0.71,
+  "roughness": 0.45,
+  "metalness": 0.05,
+  "brandBandY": 0.40, "brandBandH": 0.16,
+  "goldRingY": 0.53,
+  "bailY": 0.71, "bailOffset": 0.054,
+  "creaseZ": [0.15, -1.32]
+}

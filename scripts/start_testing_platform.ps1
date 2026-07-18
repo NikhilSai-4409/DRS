@@ -1,6 +1,6 @@
 param(
     [string]$HostAddress = "127.0.0.1",
-    [int]$BackendPort = 8766,
+    [int]$BackendPort = 8765,
     [int]$FrontendPort = 5174
 )
 

@@ -3,150 +3,631 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cricket DRS broadcast dashboard</title>
+    <title>Cricket DRS Review Workstation</title>
     <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="broadcast-widgets.css" />
   </head>
-  <body>
-    <main class="shell">
-      <header class="top-bar">
-        <div class="brand">
-          <div class="brand-mark">DRS</div>
-          <div>
-            <strong>Professional DRS prototype</strong>
-            <span id="engine-state">Engine starting</span>
+  <body class="mode-match">
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="side-top">
+          <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Toggle sidebar" title="Collapse sidebar">☰</button>
+          <div class="side-brand">
+            <div class="logo-mark">DRS</div>
+            <div class="brand-text"><strong>DRS</strong><small>Decision Review System</small></div>
           </div>
         </div>
-        <div id="live-indicator" class="live-indicator offline"><i></i><span>Offline</span></div>
-        <div id="mode-banner" class="mode-banner">Mode A - visible-spectrum approximation</div>
-        <div id="camera-pills" class="camera-pills"></div>
-        <button id="mode-toggle" type="button" title="Switch visible/demo thermal mode">Mode</button>
-        <button id="testing-platform-button" type="button" title="Open embedded React testing platform">Testing</button>
-        <button id="calibration-button" type="button">Calibration</button>
-      </header>
+        <nav class="side-nav">
+          <button class="nav-item active" type="button" data-view="dashboard" data-label="Dashboard"><span class="ni-ic">🏠</span><span class="ni-tx">Dashboard</span></button>
+          <button class="nav-item" type="button" data-view="reviews" data-label="Reviews"><span class="ni-ic">📋</span><span class="ni-tx">Reviews</span></button>
+          <button class="nav-item" type="button" data-view="replay" data-label="Replay"><span class="ni-ic">⏯</span><span class="ni-tx">Replay</span></button>
+          <button class="nav-item" type="button" data-view="cameras" data-label="Cameras"><span class="ni-ic">📷</span><span class="ni-tx">Cameras</span></button>
+          <button class="nav-item" type="button" data-view="camera-health" data-label="Camera Health"><span class="ni-ic">📊</span><span class="ni-tx">Camera Health</span></button>
+          <button class="nav-item" type="button" data-view="calibration" data-label="Calibration"><span class="ni-ic">📐</span><span class="ni-tx">Calibration</span></button>
+          <button class="nav-item" type="button" data-view="health" data-label="System"><span class="ni-ic">💻</span><span class="ni-tx">System</span></button>
+          <button class="nav-item" type="button" data-view="checklist" data-label="Pre-Match Checklist"><span class="ni-ic">✔</span><span class="ni-tx">Pre-Match Checklist</span></button>
 
-      <section class="workspace">
-        <aside class="left-rail">
-          <section class="rail-header">
-            <strong id="left-panel-title">Camera matrix</strong>
-            <span id="camera-count">0 / 6 connected</span>
-          </section>
-          <section id="camera-grid" class="camera-grid" aria-label="Adaptive camera and analysis grid"></section>
-        </aside>
+          <div class="nav-sec engineer-only">Engineer Mode</div>
+          <button class="nav-item engineer-only" type="button" data-view="testing" data-label="Testing"><span class="ni-ic">🧪</span><span class="ni-tx">Testing</span></button>
+          <button class="nav-item engineer-only" type="button" data-view="validation" data-label="Validation"><span class="ni-ic">🎯</span><span class="ni-tx">Validation</span></button>
+          <button class="nav-item engineer-only" type="button" data-view="development" data-label="Vision Studio"><span class="ni-ic">AI</span><span class="ni-tx">Vision Studio</span></button>
+          <button class="nav-item engineer-only" type="button" data-view="models" data-label="Model Manager"><span class="ni-ic">📦</span><span class="ni-tx">Model Manager</span></button>
+        </nav>
+        <div class="side-foot">
+          <div id="live-indicator" class="live-indicator offline"><i></i><span>Offline</span></div>
+          <small id="engine-state">Engine starting</small>
+        </div>
+      </aside>
 
-        <section class="center-stage">
-          <article class="trajectory-panel">
-            <header>
-              <div>
-                <span>3D trajectory window</span>
-                <small id="trajectory-status">Waiting for review data</small>
+      <main class="main">
+        <header class="topbar" id="top">
+          <div class="topbar-title">
+            <h1 id="view-title">Dashboard</h1>
+            <span id="mode-banner" class="mode-banner">Mode A - visible-spectrum approximation</span>
+          </div>
+          <div class="topbar-right">
+            <button id="system-status" class="system-status ok" type="button" title="Open System view">System Healthy</button>
+            <div class="operator-switch" role="group" aria-label="Operator mode">
+              <button id="mode-match" class="op-mode active" type="button">Match Mode</button>
+              <button id="mode-engineer" class="op-mode" type="button">Engineer Mode</button>
+            </div>
+            <button id="mode-toggle" type="button" title="Switch visible/demo thermal mode">Mode</button>
+            <button id="open-settings" type="button" title="Settings">⚙</button>
+            <div class="user-chip"><div class="ava">AD</div><div class="user-text"><strong>Admin</strong><small>Administrator</small></div></div>
+          </div>
+        </header>
+
+        <!-- ============================ DASHBOARD (state-driven workspace) ============================ -->
+        <section class="view active" data-view="dashboard">
+          <div class="review-type-header" id="review-type-header" role="group" aria-label="Review type">
+            <span class="rt-label">Review Type</span>
+            <!-- review-type buttons injected from REVIEW_MODULES registry -->
+            <span class="rt-state" id="rt-state">Waiting</span>
+            <button id="request-review" type="button" class="primary-action rt-request" title="Shortcut: R">Request Review</button>
+          </div>
+
+          <div id="system-alerts" class="system-alerts" hidden></div>
+
+          <div class="dash-grid" id="dash-grid" data-state="waiting">
+            <!-- MAIN FEED (auto-switches to the review role camera) -->
+            <article class="card d-feed">
+              <header class="card-h">
+                <div><strong id="feed-title">Main Feed</strong><small id="feed-sub">Primary review camera</small></div>
+                <span id="primary-tag" class="chip-quiet">--</span>
+              </header>
+              <div class="live-stage">
+                <img id="primary-feed" class="primary-feed" alt="Primary camera feed" />
+                <div class="primary-placeholder">Waiting for primary camera feed</div>
+                <svg id="wide-overlay" class="feed-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" hidden>
+                  <rect id="wide-overlap" x="22" y="0" width="6" height="100" class="ov-overlap" />
+                  <line x1="28" y1="0" x2="28" y2="100" class="ov-line" stroke-dasharray="3 2" />
+                  <text x="29.5" y="8" class="ov-text">Wide line</text>
+                  <line id="wide-ballpath" x1="0" y1="34" x2="62" y2="46" class="ov-path" />
+                  <circle id="wide-ball-feed" cx="50" cy="44" r="2.2" class="ov-ball" />
+                </svg>
+                <svg id="noball-overlay" class="feed-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" hidden>
+                  <line x1="0" y1="62" x2="100" y2="62" class="ov-line" />
+                  <text x="2" y="59" class="ov-text">Popping crease</text>
+                  <polygon id="noball-foot" points="42,52 58,50 60,66 44,68" class="ov-foot" />
+                  <circle id="noball-toe" cx="59" cy="51" r="1.8" class="ov-toe" />
+                  <text x="61" y="51" class="ov-text">Toe</text>
+                  <circle id="noball-heel" cx="43" cy="67" r="1.8" class="ov-heel" />
+                  <text x="30" y="69" class="ov-text">Heel</text>
+                </svg>
               </div>
-              <div class="scene-tools">
-                <button id="replay-trajectory" type="button">Replay</button>
-                <button id="reset-camera" type="button">Reset View</button>
+              <div id="camera-thumbs" class="camera-thumbs" aria-label="Mini cameras"></div>
+            </article>
+
+            <!-- ANALYSIS (swaps with review type; hidden while waiting) -->
+            <article class="card d-detail">
+              <header class="card-h">
+                <div><strong id="detail-title">LBW Review</strong><small id="detail-sub">Ball-tracking trajectory</small></div>
+                <div class="scene-tools" id="lbw-tools">
+                  <button id="replay-trajectory" type="button">Replay</button>
+                  <button id="reset-camera" type="button">Reset View</button>
+                </div>
+              </header>
+
+              <div class="review-panel" data-review-panel="lbw">
+                <div class="lbw-view-toggle" id="lbw-view-toggle">
+                  <button type="button" data-lbw-view="broadcast" class="active">Review Replay</button>
+                  <button type="button" data-lbw-view="3d">3D Analysis</button>
+                </div>
+                <div class="lbw-view" data-lbw-view="broadcast">
+                  <div id="broadcast-review" class="drsa-wrap"></div>
+                </div>
+                <div class="lbw-view" data-lbw-view="3d" hidden>
+                  <div id="trajectory-scene" class="trajectory-scene"></div>
+                  <div class="decision-metrics live-metrics">
+                    <div><span>Confidence</span><strong id="overall-confidence">--</strong></div>
+                    <div><span>Impact</span><strong id="impact-location">--</strong></div>
+                    <div><span>Wicket</span><strong id="wicket-zone">--</strong></div>
+                    <div><span>Speed</span><strong id="ball-speed">--</strong></div>
+                  </div>
+                  <canvas id="pitch-map-canvas" class="pitch-map-mini" width="420" height="120"></canvas>
+                </div>
+              </div>
+
+              <div class="review-panel" data-review-panel="wide" hidden>
+                <div class="topview-wrap">
+                  <svg class="topview" viewBox="0 0 200 150" preserveAspectRatio="xMidYMid meet" aria-label="Wide top view">
+                    <rect x="60" y="6" width="80" height="138" class="tv-pitch" />
+                    <rect id="tv-overlap" x="40" y="6" width="30" height="138" class="tv-overlap" />
+                    <line x1="40" y1="6" x2="40" y2="144" class="tv-wide" stroke-dasharray="5 3" />
+                    <text x="8" y="78" class="tv-label">WIDE LINE</text>
+                    <line x1="60" y1="20" x2="140" y2="20" class="tv-crease" />
+                    <g class="tv-stumps"><rect x="96" y="16" width="2" height="8"/><rect x="99" y="16" width="2" height="8"/><rect x="102" y="16" width="2" height="8"/></g>
+                    <line id="tv-distline" x1="40" y1="96" x2="70" y2="96" class="tv-dist" />
+                    <circle id="tv-ball" cx="70" cy="96" r="5" class="tv-ball" />
+                    <text id="tv-distlabel" x="42" y="112" class="tv-label">--</text>
+                  </svg>
+                  <div class="tv-legend">
+                    <span><i class="lg-wide"></i>Wide line</span>
+                    <span><i class="lg-ball"></i>Ball</span>
+                    <span><i class="lg-overlap"></i>Overlap</span>
+                  </div>
+                </div>
+                <div class="verdict-block">
+                  <div id="wide-verdict" class="big-verdict waiting">AWAITING</div>
+                  <div id="wide-distance" class="verdict-figure">--</div>
+                </div>
+                <div class="metric-list">
+                  <div><span>Distance from wide line</span><strong id="wide-distance-2">--</strong></div>
+                  <div><span>Ball centre</span><strong id="wide-centre">--</strong></div>
+                  <div><span>Ball radius</span><strong id="wide-radius">--</strong></div>
+                  <div><span>Batter movement</span><strong id="wide-batter">--</strong></div>
+                  <div><span>Confidence</span><strong id="wide-confidence">--</strong></div>
+                </div>
+              </div>
+
+              <div class="review-panel" data-review-panel="noball" hidden>
+                <div class="verdict-block">
+                  <div id="noball-verdict" class="big-verdict waiting">AWAITING</div>
+                  <div class="verdict-sub">Front foot past popping crease</div>
+                  <div id="noball-distance" class="verdict-figure">--</div>
+                </div>
+                <div class="foot-meter">
+                  <div class="foot-meter-label"><span>Behind</span><span>Crease</span><span>Past line</span></div>
+                  <div class="foot-meter-track"><i id="noball-meter"></i><b class="foot-crease-mark"></b></div>
+                </div>
+                <div class="metric-list">
+                  <div><span>Front foot position</span><strong id="noball-foot-pos">--</strong></div>
+                  <div><span>Distance past line</span><strong id="noball-foot-cm">--</strong></div>
+                  <div><span>Confidence</span><strong id="noball-confidence">--</strong></div>
+                </div>
+              </div>
+
+              <div class="review-panel" data-review-panel="edge" hidden>
+                <canvas id="ultraedge-canvas" class="ultraedge-canvas" width="600" height="180"></canvas>
+                <div class="metric-list">
+                  <div><span>Edge probability</span><strong id="edge-probability">--</strong></div>
+                  <div><span>Contact</span><strong id="edge-contact">--</strong></div>
+                </div>
+                <div id="hotspot-view" class="thermal-view">No contact heatmap yet</div>
+                <small id="hotspot-mode" class="edge-mode">Visible mode</small>
+              </div>
+
+              <!-- RUN OUT: crease-centric — bat-to-crease geometry, no trajectory graphics -->
+              <div class="review-panel" data-review-panel="runout" hidden>
+                <div class="verdict-block">
+                  <div id="runout-verdict" class="big-verdict waiting">AWAITING</div>
+                  <div class="verdict-sub">Bat grounded behind the popping crease?</div>
+                  <div id="runout-distance" class="verdict-figure">--</div>
+                </div>
+                <div class="foot-meter">
+                  <div class="foot-meter-label"><span>Short — OUT</span><span>Crease</span><span>Behind — SAFE</span></div>
+                  <div class="foot-meter-track"><i id="runout-meter"></i><b class="foot-crease-mark"></b></div>
+                </div>
+                <div class="metric-list">
+                  <div><span>Bat to crease</span><strong id="runout-batcrease">--</strong></div>
+                  <div><span>Decision frame</span><strong id="runout-frame">--</strong></div>
+                  <div><span>Bails</span><strong id="runout-bails">--</strong></div>
+                  <div><span>Confidence</span><strong id="runout-confidence">--</strong></div>
+                </div>
+                <small class="edge-mode">Bat located by motion analysis; bails detection pending — verify on the frame-stepped replay.</small>
+              </div>
+
+              <!-- STUMPING: keeper-centric — same crease geometry, gloves/bails emphasis -->
+              <div class="review-panel" data-review-panel="stumping" hidden>
+                <div class="verdict-block">
+                  <div id="stumping-verdict" class="big-verdict waiting">AWAITING</div>
+                  <div class="verdict-sub">Bat behind the crease when the bails came off?</div>
+                  <div id="stumping-distance" class="verdict-figure">--</div>
+                </div>
+                <div class="foot-meter">
+                  <div class="foot-meter-label"><span>Short — OUT</span><span>Crease</span><span>Behind — SAFE</span></div>
+                  <div class="foot-meter-track"><i id="stumping-meter"></i><b class="foot-crease-mark"></b></div>
+                </div>
+                <div class="metric-list">
+                  <div><span>Gloves / collection</span><strong id="stumping-gloves">Manual check</strong></div>
+                  <div><span>Bat to crease</span><strong id="stumping-batcrease">--</strong></div>
+                  <div><span>Decision frame</span><strong id="stumping-frame">--</strong></div>
+                  <div><span>Bails</span><strong id="stumping-bails">--</strong></div>
+                </div>
+                <small class="edge-mode">Glove and ball-collection detection pending — confirm a fair take on the replay.</small>
+              </div>
+            </article>
+
+            <!-- DECISION: state machine (waiting/processing) → review summary (result) -->
+            <article class="card d-decision">
+              <header class="card-h"><strong>Review State</strong><span id="decision-review-type">LBW</span></header>
+              <span id="decision-badge" class="badge waiting">Waiting</span>
+              <div class="state-machine" id="decision-state">
+                <div class="state-node" data-state="waiting"><i></i><span>WAITING</span></div>
+                <div class="state-arrow">↓</div>
+                <div class="state-node" data-state="processing"><i></i><span>PROCESSING</span></div>
+                <div class="state-arrow">↓</div>
+                <div class="state-node" data-state="result"><i></i><span id="state-result">DECISION</span></div>
+              </div>
+              <div id="broadcast-overlay" class="broadcast-overlay waiting">WAITING</div>
+              <h1 id="decision-title" class="decision-title-quiet">Waiting for appeal</h1>
+              <p id="decision-explanation" class="decision-explanation">Awaiting appeal sequence.</p>
+
+              <section id="review-summary" class="review-summary">
+                <strong class="rs-h">Review Summary</strong>
+                <!-- Rows are built per review type from the module's capability contract
+                     (decision_card) + its typed summary.measurements — an Edge review
+                     shows Spike/HotSpot, a Wide shows Guideline/Margin, never a shared
+                     LBW template. See renderReviewSummary. -->
+                <div class="rs-grid" id="rs-grid">
+                  <div><span>Type</span><strong id="rs-type">--</strong></div>
+                  <div><span>Prediction</span><strong id="rs-prediction">--</strong></div>
+                  <div><span>Confidence</span><strong id="rs-confidence">--</strong></div>
+                  <div><span>Time</span><strong id="rs-time">--</strong></div>
+                </div>
+              </section>
+
+              <div id="confidence-breakdown" class="confidence-breakdown"></div>
+              <div class="decision-actions" id="decision-actions">
+                <button id="confirm-out" type="button" class="danger" title="Shortcut: O" hidden>Confirm OUT</button>
+                <button id="confirm-not-out" type="button" class="success" title="Shortcut: N" hidden>Confirm NOT OUT</button>
+                <button id="open-replay" type="button" hidden>Replay</button>
+                <button id="export-review" type="button" hidden>Export</button>
+                <button id="reset-review" type="button" hidden>New Review</button>
+              </div>
+            </article>
+
+            <!-- REVIEW EVIDENCE (dynamic per review type; own cell so it never hides behind a scroll) -->
+            <article class="card d-evidence">
+              <div id="decision-evidence" class="decision-evidence-host"></div>
+            </article>
+
+            <!-- ADAPTIVE TIMELINE -->
+            <article class="card d-timeline">
+              <header class="card-h"><strong>Timeline</strong><span id="timeline-type">LBW sequence</span></header>
+              <div id="decision-timeline" class="decision-stages"></div>
+            </article>
+
+            <!-- CURRENT MATCH (queue) + Session History entry point -->
+            <article class="card d-queue">
+              <header class="card-h">
+                <div><strong>Current Match</strong><small id="match-name">Untitled Match</small></div>
+                <div class="queue-head-actions">
+                  <span id="match-status" class="match-status waiting">WAITING</span>
+                  <span id="queue-count" class="chip-quiet">0 pending</span>
+                  <button id="new-match" type="button" class="new-match-btn" title="Archive this match and start a new one">New Match</button>
+                </div>
+              </header>
+              <div id="review-queue" class="review-queue"></div>
+              <button id="open-history" type="button" class="history-link">Session History →</button>
+            </article>
+          </div>
+        </section>
+
+        <!-- ============================ REPLAY WORKSPACE ============================ -->
+        <section class="view" data-view="replay">
+          <article class="card">
+            <header class="card-h">
+              <div><strong>Replay Workspace</strong><small id="replay-sub">Frame-by-frame appeal inspection</small></div>
+              <button type="button" data-view="dashboard" class="nav-item-inline">← Back to Dashboard</button>
+            </header>
+            <div class="live-stage replay-stage" id="replay-stage">
+              <img id="replay-feed" class="primary-feed" alt="Replay feed" />
+              <div class="primary-placeholder">No replay buffer loaded</div>
+              <!-- Mode-driven overlay scene: which groups exist is decided by the active
+                   review module's `supports` contract, not per-type conditionals. The
+                   ball path is REAL (decision.overlay.ball_path in frame pixels);
+                   guide lines are schematic until the camera is calibrated and say so. -->
+              <svg id="replay-overlay" class="feed-overlay" viewBox="0 0 1280 720" preserveAspectRatio="none">
+                <g data-rlayer="trajectory" hidden>
+                  <polyline id="rp-ball-path" points="" class="rp-path" />
+                  <circle id="rp-ball-now" r="9" class="rp-ball" hidden />
+                </g>
+                <g data-rlayer="guideline" hidden>
+                  <line id="rp-wide-line" x1="358" y1="0" x2="358" y2="720" class="rp-guide" stroke-dasharray="14 8" />
+                  <text id="rp-wide-label" x="368" y="40" class="rp-guide-text">Wide guideline (schematic — calibrate to measure)</text>
+                </g>
+                <g data-rlayer="crease" hidden>
+                  <line id="rp-crease-line" x1="0" y1="446" x2="1280" y2="446" class="rp-guide rp-crease" stroke-dasharray="14 8" />
+                  <text id="rp-crease-label" x="16" y="436" class="rp-guide-text">Popping crease (schematic — calibrate to measure)</text>
+                </g>
+              </svg>
+            </div>
+            <!-- Audio/spike timeline (Edge reviews): spike markers when UltraEdge events
+                 exist; otherwise the module's honest reason (e.g. "no stump-mic audio"). -->
+            <div id="replay-audio-strip" class="replay-audio-strip" hidden>
+              <span class="ras-title">UltraEdge timeline</span>
+              <div id="replay-audio-track" class="ras-track"></div>
+              <small id="replay-audio-note" class="ras-note"></small>
+            </div>
+            <div id="replay-layers" class="replay-layers" aria-label="Replay overlay layers"></div>
+            <div class="replay-strip">
+              <button id="replay-play" type="button">Play</button>
+              <button id="replay-pause" type="button">Pause</button>
+              <button id="replay-back" type="button">Prev</button>
+              <input id="frame-timeline" type="range" min="0" max="100" value="0" />
+              <button id="replay-forward" type="button">Next</button>
+              <select id="replay-speed" aria-label="Replay speed">
+                <option value="0.25">0.25x</option>
+                <option value="0.5">0.5x</option>
+                <option value="1" selected>1x</option>
+              </select>
+              <span id="frame-label">Frame 0</span>
+              <button id="replay-jump-decision" type="button" hidden title="Seek to the frame the module decided on">Decision frame</button>
+              <button id="replay-zoom" type="button" hidden title="2× magnifier on the stage">Zoom</button>
+              <button id="replay-export" type="button">Export MP4</button>
+              <button id="replay-save" type="button">Save Review</button>
+            </div>
+          </article>
+        </section>
+
+        <!-- ============================ CAMERAS ============================ -->
+        <section class="view" data-view="cameras">
+          <article class="card">
+            <header class="card-h">
+              <div><strong id="left-panel-title">Cameras</strong><small>Assign a role to every camera</small></div>
+              <div class="cam-head-right">
+                <div id="camera-pills" class="camera-pills"></div>
+                <span id="camera-count" class="chip-quiet">0 / 6 connected</span>
               </div>
             </header>
-            <div id="trajectory-scene" class="trajectory-scene"></div>
-          </article>
-
-          <article class="decision-panel">
-            <section class="decision-main">
-              <span id="decision-badge" class="badge waiting">Waiting</span>
-              <h1 id="decision-title">Waiting for appeal</h1>
-              <div id="broadcast-overlay" class="broadcast-overlay waiting">WAITING</div>
-            </section>
-            <section class="decision-actions">
-              <button id="request-review" type="button" title="Shortcut: R">Request Review</button>
-              <button id="confirm-out" type="button" class="danger" title="Shortcut: O">Confirm OUT</button>
-              <button id="confirm-not-out" type="button" class="success" title="Shortcut: N">Confirm NOT OUT</button>
-            </section>
-            <section class="decision-metrics">
-              <div><span>Overall confidence</span><strong id="overall-confidence">--</strong></div>
-              <div><span>Impact</span><strong id="impact-location">--</strong></div>
-              <div><span>Wicket prediction</span><strong id="wicket-zone">--</strong></div>
-              <div><span>Speed</span><strong id="ball-speed">--</strong></div>
-            </section>
-          </article>
-        </section>
-
-        <aside class="right-rail">
-          <section class="panel timeline-panel">
-            <header><strong>Review timeline</strong></header>
-            <div id="decision-timeline" class="decision-timeline"></div>
-          </section>
-
-          <section class="panel explanation-panel">
-            <header><strong>Decision explanation</strong></header>
-            <p id="decision-explanation">Awaiting appeal sequence.</p>
-          </section>
-
-          <section class="panel confidence-panel">
-            <header><strong>Confidence breakdown</strong></header>
-            <div id="confidence-breakdown" class="confidence-breakdown"></div>
-          </section>
-
-          <section class="panel evidence-panel">
-            <header><strong>HotSpot</strong><span id="hotspot-mode">Visible mode</span></header>
-            <div id="hotspot-view" class="thermal-view">No contact heatmap yet</div>
-          </section>
-
-          <section class="panel evidence-panel">
-            <header><strong>UltraEdge</strong><span>Audio edge</span></header>
-            <canvas id="ultraedge-canvas" width="420" height="120"></canvas>
-          </section>
-
-          <section class="panel pitch-map-panel">
-            <header><strong>Pitch map</strong><span>Top-down</span></header>
-            <canvas id="pitch-map-canvas" width="420" height="180"></canvas>
-          </section>
-
-          <section class="panel export-actions-panel">
-            <header><strong>Export</strong><span>Analysis files</span></header>
-            <div id="export-panel" class="export-panel">
-              <span class="muted">Exports appear after analysis.</span>
+            <div class="cameras-inuse-bar">
+              <span class="pf-lbl">Cameras in use</span>
+              <div id="cameras-inuse" class="pf-cameras"></div>
+              <small class="cameras-inuse-hint">Unchecked cameras are excluded from the Pre-Match Checklist</small>
             </div>
+            <div id="camera-grid" class="camera-grid" aria-label="Adaptive camera and analysis grid"></div>
+          </article>
+        </section>
+
+        <!-- ============================ CALIBRATION (full-screen workspace) ============================ -->
+        <section class="view view-calibration" data-view="calibration">
+          <div id="calibration-root" class="calibration-root"></div>
+        </section>
+
+        <!-- ============================ SYSTEM ============================ -->
+        <section class="view" data-view="health">
+          <section class="kpis kpis-health">
+            <div class="kpi"><div class="kpi-h"><span>Camera Sync</span><span class="kpi-ic">⇄</span></div><strong id="kpi-sync">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>GPU</span><span class="kpi-ic">▦</span></div><strong id="kpi-gpu">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>CUDA Temp</span><span class="kpi-ic">🌡</span></div><strong id="kpi-cuda">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>Model</span><span class="kpi-ic">◑</span></div><strong id="kpi-model">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>FPS</span><span class="kpi-ic">⚡</span></div><strong id="kpi-fps">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>Latency</span><span class="kpi-ic">◷</span></div><strong id="kpi-latency">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>Inference</span><span class="kpi-ic">◴</span></div><strong id="kpi-inference">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>Tracking</span><span class="kpi-ic">⤳</span></div><strong id="kpi-tracking">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>Calibration</span><span class="kpi-ic">◎</span></div><strong id="kpi-calibration">--</strong></div>
+            <div class="kpi"><div class="kpi-h"><span>Review Queue</span><span class="kpi-ic">≣</span></div><strong id="kpi-queue">--</strong></div>
           </section>
-        </aside>
-      </section>
-
-      <footer class="bottom-deck">
-        <section class="replay-strip">
-          <button id="replay-play" type="button">Play</button>
-          <button id="replay-pause" type="button">Pause</button>
-          <button id="replay-back" type="button">Prev</button>
-          <input id="frame-timeline" type="range" min="0" max="100" value="0" />
-          <button id="replay-forward" type="button">Next</button>
-          <select id="replay-speed" aria-label="Replay speed">
-            <option value="0.25">0.25x</option>
-            <option value="0.5">0.5x</option>
-            <option value="1" selected>1x</option>
-          </select>
-          <button id="replay-export" type="button">Export MP4</button>
-          <span id="frame-label">Frame 0</span>
+          <article class="card">
+            <header class="card-h"><strong>System Health</strong><span>CPU, memory, GPU, storage, network</span></header>
+            <div id="health-grid" class="health-grid"></div>
+          </article>
+          <div class="system-lower">
+            <article class="card">
+              <header class="card-h"><strong>Environment</strong><span>Runtime versions, disk, database, build</span></header>
+              <div id="system-info-grid" class="system-info-grid"><div class="rev-empty">Loading…</div></div>
+            </article>
+            <article class="card">
+              <header class="card-h">
+                <div><strong>Activity Log</strong><small>Session events, newest first</small></div>
+                <button id="activity-refresh" type="button" class="rev-export">Refresh</button>
+              </header>
+              <div id="activity-log" class="activity-log"><div class="rev-empty">Loading…</div></div>
+            </article>
+          </div>
         </section>
 
-        <section class="health-strip">
-          <strong>System health</strong>
-          <div id="health-grid" class="health-grid"></div>
+        <!-- ============================ REVIEWS (archive of completed decisions) ============================ -->
+        <section class="view" data-view="reviews">
+          <article class="card">
+            <header class="card-h">
+              <div><strong>Reviews</strong><small>Completed decisions in this session</small></div>
+              <span id="reviews-count" class="chip-quiet">--</span>
+            </header>
+            <div class="reviews-toolbar" id="reviews-toolbar">
+              <div class="rev-filters" id="rev-filters" role="group" aria-label="Filter by review type">
+                <button type="button" class="rev-chip active" data-rev-filter="all">All</button>
+                <button type="button" class="rev-chip" data-rev-filter="lbw">LBW</button>
+                <button type="button" class="rev-chip" data-rev-filter="edge">Edge</button>
+                <button type="button" class="rev-chip" data-rev-filter="runout">Run Out</button>
+                <button type="button" class="rev-chip" data-rev-filter="wide">Wide</button>
+                <button type="button" class="rev-chip" data-rev-filter="noball">No Ball</button>
+              </div>
+              <input id="rev-search" class="rev-search" type="search" placeholder="Search id, decision, operator…" aria-label="Search reviews" />
+            </div>
+            <div id="reviews-list" class="reviews-list"></div>
+          </article>
         </section>
 
-        <section class="history-strip">
-          <header>
-            <strong>Review center</strong>
-            <span>History</span>
-          </header>
-          <div id="review-history" class="review-history"></div>
+        <!-- ============================ CAMERA HEALTH (live per-camera telemetry) ============================ -->
+        <section class="view" data-view="camera-health">
+          <article class="card">
+            <header class="card-h">
+              <div><strong>Camera Health</strong><small>Live per-camera capture telemetry</small></div>
+              <span id="camhealth-summary" class="chip-quiet">--</span>
+            </header>
+            <div id="camhealth-grid" class="camhealth-grid"></div>
+          </article>
         </section>
-      </footer>
 
-      <dialog id="testing-platform-dialog" class="testing-dialog">
-        <header>
-          <strong>React testing platform</strong>
-          <button id="close-testing-platform" type="button" aria-label="Close testing platform">x</button>
-        </header>
-        <iframe id="testing-platform-frame" title="Embedded React testing platform"></iframe>
-      </dialog>
-      <div id="calibration-modal-root" class="calibration-modal-root" aria-live="polite"></div>
-    </main>
+        <!-- ============================ PRE-MATCH CHECKLIST (read-only go/no-go) ============================ -->
+        <section class="view" data-view="checklist">
+          <article class="card preflight-card">
+            <header class="card-h">
+              <div><strong>Pre-Match Checklist</strong><small>Read-only readiness — can we start the session?</small></div>
+              <span id="preflight-summary" class="chip-quiet">--</span>
+            </header>
+            <div id="preflight-grid" class="preflight-grid"></div>
+            <div id="preflight-banner" class="preflight-banner pending">Checking readiness…</div>
+          </article>
+        </section>
+
+        <!-- ============================ TESTING (engineer-only: upload delivery → analyze) ============================ -->
+        <section class="view view-testing" data-view="testing">
+          <div id="testing-root" class="testing-root"></div>
+        </section>
+
+        <!-- ============================ VALIDATION (engineer-only: LBW accuracy vs ground truth) ============================ -->
+        <section class="view view-validation" data-view="validation">
+          <div id="validation-root" class="validation-root"></div>
+        </section>
+
+        <!-- ============================ MODEL MANAGER (engineer-only: model registry + lifecycle) ============================ -->
+        <section class="view view-models" data-view="models">
+          <div id="models-root" class="models-root"></div>
+        </section>
+
+        <!-- ============================ DEVELOPMENT ============================ -->
+        <section class="view" data-view="development">
+          <article class="card development-card">
+            <header class="card-h">
+              <div><strong>Development</strong><small>Vision Studio launches outside the match dashboard</small></div>
+              <span id="vision-studio-status" class="chip-quiet">Loading</span>
+            </header>
+            <div class="development-body">
+              <section class="dev-summary">
+                <div><span>Vision Studio</span><strong id="vision-studio-ready">--</strong></div>
+                <div><span>Project</span><strong id="vision-studio-project">--</strong></div>
+                <div><span>Workspace</span><strong id="vision-studio-workspace">--</strong></div>
+                <div><span>Dataset</span><strong id="vision-studio-dataset">--</strong></div>
+                <div><span>Model</span><strong id="vision-studio-model">--</strong></div>
+                <div><span>GPU</span><strong id="vision-studio-gpu">--</strong></div>
+                <div><span>CUDA</span><strong id="vision-studio-cuda">--</strong></div>
+                <div><span>Version</span><strong id="vision-studio-version">--</strong></div>
+              </section>
+              <div id="development-lock" class="development-lock" hidden>Development is guarded during an active match.</div>
+              <label class="dev-project-picker">Open Recent Project
+                <select id="vision-studio-recent"></select>
+              </label>
+              <section class="dev-actions" aria-label="Vision Studio actions">
+                <button id="open-vision-studio" type="button" class="primary-action">Open Vision Studio</button>
+                <button id="open-vision-studio-workspace" type="button">Open Recent Project</button>
+                <button id="import-match-recordings" type="button">Import Match Recordings</button>
+                <button type="button" data-open-development-folder="dataset">Open Dataset Folder</button>
+                <button type="button" data-open-development-folder="training">Open Training Folder</button>
+                <button type="button" data-open-development-folder="models">Open Models</button>
+                <button type="button" data-open-development-folder="workspace">Open Workspace</button>
+                <button type="button" data-open-development-folder="exports">Open Exports Folder</button>
+              </section>
+              <pre id="ai-development-output" class="ai-development-output">Ready.</pre>
+            </div>
+          </article>
+        </section>
+
+        <!-- ============================ SETTINGS ============================ -->
+        <section class="view" data-view="settings">
+          <article class="card">
+            <header class="card-h"><strong>Settings</strong><span>Interface and operator preferences</span></header>
+            <div class="settings-body">
+              <div class="setting-row">
+                <div><strong>Operator mode</strong><small>Match Mode hides AI/engineering tools for a clean officiating interface.</small></div>
+                <div class="operator-switch" role="group" aria-label="Operator mode">
+                  <button id="settings-mode-match" class="op-mode active" type="button">Match</button>
+                  <button id="settings-mode-engineer" class="op-mode" type="button">Engineer</button>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div><strong>Calm palette</strong><small>Reduce glows and animation for long sessions.</small></div>
+                <button id="calm-toggle" type="button">Toggle</button>
+              </div>
+              <div class="setting-row">
+                <div><strong>Sidebar</strong><small>Collapse to icons for more room.</small></div>
+                <button id="settings-collapse" type="button">Toggle Sidebar</button>
+              </div>
+              <div class="setting-row">
+                <div><strong>Analysis mode</strong><small>Visible-spectrum approximation or simulated thermal presentation.</small></div>
+                <button id="settings-mode-analysis" type="button">Switch Mode</button>
+              </div>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <!-- ============================ REVIEW MODE (immersive appeal environment) ============================ -->
+    <div id="review-mode" class="review-mode" aria-hidden="true">
+      <div class="rm-stage">
+        <canvas id="review-canvas" width="1280" height="720"></canvas>
+      </div>
+      <div class="rm-bar">
+        <div class="rm-bar-sec">
+          <span class="rm-label">Timeline</span>
+          <div id="rm-timeline" class="rm-timeline">
+            <div class="rm-step" data-step="appeal"><i></i><span>Appeal</span></div>
+            <div class="rm-step" data-step="tracking"><i></i><span>Tracking</span></div>
+            <div class="rm-step" data-step="prediction"><i></i><span>Prediction</span></div>
+            <div class="rm-step" data-step="decision"><i></i><span>Decision</span></div>
+          </div>
+        </div>
+        <div class="rm-bar-sec rm-decision-sec">
+          <span class="rm-label" id="rm-type">LBW</span>
+          <div id="rm-verdict" class="rm-verdict reviewing">REVIEWING</div>
+        </div>
+        <div class="rm-bar-sec">
+          <span class="rm-label">Replay Controls</span>
+          <div class="rm-controls">
+            <button id="rm-replay" type="button">⟲ Replay</button>
+            <input id="rm-scrub" type="range" min="0" max="100" value="100" aria-label="Scrub review" />
+          </div>
+          <div class="rm-speeds" role="group" aria-label="Replay speed">
+            <button type="button" class="rm-speed" data-speed="0.1">0.1x</button>
+            <button type="button" class="rm-speed" data-speed="0.25">0.25x</button>
+            <button type="button" class="rm-speed" data-speed="0.5">0.5x</button>
+            <button type="button" class="rm-speed active" data-speed="1">1x</button>
+            <button type="button" class="rm-speed" data-speed="2">2x</button>
+          </div>
+          <div class="rm-decision-actions">
+            <button id="rm-confirm-out" type="button" class="danger">OUT</button>
+            <button id="rm-confirm-not-out" type="button" class="success">NOT OUT</button>
+          </div>
+        </div>
+        <div class="rm-bar-sec">
+          <span class="rm-label">Review Progress</span>
+          <div class="rm-progress"><i id="rm-progress-bar"></i></div>
+          <button id="rm-back" class="rm-back" type="button">← Back to Dashboard</button>
+        </div>
+      </div>
+    </div>
+
+    <dialog id="testing-platform-dialog" class="testing-dialog">
+      <header>
+        <strong>React testing platform</strong>
+        <button id="close-testing-platform" type="button" aria-label="Close testing platform">x</button>
+      </header>
+      <iframe id="testing-platform-frame" title="Embedded React testing platform"></iframe>
+    </dialog>
+    <dialog id="new-match-dialog" class="new-match-dialog">
+      <header><strong>Start a New Match?</strong></header>
+      <div class="nm-body">
+        <div class="nm-row"><span>Current match</span><strong id="nm-current-name">--</strong></div>
+        <div class="nm-row"><span>Completed reviews</span><strong id="nm-current-count">0</strong></div>
+        <label class="nm-field">New match name
+          <input id="nm-name" type="text" placeholder="e.g. India vs Australia" />
+        </label>
+        <div class="nm-grid">
+          <label class="nm-field">Operator
+            <input id="nm-operator" type="text" placeholder="e.g. Nikhil" />
+          </label>
+          <label class="nm-field">Tournament
+            <input id="nm-tournament" type="text" placeholder="optional" />
+          </label>
+          <label class="nm-field">Venue
+            <input id="nm-venue" type="text" placeholder="e.g. PES" />
+          </label>
+          <label class="nm-field">Ground
+            <input id="nm-ground" type="text" placeholder="e.g. Nets A" />
+          </label>
+        </div>
+        <p class="nm-note">Model &amp; calibration in force are captured automatically, so every review is reproducible.</p>
+        <p class="nm-warn">⚠ The current match will be archived to Session History and the queue cleared.</p>
+      </div>
+      <div class="nm-actions">
+        <button id="nm-cancel" type="button">Cancel</button>
+        <button id="nm-confirm" type="button" class="danger">Archive &amp; Start New</button>
+      </div>
+    </dialog>
+
+    <dialog id="match-history-dialog" class="history-dialog">
+      <header>
+        <strong>Session History</strong>
+        <button id="close-history" type="button" aria-label="Close session history">x</button>
+      </header>
+      <div class="history-body">
+        <ul id="history-list" class="history-list"><li class="muted">No archived matches yet.</li></ul>
+        <section id="history-detail" class="history-detail"><p class="muted">Select a match to view its reviews (read-only).</p></section>
+      </div>
+    </dialog>
 
     <script type="module" src="renderer.js"></script>
   </body>
