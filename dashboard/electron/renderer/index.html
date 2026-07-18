@@ -112,6 +112,7 @@
                 <div class="lbw-view-toggle" id="lbw-view-toggle">
                   <button type="button" data-lbw-view="broadcast" class="active">Review Replay</button>
                   <button type="button" data-lbw-view="3d">3D Analysis</button>
+                  <button type="button" data-lbw-view="videos" id="lbw-videos-btn" title="Pipeline-rendered replays — tracked overlay + clean DRS review (same videos as the Testing page)">DRS Replay</button>
                 </div>
                 <div class="lbw-view" data-lbw-view="broadcast">
                   <div id="broadcast-review" class="drsa-wrap"></div>
@@ -125,6 +126,13 @@
                     <div><span>Speed</span><strong id="ball-speed">--</strong></div>
                   </div>
                   <canvas id="pitch-map-canvas" class="pitch-map-mini" width="420" height="120"></canvas>
+                </div>
+                <!-- Pipeline-rendered replay videos for the CURRENT live appeal — the same
+                     replay_players / replay_review exports the Testing page shows. -->
+                <div class="lbw-view" data-lbw-view="videos" hidden>
+                  <div id="canonical-review" class="canonical-review">
+                    <div class="cr-note quiet">Request an LBW review — the tracked-overlay and clean DRS replays render here when analysis completes.</div>
+                  </div>
                 </div>
               </div>
 
@@ -331,6 +339,9 @@
               <small id="replay-audio-note" class="ras-note"></small>
             </div>
             <div id="replay-layers" class="replay-layers" aria-label="Replay overlay layers"></div>
+            <!-- Pipeline-rendered DRS replay videos for the current appeal (LBW):
+                 same exports as the Testing page; hidden until analysis produces them. -->
+            <div id="replay-canonical" class="canonical-review replay-canonical" hidden></div>
             <div class="replay-strip">
               <button id="replay-play" type="button">Play</button>
               <button id="replay-pause" type="button">Pause</button>

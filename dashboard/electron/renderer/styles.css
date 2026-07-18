@@ -633,6 +633,18 @@ body.mode-match .engineer-only { display: none !important; }
 .sync-head strong.ok { color: #86efac; } .sync-head strong.warn { color: #fcd34d; }
 .sync-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; font-size: 12px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-3); }
 .adv-note { font-size: 11px; margin-top: 8px; line-height: 1.4; }
+.adv-note.warn { color: var(--amber, #f2b134); }
+
+/* ---------- Canonical pipeline replays (LBW live appeal → same videos as Testing) ---------- */
+.canonical-review { margin: 8px 0; }
+.canonical-review .cr-note { padding: 10px 12px; border: 1px solid #7a5b1e; border-radius: 8px; background: #221a08; color: #f2b134; font-size: 13px; }
+.canonical-review .cr-note.quiet { border-color: var(--border); background: var(--panel-3); color: var(--muted); }
+.canonical-review .cr-gates { display: flex; gap: 14px; flex-wrap: wrap; margin: 8px 0; font-size: 13px; color: #cfe6d6; }
+.canonical-review .cr-gates b { color: #fff; }
+.canonical-review h4 { margin: 12px 0 6px; color: #cfe6d6; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+.canonical-review video { width: 100%; height: auto; display: block; border-radius: 8px; background: #000; }
+.replay-canonical { margin: 8px 14px 0; }
+#lbw-videos-btn.ready::after { content: " ●"; color: var(--green, #2fe07a); }
 .cws-foot { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 14px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .detect-bar { position: absolute; left: 50%; top: 16px; transform: translateX(-50%); width: 280px; display: grid; gap: 6px; z-index: 4; padding: 10px 12px; border-radius: 10px; background: rgba(7, 12, 18, 0.92); border: 1px solid var(--border-2); }
 .detect-bar span { font-size: 12px; color: var(--accent2); text-align: center; }

@@ -142,6 +142,8 @@ const state = {
   reviewsCache: [],
   // Replay workspace: layers the operator switched OFF (per session; defaults on).
   replayLayerOff: {},
+  // Canonical pipeline job for the current live appeal: {jobId, results} once complete.
+  canonical: null,
 };
 
 const timers = {};
@@ -788,12 +790,14 @@ let _canonicalJobWatching = null;
 function watchCanonicalReview(decision) {
   const host = ensureCanonicalHost();
   if (!host) return;
+  state.canonical = null;
+  syncCanonicalSurfaces();                                 // clear the badge for the new appeal
   const jobId = decision?.canonical_job_id;
   if (!jobId) {
     // honesty rule: name the reason, never fabricate a replay
     host.innerHTML = decision?.canonical_skip_reason
       ? `<div class="cr-note">No DRS replay — ${decision.canonical_skip_reason}</div>`
-      : "";
+      : `<div class="cr-note quiet">No pipeline replay for this review type.</div>`;
     return;
   }
   _canonicalJobWatching = jobId;
@@ -808,31 +812,36 @@ function watchCanonicalReview(decision) {
     try {
       const res = await fetch(`${API_BASE}/api/analyze/${jobId}/results`);
       if (!res.ok) { setTimeout(poll, 3000); return; }     // 409 while processing
-      renderCanonicalReview(host, jobId, await res.json());
+      const results = await res.json();
+      state.canonical = { jobId, results };
+      renderCanonicalReview(host, jobId, results);
+      syncCanonicalSurfaces();                             // badge the toggle + mirror into Replay
     } catch { setTimeout(poll, 3000); }
   };
   setTimeout(poll, 3000);
 }
 
+// The host now lives statically INSIDE the LBW panel's "DRS Replay" view (it used to
+// be a stray div injected into the dashboard grid, which the fixed grid-areas layout
+// rendered effectively invisible — the videos existed but nobody could see them).
 function ensureCanonicalHost() {
-  let host = document.getElementById("canonical-review");
-  if (!host) {
-    const anchor = els.explanation?.closest("section, .panel, .card") || els.explanation?.parentElement;
-    if (!anchor) return null;
-    host = document.createElement("div");
-    host.id = "canonical-review";
-    anchor.insertAdjacentElement("afterend", host);
-    const style = document.createElement("style");
-    style.textContent = `
-      #canonical-review{margin:12px 0}
-      #canonical-review .cr-note{padding:10px 12px;border:1px solid #7a5b1e;border-radius:8px;background:#221a08;color:#f2b134;font-size:13px}
-      #canonical-review .cr-gates{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0;font-size:13px;color:#cfe6d6}
-      #canonical-review .cr-gates b{color:#fff}
-      #canonical-review h4{margin:12px 0 6px;color:#cfe6d6;font-size:13px;text-transform:uppercase;letter-spacing:.5px}
-      #canonical-review video{width:100%;height:auto;display:block;border-radius:8px;background:#000}`;
-    document.head.appendChild(style);
+  return document.getElementById("canonical-review");
+}
+
+// Mirror the canonical replays into the Replay workspace (LBW mode) and badge the
+// LBW "DRS Replay" toggle so the operator knows the videos are ready.
+function syncCanonicalSurfaces() {
+  const btn = document.getElementById("lbw-videos-btn");
+  const replayHost = document.getElementById("replay-canonical");
+  const c = state.canonical;
+  const ready = Boolean(c && c.results && (c.results.exports || {}).replay_players);
+  btn?.classList.toggle("ready", ready);
+  if (replayHost) {
+    const showInReplay = ready && state.reviewType === "lbw";
+    replayHost.hidden = !showInReplay;
+    if (showInReplay) renderCanonicalReview(replayHost, c.jobId, c.results);
+    else replayHost.innerHTML = "";
   }
-  return host;
 }
 
 function renderCanonicalReview(host, jobId, results) {
@@ -1288,7 +1297,7 @@ function setupLbwViewToggle() {
         panel.hidden = panel.dataset.lbwView !== view;
       });
       if (view === "3d") requestAnimationFrame(resizeThree);
-      else if (state.broadcastReview && state.decision) state.broadcastReview.play();
+      else if (view === "broadcast" && state.broadcastReview && state.decision) state.broadcastReview.play();
     });
   });
 }
@@ -1849,6 +1858,7 @@ function applyReplayMode() {
       ? "No decision frame yet — run the review first"
       : `Seek to frame ${frame} — the frame the module decided on`;
   }
+  syncCanonicalSurfaces();                                 // pipeline replay videos (LBW)
   drawReplayScene(state.decision || {});
 }
 
