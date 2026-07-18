@@ -255,12 +255,16 @@ export class CalibrationWorkspace {
         <h4>Camera sync</h4>
         <div class="sync-list">${this.syncRows()}</div>
       </div>
+      <div class="rail-block">
+        <h4>Pitch preview</h4>
+        <label class="adv-toggle"><input type="checkbox" data-adv="grid" ${this.advanced.grid ? "checked" : ""}/> Projected pitch grid</label>
+        <label class="adv-toggle"><input type="checkbox" data-adv="reproj" ${this.advanced.reproj ? "checked" : ""}/> Reprojection error points</label>
+        <div class="adv-note muted">${this.homography ? "Drawn from the solved homography — check the grid hugs the real pitch before saving." : "Appears automatically once all 5 reference points are placed."}</div>
+      </div>
       ${this.engineer ? `
       <div class="rail-block">
         <h4>Engineer diagnostics</h4>
-        <label class="adv-toggle"><input type="checkbox" data-adv="grid" ${this.advanced.grid ? "checked" : ""}/> Homography grid</label>
         <label class="adv-toggle"><input type="checkbox" data-adv="axes" ${this.advanced.axes ? "checked" : ""}/> Coordinate axes</label>
-        <label class="adv-toggle"><input type="checkbox" data-adv="reproj" ${this.advanced.reproj ? "checked" : ""}/> Reprojection points</label>
         <label class="adv-toggle"><input type="checkbox" data-adv="world" ${this.advanced.world ? "checked" : ""}/> World coordinates</label>
         <div class="adv-note muted">Lens distortion · intrinsics · extrinsics: not modeled (homography calibration).</div>
       </div>` : ""}`;
@@ -302,7 +306,14 @@ export class CalibrationWorkspace {
 
   actions() {
     const remove = this.profileFor(this.cameraId) ? `<button id="cws-delete" class="danger" type="button">Remove Saved Profile</button>` : "";
-    if (!this.captured) return `${remove}<button id="cws-capture" class="primary" type="button" ${this.cameraId == null ? "disabled" : ""}>Capture Frame</button>`;
+    // Two frame sources, same downstream flow: a LIVE camera capture, or a frame
+    // loaded from recorded footage (image or video — first frame is extracted).
+    // The upload path is what lets recorded 0_MP4 deliveries be calibrated without
+    // a live rig: the profile saves under the selected camera id (uploads analyze
+    // as camera 0), so the testing pipeline picks it up immediately.
+    const upload = `<button id="cws-upload" type="button" ${this.cameraId == null ? "disabled" : ""}>Load Frame from File</button>
+      <input id="cws-upload-file" type="file" accept="image/*,video/*" hidden />`;
+    if (!this.captured) return `${remove}${upload}<button id="cws-capture" class="primary" type="button" ${this.cameraId == null ? "disabled" : ""}>Capture Frame</button>`;
     const placed = Object.keys(this.markers).length;
     const recap = `<button id="cws-recapture" type="button">Recapture</button>`;
     const auto = `<button id="cws-auto" type="button">Auto Detect</button>`;
@@ -314,7 +325,10 @@ export class CalibrationWorkspace {
   /* ---------- bind ---------- */
   bind() {
     const q = (s) => this.host.querySelector(s);
-    q("#cws-eng")?.addEventListener("change", (e) => { this.engineer = e.target.checked; if (!this.engineer) this.advanced = { grid: false, axes: false, reproj: false, world: false }; this.refreshRight(); this.drawOverlays(); });
+    // Leaving Engineer Mode clears only the engineer-level overlays (axes/world).
+    // The pitch preview (grid + reprojection points) is a first-class control now,
+    // not an engineer diagnostic, so it survives the toggle.
+    q("#cws-eng")?.addEventListener("change", (e) => { this.engineer = e.target.checked; if (!this.engineer) { this.advanced.axes = false; this.advanced.world = false; } this.refreshRight(); this.drawOverlays(); });
     this.host.querySelectorAll('[name="cws-board"]').forEach((el) => el.addEventListener("change", () => {
       this.boardSetup = el.value === "dual" ? "dual" : "single";
       localStorage.setItem("drs.calibrationBoardSetup", this.boardSetup);
@@ -324,7 +338,9 @@ export class CalibrationWorkspace {
     this.host.querySelectorAll(".cws-cam-pick").forEach((el) => el.addEventListener("click", () => this.selectCamera(Number(el.dataset.cam))));
     this.host.querySelectorAll(".cws-role-select").forEach((el) => el.addEventListener("change", () => this.onRoleChange(Number(el.dataset.cam), el.value)));
     q("#cws-capture")?.addEventListener("click", () => this.captureFrame());
-    q("#cws-recapture")?.addEventListener("click", () => { this.captured = false; this.markers = {}; this.homography = null; this.quality = null; this.score = null; this.errorCm = null; this.render(); });
+    q("#cws-upload")?.addEventListener("click", () => q("#cws-upload-file")?.click());
+    q("#cws-upload-file")?.addEventListener("change", (e) => this.loadFrameFromFile(e.target.files?.[0]));
+    q("#cws-recapture")?.addEventListener("click", () => { this.captured = false; this.markers = {}; this.homography = null; this.quality = null; this.score = null; this.errorCm = null; this._previewShown = false; this.render(); });
     q("#cws-auto")?.addEventListener("click", () => this.autoDetect());
     q("#cws-save")?.addEventListener("click", () => this.save());
     q("#cws-delete")?.addEventListener("click", () => this.deleteProfile(this.cameraId));
@@ -363,6 +379,7 @@ export class CalibrationWorkspace {
   selectCamera(id) {
     this.cameraId = id;
     this.captured = false; this.markers = {}; this.proposed = false;
+    this._previewShown = false;
     this.homography = null; this.errorCm = null; this.quality = null; this.score = null; this.saved = false;
     const p = this.profileFor(id);
     if (p && p.markers) { for (const m of MARKERS) { const s = p.markers[m.key]; if (s) this.markers[m.key] = { x: Number(s.x), y: Number(s.y) }; } if (p.image_size) { this.imageW = p.image_size[0] || this.imageW; this.imageH = p.image_size[1] || this.imageH; } }
@@ -389,6 +406,56 @@ export class CalibrationWorkspace {
     if (!el) return;
     if (this.liveOk) { el.textContent = `LIVE — Camera ${this.cameraId}`; el.classList.remove("warn"); }
     else { el.textContent = `Camera ${this.cameraId} has no live feed — check that it is connected and streaming.`; el.classList.add("warn"); }
+  }
+
+  // Calibrate from recorded footage: extract a frame from an uploaded image/video and
+  // enter the SAME marker-placement flow as a live capture. This is the path for
+  // calibrating uploaded deliveries (processed as camera 0) without a live rig.
+  loadFrameFromFile(file) {
+    if (!file) return;
+    const finish = (canvas) => {
+      if (!canvas.width || !canvas.height) return;
+      this.imageW = canvas.width;
+      this.imageH = canvas.height;
+      this.capturedUrl = canvas.toDataURL("image/jpeg", 0.92);
+      this.stopLive();
+      this.captured = true;
+      this.markers = {};
+      this.proposed = false;
+      this.homography = null; this.errorCm = null; this.quality = null; this.score = null; this.saved = false;
+      this.render();
+    };
+    const url = URL.createObjectURL(file);
+    if (file.type.startsWith("video/")) {
+      const video = document.createElement("video");
+      video.muted = true;
+      video.src = url;
+      video.addEventListener("loadeddata", () => {
+        // Seek slightly in so we grab a real image, not a black lead-in frame.
+        video.currentTime = Math.min(0.5, (video.duration || 1) / 4);
+      }, { once: true });
+      video.addEventListener("seeked", () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext("2d").drawImage(video, 0, 0);
+        URL.revokeObjectURL(url);
+        finish(canvas);
+      }, { once: true });
+      video.addEventListener("error", () => URL.revokeObjectURL(url), { once: true });
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      canvas.getContext("2d").drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+      finish(canvas);
+    };
+    img.onerror = () => URL.revokeObjectURL(url);
+    img.src = url;
   }
 
   captureFrame() {
@@ -479,6 +546,14 @@ export class CalibrationWorkspace {
       this.errorCm = data.homography_error_cm;
       this.quality = data.quality;
       this.score = this.computeScore();
+      // The moment a homography exists, SHOW it: projected pitch grid + per-marker
+      // reprojection error dots become the default preview (the operator judges the
+      // solve visually, not from an RMS number alone). Toggles can still hide them.
+      if (this.homography && !this._previewShown) {
+        this._previewShown = true;
+        this.advanced.grid = true;
+        this.advanced.reproj = true;
+      }
       this.refreshRight(); this.drawOverlays(); this.refreshFooter();
     } catch { const cap = this.host.querySelector("#cal-caption"); if (cap) cap.textContent = "Could not solve — check the markers."; }
   }
@@ -575,6 +650,9 @@ export class CalibrationWorkspace {
     }
     if (!this.advanced.grid && !this.advanced.axes) return;
     const inv = mat3inv(this.homography);
+    this._setPreviewNote(inv
+      ? "Drawn from the solved homography — check the grid hugs the real pitch before saving."
+      : "⚠ Projected grid unavailable — the reference points are nearly in a line (degenerate view). Re-place them with more spread before trusting this calibration.");
     if (!inv) return;
     const toC = (lat, along) => { const [px, py] = applyH(inv, lat + 0.1143, along); return [px * sx, py * sy]; };
     if (this.advanced.grid) {
@@ -587,6 +665,18 @@ export class CalibrationWorkspace {
       ctx.lineWidth = 2;
       ctx.strokeStyle = "#22c55e"; ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(xx, xy); ctx.stroke();
       ctx.strokeStyle = "#ef4444"; ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(zx, zy); ctx.stroke();
+    }
+  }
+
+  // Update the Pitch-preview explainer in place (drawOverlays discovers degeneracy
+  // AFTER the rail renders, so it writes the warning directly).
+  _setPreviewNote(text) {
+    const block = [...this.host.querySelectorAll(".rail-block")]
+      .find((b) => b.querySelector("h4")?.textContent === "Pitch preview");
+    const note = block?.querySelector(".adv-note");
+    if (note && note.textContent !== text) {
+      note.textContent = text;
+      note.classList.toggle("warn", text.startsWith("⚠"));
     }
   }
 
