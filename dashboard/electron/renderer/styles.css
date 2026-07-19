@@ -222,13 +222,15 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 .dash-grid[data-state="waiting"] .d-detail { display: none; }
 .dash-grid[data-state="waiting"] .d-evidence { display: none; }
 
-/* PROCESSING + RESULT — analysis-rich */
+/* PROCESSING + RESULT — the replay/analysis card is the primary evidence and gets
+   the most area (6 of 12 columns, the taller row); the live feed shrinks once the
+   event is captured, and history/timeline compress before the evidence does. */
 .dash-grid[data-state="processing"],
 .dash-grid[data-state="result"] {
-  grid-template-rows: minmax(300px, 1.15fr) minmax(190px, 0.85fr);
+  grid-template-rows: minmax(300px, 1.45fr) minmax(170px, 0.55fr);
   grid-template-areas:
-    "feed feed feed feed feed detail detail detail detail decision decision decision"
-    "timeline timeline timeline queue queue queue evidence evidence evidence decision decision decision";
+    "feed feed feed detail detail detail detail detail detail decision decision decision"
+    "timeline timeline queue queue queue evidence evidence evidence evidence decision decision decision";
 }
 
 /* Short laptop windows (≤920px tall): reclaim chrome so the analysis cards get the
@@ -242,7 +244,7 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
   .system-alerts { padding: 6px 10px; font-size: 12px; }
   .dash-grid { gap: 10px; }
   .dash-grid[data-state="processing"],
-  .dash-grid[data-state="result"] { grid-template-rows: minmax(260px, 1.15fr) minmax(170px, 0.85fr); }
+  .dash-grid[data-state="result"] { grid-template-rows: minmax(260px, 1.45fr) minmax(150px, 0.55fr); }
 }
 
 /* 1366x768-class laptops: tightest tier — everything still visible, just denser. */
@@ -253,7 +255,7 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
   .dash-grid { gap: 8px; }
   .dash-grid[data-state="waiting"] { grid-template-rows: minmax(280px, 1.5fr) minmax(140px, 0.55fr); }
   .dash-grid[data-state="processing"],
-  .dash-grid[data-state="result"] { grid-template-rows: minmax(225px, 1.15fr) minmax(145px, 0.85fr); }
+  .dash-grid[data-state="result"] { grid-template-rows: minmax(225px, 1.45fr) minmax(130px, 0.55fr); }
   .decision-stages { padding: 6px 10px; gap: 6px; }
   .camera-thumbs { padding: 6px 8px; }
   .cam-thumb { width: 118px; height: 70px; }
@@ -689,7 +691,11 @@ body.mode-match .engineer-only { display: none !important; }
 .canonical-review h4 { margin: 12px 0 6px; color: #cfe6d6; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
 .canonical-review video { width: 100%; height: auto; display: block; border-radius: 8px; background: #000; }
 .replay-canonical { margin: 8px 14px 0; }
-#lbw-videos-btn.ready::after { content: " ●"; color: var(--green, #2fe07a); }
+.lbw-view-toggle button.ready::after { content: " ●"; color: var(--green, #2fe07a); }
+/* Evidence video tabs: the replay letterboxes to fill the panel without scrolling. */
+.lbw-view[data-lbw-view="observed"], .lbw-view[data-lbw-view="clean"] { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.lbw-view[data-lbw-view="observed"] .canonical-review, .lbw-view[data-lbw-view="clean"] .canonical-review { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.lbw-view[data-lbw-view="observed"] .canonical-review video, .lbw-view[data-lbw-view="clean"] .canonical-review video { flex: 1 1 auto; min-height: 0; object-fit: contain; }
 .canonical-review .cr-tips { margin: 8px 0 0; padding: 0 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .rm-canonical { border: 1px solid var(--border-2); background: var(--panel-3); color: var(--muted); border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: default; }
 .rm-canonical.ready { border-color: var(--green, #2fe07a); color: var(--green, #2fe07a); cursor: pointer; font-weight: 600; }

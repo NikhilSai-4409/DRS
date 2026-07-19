@@ -109,12 +109,26 @@
               </header>
 
               <div class="review-panel" data-review-panel="lbw">
+                <!-- The two PIPELINE replays are the primary evidence (same videos as the
+                     Testing page). The legacy SVG animation and 3D reconstruction predate
+                     the pipeline replay and are engineer/debug views only. -->
                 <div class="lbw-view-toggle" id="lbw-view-toggle">
-                  <button type="button" data-lbw-view="broadcast" class="active">Review Replay</button>
-                  <button type="button" data-lbw-view="3d">3D Analysis</button>
-                  <button type="button" data-lbw-view="videos" id="lbw-videos-btn" title="Pipeline-rendered replays — tracked overlay + clean DRS review (same videos as the Testing page)">DRS Replay</button>
+                  <button type="button" data-lbw-view="observed" id="lbw-observed-btn" class="active" title="Real footage with the tracked-ball overlay — pipeline replay">Observed Trajectory</button>
+                  <button type="button" data-lbw-view="clean" id="lbw-clean-btn" title="Clean broadcast DRS replay — pipeline render">Broadcast Replay</button>
+                  <button type="button" data-lbw-view="broadcast" class="engineer-only" title="Engineer: legacy SVG animation (pre-pipeline)">Animation</button>
+                  <button type="button" data-lbw-view="3d" class="engineer-only" title="Engineer: 3D reconstruction (debug)">3D Analysis</button>
                 </div>
-                <div class="lbw-view" data-lbw-view="broadcast">
+                <div class="lbw-view" data-lbw-view="observed">
+                  <div id="canonical-observed" class="canonical-review">
+                    <div class="cr-note quiet">Request an LBW review — the tracked-footage replay renders here when analysis completes.</div>
+                  </div>
+                </div>
+                <div class="lbw-view" data-lbw-view="clean" hidden>
+                  <div id="canonical-review" class="canonical-review">
+                    <div class="cr-note quiet">Request an LBW review — the clean DRS broadcast replay renders here when analysis completes.</div>
+                  </div>
+                </div>
+                <div class="lbw-view" data-lbw-view="broadcast" hidden>
                   <div id="broadcast-review" class="drsa-wrap"></div>
                 </div>
                 <div class="lbw-view" data-lbw-view="3d" hidden>
@@ -126,13 +140,6 @@
                     <div><span>Speed</span><strong id="ball-speed">--</strong></div>
                   </div>
                   <canvas id="pitch-map-canvas" class="pitch-map-mini" width="420" height="120"></canvas>
-                </div>
-                <!-- Pipeline-rendered replay videos for the CURRENT live appeal — the same
-                     replay_players / replay_review exports the Testing page shows. -->
-                <div class="lbw-view" data-lbw-view="videos" hidden>
-                  <div id="canonical-review" class="canonical-review">
-                    <div class="cr-note quiet">Request an LBW review — the tracked-overlay and clean DRS replays render here when analysis completes.</div>
-                  </div>
                 </div>
               </div>
 

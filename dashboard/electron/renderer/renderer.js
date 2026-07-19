@@ -391,6 +391,11 @@ function setOperatorMode(mode) {
   const engineer = state.operatorMode === "engineer";
   [els.opModeEngineer, els.settingsModeEngineer].forEach((b) => b && b.classList.toggle("active", engineer));
   [els.opModeMatch, els.settingsModeMatch].forEach((b) => b && b.classList.toggle("active", !engineer));
+  // Match Mode hides the engineer evidence views (SVG animation / 3D) — if the
+  // operator was parked on one, snap back to the primary pipeline replay.
+  if (!engineer && (state.lbwView === "broadcast" || state.lbwView === "3d")) {
+    document.getElementById("lbw-observed-btn")?.click();
+  }
 }
 
 function applySidebarState() {
@@ -788,39 +793,39 @@ function setMatchStatus(kind) {
 // results, endpoints and replay exports as the Testing page (one implementation).
 let _canonicalJobWatching = null;
 function watchCanonicalReview(decision) {
-  const host = ensureCanonicalHost();
-  if (!host) return;
+  const hosts = canonicalHosts();
+  if (!hosts.observed && !hosts.clean) return;
   state.canonical = null;
-  syncCanonicalSurfaces();                                 // clear the badge for the new appeal
+  syncCanonicalSurfaces();                                 // clear the badges for the new appeal
   const jobId = decision?.canonical_job_id;
   if (!jobId) {
     // honesty rule: name the reason, never fabricate a replay
-    host.innerHTML = decision?.canonical_skip_reason
+    setCanonicalNotes(decision?.canonical_skip_reason
       ? `<div class="cr-note">No DRS replay — ${decision.canonical_skip_reason}</div>`
-      : `<div class="cr-note quiet">No pipeline replay for this review type.</div>`;
+      : `<div class="cr-note quiet">No pipeline replay for this review type.</div>`);
     return;
   }
   _canonicalJobWatching = jobId;
-  host.innerHTML = `<div class="cr-note">DRS analysis running… (ball tracking + replay render)</div>`;
+  setCanonicalNotes(`<div class="cr-note">DRS analysis running… (ball tracking + replay render)</div>`);
   setCanonicalChip("Replay rendering …", false);
   const started = Date.now();
   const poll = async () => {
     if (_canonicalJobWatching !== jobId) return;           // superseded by a newer appeal
     if (Date.now() - started > 5 * 60 * 1000) {
-      host.innerHTML = `<div class="cr-note">DRS analysis timed out — check the backend log.</div>`;
+      setCanonicalNotes(`<div class="cr-note">DRS analysis timed out — check the backend log.</div>`);
       return;
     }
     try {
       const res = await fetch(`${API_BASE}/api/analyze/${jobId}/results`);
       if (!res.ok) {
-        // Still processing — show the job's REAL progress (percent + step), both in
-        // the DRS Replay tab and the Review Mode chip, instead of a static note.
+        // Still processing — show the job's REAL progress (percent + step) in both
+        // evidence tabs and the Review Mode chip, instead of a static note.
         try {
           const st = await fetch(`${API_BASE}/api/analyze/${jobId}/status`).then((r) => r.json());
           if (_canonicalJobWatching === jobId) {
             const pct = Number(st.progress ?? st.percent ?? 0);
             const step = st.current_step || st.step || "processing";
-            host.innerHTML = `<div class="cr-note">DRS analysis ${pct ? `${pct}% — ` : "running… "}${step}</div>`;
+            setCanonicalNotes(`<div class="cr-note">DRS analysis ${pct ? `${pct}% — ` : "running… "}${step}</div>`);
             setCanonicalChip(`Replay rendering ${pct ? `${pct}%` : "…"}`, false);
           }
         } catch { /* status endpoint unavailable — keep the previous note */ }
@@ -828,18 +833,29 @@ function watchCanonicalReview(decision) {
       }
       const results = await res.json();
       state.canonical = { jobId, results };
-      renderCanonicalReview(host, jobId, results);
-      syncCanonicalSurfaces();                             // badge the toggle + mirror into Replay
+      if (hosts.observed) renderCanonicalReview(hosts.observed, jobId, results, "players");
+      if (hosts.clean) renderCanonicalReview(hosts.clean, jobId, results, "review");
+      syncCanonicalSurfaces();                             // badge the tabs + mirror into Replay
     } catch { setTimeout(poll, 3000); }
   };
   setTimeout(poll, 3000);
 }
 
-// The host now lives statically INSIDE the LBW panel's "DRS Replay" view (it used to
-// be a stray div injected into the dashboard grid, which the fixed grid-areas layout
-// rendered effectively invisible — the videos existed but nobody could see them).
-function ensureCanonicalHost() {
-  return document.getElementById("canonical-review");
+// The two pipeline replays live in their OWN primary tabs: Observed Trajectory
+// (#canonical-observed, tracked footage) and Broadcast Replay (#canonical-review,
+// clean DRS render). Both hosts get identical pending/failure notes so whichever
+// tab the operator is on tells the truth.
+function canonicalHosts() {
+  return {
+    observed: document.getElementById("canonical-observed"),
+    clean: document.getElementById("canonical-review"),
+  };
+}
+
+function setCanonicalNotes(html) {
+  const { observed, clean } = canonicalHosts();
+  if (observed) observed.innerHTML = html;
+  if (clean) clean.innerHTML = html;
 }
 
 // Review Mode status chip: replay-rendering progress / readiness, visible WITHOUT
@@ -856,11 +872,11 @@ function setCanonicalChip(text, ready) {
 // Mirror the canonical replays into the Replay workspace (LBW mode) and badge the
 // LBW "DRS Replay" toggle so the operator knows the videos are ready.
 function syncCanonicalSurfaces() {
-  const btn = document.getElementById("lbw-videos-btn");
   const replayHost = document.getElementById("replay-canonical");
   const c = state.canonical;
   const ready = Boolean(c && c.results && (c.results.exports || {}).replay_players);
-  btn?.classList.toggle("ready", ready);
+  document.getElementById("lbw-observed-btn")?.classList.toggle("ready", ready);
+  document.getElementById("lbw-clean-btn")?.classList.toggle("ready", ready && Boolean((c.results.exports || {}).replay_review));
   if (c && c.results) {
     setCanonicalChip(ready ? "DRS replay ready ✓ — view" : "Analysis done — no replay (see DRS Replay tab)", ready);
   } else if (!c) {
@@ -874,7 +890,7 @@ function syncCanonicalSurfaces() {
   }
 }
 
-function renderCanonicalReview(host, jobId, results) {
+function renderCanonicalReview(host, jobId, results, which = "both") {
   const ex = results.exports || {};
   const g = results.reconstruction?.gates;
   const gates = g
@@ -897,11 +913,13 @@ function renderCanonicalReview(host, jobId, results) {
       <ul class="cr-tips">${tips.map((tip) => `<li>${tip}</li>`).join("")}</ul>`;
     return;
   }
-  host.innerHTML = `${gates}
-    <h4>Observed Trajectory</h4>
-    <video muted playsinline controls autoplay loop src="${API_BASE}/api/testing/jobs/${jobId}/exports/replay_players"></video>
-    ${ex.replay_review ? `<h4>DRS Review</h4>
-    <video muted playsinline controls autoplay loop src="${API_BASE}/api/testing/jobs/${jobId}/exports/replay_review"></video>` : ""}`;
+  const players = `<video muted playsinline controls autoplay loop src="${API_BASE}/api/testing/jobs/${jobId}/exports/replay_players"></video>`;
+  const review = ex.replay_review
+    ? `<video muted playsinline controls autoplay loop src="${API_BASE}/api/testing/jobs/${jobId}/exports/replay_review"></video>`
+    : `<div class="cr-note">Clean broadcast replay was not generated for this delivery.</div>`;
+  if (which === "players") host.innerHTML = `${gates}${players}`;
+  else if (which === "review") host.innerHTML = `${gates}${review}`;
+  else host.innerHTML = `${gates}<h4>Observed Trajectory</h4>${players}${ex.replay_review ? `<h4>DRS Review</h4>${review}` : ""}`;
 }
 
 function renderDecisionState(status) {
@@ -1326,7 +1344,9 @@ function initDashboardModules() {
 function setupLbwViewToggle() {
   const toggle = document.getElementById("lbw-view-toggle");
   if (!toggle) return;
-  state.lbwView = "broadcast";
+  // Primary evidence = the pipeline replays; the SVG animation and 3D scene are
+  // engineer-only views and never the default.
+  state.lbwView = "observed";
   toggle.querySelectorAll("button[data-lbw-view]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const view = btn.dataset.lbwView;
@@ -2517,11 +2537,11 @@ els.reviewsList?.addEventListener("click", (event) => {
   if (btn) exportReviewJson(btn.dataset.exportReview);
 });
 els.activityRefresh?.addEventListener("click", renderActivityLog);
-// Review Mode chip → exit the overlay and land directly on the DRS Replay videos.
+// Review Mode chip → exit the overlay and land on the Observed Trajectory replay.
 document.getElementById("rm-canonical-status")?.addEventListener("click", () => {
   document.getElementById("rm-back")?.click();
   setView("dashboard");
-  document.getElementById("lbw-videos-btn")?.click();
+  document.getElementById("lbw-observed-btn")?.click();
 });
 els.replaySave?.addEventListener("click", () => showToast("Review saved", "not-out"));
 els.modeToggle.addEventListener("click", toggleMode);
