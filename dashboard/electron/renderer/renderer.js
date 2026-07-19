@@ -885,7 +885,16 @@ function renderCanonicalReview(host, jobId, results) {
     const why = t.valid === false
       ? `trajectory rejected: ${(t.reasons || []).join("; ") || t.observed?.end_reason || "invalid"}`
       : "replay generation failed";
-    host.innerHTML = `${gates}<div class="cr-note">No DRS replay — ${why}</div>`;
+    // Make the reason ACTIONABLE: distinguish "the camera never saw a ball"
+    // (operator-fixable) from a render failure (check the logs).
+    const trackingIssue = /tracked points|no ball|detection|gap|lost/i.test(why);
+    const tips = trackingIssue
+      ? ["Confirm the ball is clearly visible to the ball-tracking camera for at least ~10 frames",
+         "Check lighting/exposure — a dim or blown-out ball won't detect",
+         "Verify the camera points down the pitch (Cameras page → roles)"]
+      : ["Check the Activity Log / backend log for the render error"];
+    host.innerHTML = `${gates}<div class="cr-note">No DRS replay — ${why}</div>
+      <ul class="cr-tips">${tips.map((tip) => `<li>${tip}</li>`).join("")}</ul>`;
     return;
   }
   host.innerHTML = `${gates}

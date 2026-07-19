@@ -103,6 +103,9 @@ class DeliveryTestingPipeline:
     def process(self, job_id: str, video_paths: list[Path], options: AnalysisOptions) -> dict[str, Any]:
         if len(video_paths) < 1 or len(video_paths) > 6:
             raise ValueError("Testing platform supports one to six uploaded videos")
+        import time as _time
+        _t_start = _time.monotonic()
+        _t_replay = 0.0
 
         base_output = Path(options.output_dir) if options.output_dir else OUTPUT_DIR
         job_dir = base_output / job_id
@@ -159,6 +162,7 @@ class DeliveryTestingPipeline:
         if options.replay_generation:
             from core.replay_reconstruction import build_replay_reconstruction
 
+            _t0 = _time.monotonic()
             reconstruction = build_replay_reconstruction(
                 review_result.trajectory.to_dict(), decision
             )
@@ -172,6 +176,7 @@ class DeliveryTestingPipeline:
                 replay_review_path = generate_drs_review_replay(
                     reconstruction, job_dir / "replay_review.mp4"
                 )
+            _t_replay = _time.monotonic() - _t0
 
         report_path = self._write_report(job_dir, job_id, camera_results, decision, sync)
         json_path = self._write_json(
@@ -179,7 +184,31 @@ class DeliveryTestingPipeline:
         )
         csv_path = self._write_csv(job_dir, job_id, all_tracks)
 
+        # Per-review performance metrics — recorded on EVERY job (result JSON + activity
+        # stream) so regressions in analysis/render time and tracking quality are
+        # visible as trends, not anecdotes.
+        metrics = {
+            "analysis_time_s": round(_time.monotonic() - _t_start, 2),
+            "replay_render_time_s": round(_t_replay, 2) if _t_replay else None,
+            "tracked_points": len(fused),
+            "real_detections": observed.real_count,
+            "replay_generated": bool(replay_review_path),
+            "detector_model": getattr(self.detector, "active_model_name", "none"),
+            "geometry_source": geometry_source,
+        }
+        try:
+            from core import activity_log
+            activity_log.record(
+                "review_metrics",
+                f"Job {job_id}: {metrics['analysis_time_s']}s analysis, "
+                f"{metrics['tracked_points']} pts, replay={'yes' if metrics['replay_generated'] else 'no'}",
+                **metrics,
+            )
+        except Exception:  # metrics must never fail a job
+            pass
+
         return {
+            "metrics": metrics,
             "job_id": job_id,
             "mode": f"{len(video_paths)}_camera",
             "status": "completed",
