@@ -1600,30 +1600,98 @@ function finishActiveReview() {
 // canvas adapts to the review type while the surrounding chrome stays identical.
 const ReviewMode = {
   player: null, el: null, active: false, feedTimer: null,
+  // Captured-video replay: when the ANIMATION has no data (no tracked ball), the
+  // controls drive the backend replay buffer — the actual captured delivery footage —
+  // so the scrubber and speeds always work on a real review.
+  videoReplay: { armed: false, total: 0, frame: 0, speed: 1, timer: null, camId: 0 },
   ensure() {
     if (this.player) return this.player;
     this.el = document.getElementById("review-mode");
     this.player = new ReviewPlayer(document.getElementById("review-canvas"));
     this.player.onProgress = (p) => this.onProgress(p);
     document.getElementById("rm-back").addEventListener("click", () => this.exit());
-    document.getElementById("rm-replay").addEventListener("click", () => { if (this.player.hasReplayData()) this.player.restart(); });
-    document.getElementById("rm-scrub").addEventListener("input", (e) => { this.player.pause(); this.player.seek(Number(e.target.value) / 100); });
+    document.getElementById("rm-replay").addEventListener("click", () => {
+      if (this.player.hasReplayData()) this.player.restart();
+      else if (this.videoReplay.armed) this.playVideoReplay(true);
+    });
+    document.getElementById("rm-scrub").addEventListener("input", (e) => {
+      if (this.player.hasReplayData()) { this.player.pause(); this.player.seek(Number(e.target.value) / 100); }
+      else if (this.videoReplay.armed) { this.stopVideoReplay(); this.showReplayFrame(Number(e.target.value)); }
+    });
     // Slow-motion presets (0.1x–2x): set the rate and immediately replay at it.
     document.querySelectorAll("#review-mode .rm-speed").forEach((btn) => {
       btn.addEventListener("click", () => {
-        this.player.setSpeed(Number(btn.dataset.speed) || 1);
+        const speed = Number(btn.dataset.speed) || 1;
+        this.player.setSpeed(speed);
+        this.videoReplay.speed = speed;
         document.querySelectorAll("#review-mode .rm-speed").forEach((b) => b.classList.toggle("active", b === btn));
         if (this.player.hasReplayData()) this.player.restart();
+        else if (this.videoReplay.armed && this.videoReplay.timer) this.playVideoReplay(false);
       });
     });
     document.getElementById("rm-confirm-out").addEventListener("click", () => confirmDecision("OUT"));
     document.getElementById("rm-confirm-not-out").addEventListener("click", () => confirmDecision("NOT_OUT"));
     return this.player;
   },
+
+  // ---- captured-video replay (backend replay buffer) ----
+  async armVideoReplay() {
+    try {
+      const st = await jsonFetch("/api/replay/state");
+      const total = Number(st.total_frames || 0);
+      if (!total) return false;
+      const vr = this.videoReplay;
+      vr.total = total; vr.frame = 0; vr.armed = true;
+      vr.camId = getPrimaryCameraId() ?? 0;
+      const scrub = document.getElementById("rm-scrub");
+      if (scrub && !this.player.hasReplayData()) { scrub.max = String(Math.max(1, total - 1)); scrub.value = "0"; }
+      this.syncReplayControls();
+      return true;
+    } catch { return false; }
+  },
+  showReplayFrame(index) {
+    const vr = this.videoReplay;
+    vr.frame = Math.max(0, Math.min(vr.total - 1, Math.round(index)));
+    clearInterval(this.feedTimer);          // leave LIVE view the moment the operator scrubs
+    const img = new Image();
+    img.onload = () => this.player.setFeedImage(img);
+    img.src = `${API_BASE}/api/replay/${vr.camId}.jpg?frame_index=${vr.frame}&t=${Date.now()}`;
+    const scrub = document.getElementById("rm-scrub");
+    if (scrub) scrub.value = String(vr.frame);
+  },
+  playVideoReplay(fromStart) {
+    const vr = this.videoReplay;
+    if (!vr.armed) return;
+    clearInterval(vr.timer);
+    if (fromStart) vr.frame = 0;
+    // Client-side playback clock: one buffered frame per tick, tick rate = 30fps × speed.
+    vr.timer = setInterval(() => {
+      if (vr.frame >= vr.total - 1) { clearInterval(vr.timer); vr.timer = null; return; }
+      this.showReplayFrame(vr.frame + 1);
+    }, Math.max(16, Math.round(1000 / (30 * vr.speed))));
+  },
+  stopVideoReplay() {
+    clearInterval(this.videoReplay.timer);
+    this.videoReplay.timer = null;
+  },
+  syncReplayControls() {
+    const hasAnim = this.player.hasReplayData();
+    const hasVideo = this.videoReplay.armed;
+    const usable = hasAnim || hasVideo;
+    const replayBtn = document.getElementById("rm-replay");
+    replayBtn.disabled = !usable;
+    replayBtn.textContent = hasAnim ? "⟲ Replay" : hasVideo ? "⟲ Replay captured" : "No replay data";
+    document.getElementById("rm-scrub").disabled = !usable;
+    document.querySelectorAll("#review-mode .rm-speed").forEach((b) => { b.disabled = !usable; });
+    if (hasAnim) { const s = document.getElementById("rm-scrub"); s.max = "100"; }
+  },
   enter(decision) {
     this.ensure();
     this.active = true;
     this._lastP = 0;   // start hidden; the director reveals everything progressively
+    // Fresh appeal → fresh replay buffer: re-arm the captured-video controls.
+    this.stopVideoReplay();
+    this.videoReplay.armed = false;
     document.body.classList.add("review-active");
     this.el.classList.add("open");
     this.el.setAttribute("aria-hidden", "false");
@@ -1645,14 +1713,11 @@ const ReviewMode = {
     if (!this.active) return;
     const rr = decision.review_result || {};
     this.player.setPayload(decision.overlay || { review_type: decision.review_type, verdict: rr.verdict, confidence: rr.confidence, measurements: rr.measurements });
-    // Reflect whether there's a ball trajectory to replay. No trajectory (e.g. no
-    // camera / no tracked delivery) → disable replay + speed controls and say so.
-    const hasReplay = this.player.hasReplayData();
-    const replayBtn = document.getElementById("rm-replay");
-    replayBtn.disabled = !hasReplay;
-    replayBtn.textContent = hasReplay ? "⟲ Replay" : "No replay data";
-    document.getElementById("rm-scrub").disabled = !hasReplay;
-    document.querySelectorAll("#review-mode .rm-speed").forEach((b) => { b.disabled = !hasReplay; });
+    // Controls always work on SOMETHING real: the animation when a trajectory
+    // exists, else the captured delivery footage from the backend replay buffer
+    // (armed asynchronously — syncReplayControls re-runs when it lands).
+    this.syncReplayControls();
+    if (!this.player.hasReplayData() && !this.videoReplay.armed) this.armVideoReplay();
     const status = decision.status || "PROCESSING";
     const resolved = status === "OUT" || status === "NOT_OUT";
     const v = document.getElementById("rm-verdict");
@@ -1693,6 +1758,7 @@ const ReviewMode = {
     this.active = false;
     if (this.player) this.player.pause();
     clearInterval(this.feedTimer);
+    this.stopVideoReplay();
     document.body.classList.remove("review-active");
     if (this.el) { this.el.classList.remove("open"); this.el.setAttribute("aria-hidden", "true"); }
   },

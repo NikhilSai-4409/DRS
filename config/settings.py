@@ -148,6 +148,9 @@ WIDE_LINE_FROM_MIDDLE_M = 0.889
 NO_BALL_CREASE_MARGIN_MM = 0.0
 # Cap the number of buffered replay frames a review module runs detection over.
 REVIEW_ANALYSIS_MAX_FRAMES = 48
+# Max frames written into a saved review replay clip (replay.mp4 per review).
+# 600 @ 30fps = 20s — enough for run-up + delivery; override per deployment.
+REPLAY_CLIP_MAX_FRAMES = _env_int("DRS_REPLAY_CLIP_MAX_FRAMES", 600)
 GRAVITY_MPS2 = 9.81
 BOUNCE_RESTITUTION = 0.58
 DRAG_COEFFICIENT = 0.47

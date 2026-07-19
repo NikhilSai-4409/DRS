@@ -14,6 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from config.settings import REPLAY_CLIP_MAX_FRAMES
 from core.animation_director import AnimationDirector
 from core.camera_director import CameraDirector
 from core.overlay_renderer import OverlayRenderer
@@ -25,12 +26,14 @@ log = get_logger("replay_builder")
 
 class ReplayBuilder:
     def __init__(self, renderer: OverlayRenderer | None = None, director: AnimationDirector | None = None,
-                 camera: CameraDirector | None = None, fps: int = 30, max_frames: int = 150):
+                 camera: CameraDirector | None = None, fps: int = 30, max_frames: int | None = None):
         self.renderer = renderer or OverlayRenderer()
         self.director = director or AnimationDirector()
         self.camera = camera or CameraDirector()
         self.fps = int(fps)
-        self.max_frames = int(max_frames)
+        # The saved review clip keeps the whole delivery, not just the tail: the old
+        # hardcoded 150-frame cap cut real reviews to the "last 10 seconds".
+        self.max_frames = int(max_frames if max_frames is not None else REPLAY_CLIP_MAX_FRAMES)
 
     def build(self, frames: list, payload: dict, output_path: Path) -> dict:
         """Render ``payload`` onto each frame (revealed progressively) and encode mp4."""
