@@ -802,6 +802,7 @@ function watchCanonicalReview(decision) {
   }
   _canonicalJobWatching = jobId;
   host.innerHTML = `<div class="cr-note">DRS analysis running… (ball tracking + replay render)</div>`;
+  setCanonicalChip("Replay rendering …", false);
   const started = Date.now();
   const poll = async () => {
     if (_canonicalJobWatching !== jobId) return;           // superseded by a newer appeal
@@ -811,7 +812,20 @@ function watchCanonicalReview(decision) {
     }
     try {
       const res = await fetch(`${API_BASE}/api/analyze/${jobId}/results`);
-      if (!res.ok) { setTimeout(poll, 3000); return; }     // 409 while processing
+      if (!res.ok) {
+        // Still processing — show the job's REAL progress (percent + step), both in
+        // the DRS Replay tab and the Review Mode chip, instead of a static note.
+        try {
+          const st = await fetch(`${API_BASE}/api/analyze/${jobId}/status`).then((r) => r.json());
+          if (_canonicalJobWatching === jobId) {
+            const pct = Number(st.progress ?? st.percent ?? 0);
+            const step = st.current_step || st.step || "processing";
+            host.innerHTML = `<div class="cr-note">DRS analysis ${pct ? `${pct}% — ` : "running… "}${step}</div>`;
+            setCanonicalChip(`Replay rendering ${pct ? `${pct}%` : "…"}`, false);
+          }
+        } catch { /* status endpoint unavailable — keep the previous note */ }
+        setTimeout(poll, 3000); return;
+      }
       const results = await res.json();
       state.canonical = { jobId, results };
       renderCanonicalReview(host, jobId, results);
@@ -828,6 +842,17 @@ function ensureCanonicalHost() {
   return document.getElementById("canonical-review");
 }
 
+// Review Mode status chip: replay-rendering progress / readiness, visible WITHOUT
+// leaving Review Mode. `ready` turns it green and clicking jumps to the videos view.
+function setCanonicalChip(text, ready) {
+  const chip = document.getElementById("rm-canonical-status");
+  if (!chip) return;
+  chip.hidden = !text;
+  chip.textContent = text || "";
+  chip.classList.toggle("ready", Boolean(ready));
+  chip.disabled = !ready;
+}
+
 // Mirror the canonical replays into the Replay workspace (LBW mode) and badge the
 // LBW "DRS Replay" toggle so the operator knows the videos are ready.
 function syncCanonicalSurfaces() {
@@ -836,6 +861,11 @@ function syncCanonicalSurfaces() {
   const c = state.canonical;
   const ready = Boolean(c && c.results && (c.results.exports || {}).replay_players);
   btn?.classList.toggle("ready", ready);
+  if (c && c.results) {
+    setCanonicalChip(ready ? "DRS replay ready ✓ — view" : "Analysis done — no replay (see DRS Replay tab)", ready);
+  } else if (!c) {
+    setCanonicalChip("", false);
+  }
   if (replayHost) {
     const showInReplay = ready && state.reviewType === "lbw";
     replayHost.hidden = !showInReplay;
@@ -2478,6 +2508,12 @@ els.reviewsList?.addEventListener("click", (event) => {
   if (btn) exportReviewJson(btn.dataset.exportReview);
 });
 els.activityRefresh?.addEventListener("click", renderActivityLog);
+// Review Mode chip → exit the overlay and land directly on the DRS Replay videos.
+document.getElementById("rm-canonical-status")?.addEventListener("click", () => {
+  document.getElementById("rm-back")?.click();
+  setView("dashboard");
+  document.getElementById("lbw-videos-btn")?.click();
+});
 els.replaySave?.addEventListener("click", () => showToast("Review saved", "not-out"));
 els.modeToggle.addEventListener("click", toggleMode);
 els.replayTrajectory.addEventListener("click", replayTrajectory);

@@ -214,11 +214,31 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 /* PROCESSING + RESULT — analysis-rich */
 .dash-grid[data-state="processing"],
 .dash-grid[data-state="result"] {
-  grid-template-rows: minmax(360px, 1.15fr) minmax(240px, 0.85fr);
+  grid-template-rows: minmax(300px, 1.15fr) minmax(190px, 0.85fr);
   grid-template-areas:
     "feed feed feed feed feed detail detail detail detail decision decision decision"
     "timeline timeline timeline queue queue queue evidence evidence evidence decision decision decision";
 }
+
+/* Short laptop windows (≤920px tall): reclaim chrome so the analysis cards get the
+   height — the review content should compress last, not first. */
+@media (max-height: 920px) {
+  .main { gap: 10px; padding: 10px 12px; }
+  .review-type-header { padding: 6px 10px; }
+  .card-h { padding: 8px 12px; }
+  .rs-grid div { padding: 6px 8px; }
+  .decision-stages, .confidence-breakdown { padding: 8px 12px; }
+  .system-alerts { padding: 6px 10px; font-size: 12px; }
+  .dash-grid { gap: 10px; }
+  .dash-grid[data-state="processing"],
+  .dash-grid[data-state="result"] { grid-template-rows: minmax(260px, 1.15fr) minmax(170px, 0.85fr); }
+}
+
+/* The broadcast replay must FIT its card, never hide behind an inner scrollbar:
+   size the stage from the panel's actual height (aspect 1.62 → width = 162cqh). */
+.review-panel { container-type: size; }
+.lbw-view[data-lbw-view="broadcast"] { overflow: hidden; }
+.lbw-view[data-lbw-view="broadcast"] .drsa-wrap { width: 100%; max-width: 148cqh; margin: 0 auto; }
 
 /* decision card content by state */
 #review-summary { display: none; }
@@ -645,6 +665,9 @@ body.mode-match .engineer-only { display: none !important; }
 .canonical-review video { width: 100%; height: auto; display: block; border-radius: 8px; background: #000; }
 .replay-canonical { margin: 8px 14px 0; }
 #lbw-videos-btn.ready::after { content: " ●"; color: var(--green, #2fe07a); }
+.rm-canonical { border: 1px solid var(--border-2); background: var(--panel-3); color: var(--muted); border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: default; }
+.rm-canonical.ready { border-color: var(--green, #2fe07a); color: var(--green, #2fe07a); cursor: pointer; font-weight: 600; }
+.rm-canonical.ready:hover { background: rgba(47, 224, 122, 0.12); }
 .cws-foot { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 14px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .detect-bar { position: absolute; left: 50%; top: 16px; transform: translateX(-50%); width: 280px; display: grid; gap: 6px; z-index: 4; padding: 10px 12px; border-radius: 10px; background: rgba(7, 12, 18, 0.92); border: 1px solid var(--border-2); }
 .detect-bar span { font-size: 12px; color: var(--accent2); text-align: center; }

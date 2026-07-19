@@ -586,6 +586,10 @@
         <div class="rm-bar-sec">
           <span class="rm-label">Review Progress</span>
           <div class="rm-progress"><i id="rm-progress-bar"></i></div>
+          <!-- Replay-rendering status lives INSIDE Review Mode so the operator never
+               has to exit to discover the DRS replay finished. Click when ready → jump
+               straight to the videos view. -->
+          <button id="rm-canonical-status" class="rm-canonical" type="button" hidden></button>
           <button id="rm-back" class="rm-back" type="button">← Back to Dashboard</button>
         </div>
       </div>
