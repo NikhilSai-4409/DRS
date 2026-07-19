@@ -233,6 +233,18 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
     "timeline timeline queue queue queue evidence evidence evidence evidence decision decision decision";
 }
 
+/* FOCUS MODE (result): the capture workspace becomes a DECISION workspace — the
+   live feed collapses to a corner, its thumbnail strip hides, timeline/history
+   drop to a slim row, and the replay takes 7 of 12 columns in a taller row.
+   Wickets and the decision column stay in view. */
+.dash-grid[data-state="result"] {
+  grid-template-rows: minmax(320px, 1.6fr) minmax(140px, 0.4fr);
+  grid-template-areas:
+    "feed feed detail detail detail detail detail detail detail decision decision decision"
+    "timeline timeline queue queue queue evidence evidence evidence evidence decision decision decision";
+}
+.dash-grid[data-state="result"] .camera-thumbs { display: none; }
+
 /* Short laptop windows (≤920px tall): reclaim chrome so the analysis cards get the
    height — the review content should compress last, not first. */
 @media (max-height: 920px) {
@@ -243,8 +255,8 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
   .decision-stages, .confidence-breakdown { padding: 8px 12px; }
   .system-alerts { padding: 6px 10px; font-size: 12px; }
   .dash-grid { gap: 10px; }
-  .dash-grid[data-state="processing"],
-  .dash-grid[data-state="result"] { grid-template-rows: minmax(260px, 1.45fr) minmax(150px, 0.55fr); }
+  .dash-grid[data-state="processing"] { grid-template-rows: minmax(260px, 1.45fr) minmax(150px, 0.55fr); }
+  .dash-grid[data-state="result"] { grid-template-rows: minmax(280px, 1.6fr) minmax(130px, 0.4fr); }
 }
 
 /* 1366x768-class laptops: tightest tier — everything still visible, just denser. */
@@ -254,8 +266,8 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
   .card-h small { display: none; }
   .dash-grid { gap: 8px; }
   .dash-grid[data-state="waiting"] { grid-template-rows: minmax(280px, 1.5fr) minmax(140px, 0.55fr); }
-  .dash-grid[data-state="processing"],
-  .dash-grid[data-state="result"] { grid-template-rows: minmax(225px, 1.45fr) minmax(130px, 0.55fr); }
+  .dash-grid[data-state="processing"] { grid-template-rows: minmax(225px, 1.45fr) minmax(130px, 0.55fr); }
+  .dash-grid[data-state="result"] { grid-template-rows: minmax(240px, 1.6fr) minmax(115px, 0.4fr); }
   .decision-stages { padding: 6px 10px; gap: 6px; }
   .camera-thumbs { padding: 6px 8px; }
   .cam-thumb { width: 118px; height: 70px; }
@@ -388,7 +400,10 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 .badge.out { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.5); color: #fca5a5; }
 .badge.not-out { background: rgba(34, 197, 94, 0.16); border-color: rgba(34, 197, 94, 0.5); color: #86efac; }
 .badge.processing { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.45); color: #fcd34d; }
-.state-machine { padding: 10px 14px; display: grid; gap: 4px; justify-items: center; flex: none; }
+/* Compact horizontal strip (✓ Waiting · ✓ Processing · ● Decision) — the state
+   machine is status, not evidence, so it takes one slim row instead of a column. */
+.state-machine { padding: 8px 14px; display: flex; align-items: center; gap: 6px; flex: none; }
+.state-machine .state-arrow { display: none; }
 .state-node { display: flex; align-items: center; justify-content: center; gap: 9px; width: 100%; padding: 8px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-3); color: var(--muted); font-weight: 700; font-size: 12px; letter-spacing: 0.4px; }
 .state-node i { width: 9px; height: 9px; border-radius: 50%; border: 2px solid currentColor; flex: none; transition: all 200ms var(--ease); }
 .state-node.active { color: var(--accent2); border-color: rgba(59, 130, 246, 0.5); }
@@ -729,8 +744,15 @@ body.mode-match .engineer-only { display: none !important; }
 @keyframes toast-in { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: none; } }
 
 /* ---------- responsive ---------- */
-@media (max-width: 1400px) {
-  .dash-grid {
+/* Single-column stack is for genuinely NARROW windows only. It must name the
+   data-state variants too — they carry higher specificity than a bare .dash-grid,
+   and losing to them produced a half-applied hybrid (1fr + implicit columns) that
+   silently skewed proportions at 1366px-wide laptops. */
+@media (max-width: 1100px) {
+  .dash-grid,
+  .dash-grid[data-state="waiting"],
+  .dash-grid[data-state="processing"],
+  .dash-grid[data-state="result"] {
     grid-template-columns: 1fr;
     grid-template-rows: none;
     grid-template-areas: "feed" "detail" "decision" "evidence" "timeline" "queue";
