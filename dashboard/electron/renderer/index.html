@@ -21,6 +21,7 @@
           <button class="nav-item active" type="button" data-view="dashboard" data-label="Dashboard"><span class="ni-ic">🏠</span><span class="ni-tx">Dashboard</span></button>
           <button class="nav-item" type="button" data-view="reviews" data-label="Reviews"><span class="ni-ic">📋</span><span class="ni-tx">Reviews</span></button>
           <button class="nav-item" type="button" data-view="replay" data-label="Replay"><span class="ni-ic">⏯</span><span class="ni-tx">Replay</span></button>
+          <button class="nav-item" type="button" data-view="sync-replay" data-label="Sync Replay"><span class="ni-ic">🎬</span><span class="ni-tx">Sync Replay</span></button>
           <button class="nav-item" type="button" data-view="cameras" data-label="Cameras"><span class="ni-ic">📷</span><span class="ni-tx">Cameras</span></button>
           <button class="nav-item" type="button" data-view="camera-health" data-label="Camera Health"><span class="ni-ic">📊</span><span class="ni-tx">Camera Health</span></button>
           <button class="nav-item" type="button" data-view="calibration" data-label="Calibration"><span class="ni-ic">📐</span><span class="ni-tx">Calibration</span></button>
@@ -365,6 +366,35 @@
               <button id="replay-zoom" type="button" hidden title="2× magnifier on the stage">Zoom</button>
               <button id="replay-export" type="button">Export MP4</button>
               <button id="replay-save" type="button">Save Review</button>
+            </div>
+          </article>
+        </section>
+
+        <!-- ============================ SYNC REPLAY (multi-cam, one timeline) ============================ -->
+        <section class="view" data-view="sync-replay">
+          <article class="card">
+            <header class="card-h">
+              <div><strong>Sync Replay</strong><small>2–3 cameras locked to one timeline — panes align on capture timestamp</small></div>
+              <div class="sync-head">
+                <div id="syncrep-cams" class="sync-cam-pills" aria-label="Cameras in sync replay"></div>
+                <button id="syncrep-load" type="button" class="rev-export">Load replay buffer</button>
+              </div>
+            </header>
+            <div id="syncrep-grid" class="syncrep-grid">
+              <div class="rev-empty">Load the replay buffer, then pick 2–3 cameras.</div>
+            </div>
+            <div class="replay-strip">
+              <button id="syncrep-play" type="button">Play</button>
+              <button id="syncrep-pause" type="button">Pause</button>
+              <button id="syncrep-back" type="button">Prev</button>
+              <input id="syncrep-timeline" type="range" min="0" max="1000" value="0" aria-label="Shared sync timeline" />
+              <button id="syncrep-forward" type="button">Next</button>
+              <select id="syncrep-speed" aria-label="Sync replay speed">
+                <option value="0.25">0.25x</option>
+                <option value="0.5">0.5x</option>
+                <option value="1" selected>1x</option>
+              </select>
+              <span id="syncrep-label">--</span>
             </div>
           </article>
         </section>

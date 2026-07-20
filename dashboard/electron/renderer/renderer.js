@@ -89,7 +89,7 @@ async function loadReviewTypes() {
 
 const CAMERA_ROLES = ["Ball Tracking", "Front Foot", "Wide Camera", "Replay Camera", "Stump Camera", "Broadcast Camera", "Reserve"];
 const DEFAULT_ROLE_BY_INDEX = ["Ball Tracking", "Stump Camera", "Front Foot", "Wide Camera", "Replay Camera", "Broadcast Camera"];
-const VIEW_TITLES = { dashboard: "Dashboard", reviews: "Reviews", replay: "Replay", cameras: "Cameras", "camera-health": "Camera Health", calibration: "Calibration", testing: "Testing", validation: "Validation", models: "Model Manager", health: "System", checklist: "Pre-Match Checklist", development: "Vision Studio", settings: "Settings" };
+const VIEW_TITLES = { dashboard: "Dashboard", reviews: "Reviews", replay: "Replay", "sync-replay": "Sync Replay", cameras: "Cameras", "camera-health": "Camera Health", calibration: "Calibration", testing: "Testing", validation: "Validation", models: "Model Manager", health: "System", checklist: "Pre-Match Checklist", development: "Vision Studio", settings: "Settings" };
 
 const store = {
   get(key, fallback) {
@@ -378,6 +378,7 @@ function setView(view) {
   if (view === "reviews") renderReviews();
   if (view === "health") renderSystemView();
   if (view === "replay") applyReplayMode();
+  if (view === "sync-replay") SyncReplay.ensure();
   if (view === "camera-health") renderCameraHealth();
   if (view === "calibration") state.calibrationModal?.activate?.();
   else if (previous === "calibration") state.calibrationModal?.deactivate?.();
@@ -2014,6 +2015,80 @@ function drawReplayAudio(decision) {
   }
 }
 
+/* ===================== Sync Replay (multi-cam, one timeline) =====================
+   One master clock in CAPTURE TIME; every pane fetches its camera's frame nearest
+   that timestamp via /api/replay/{cam}.jpg?timestamp_ms=… — synchronization comes
+   from aligning on when frames were captured, not on frame index (cameras drop
+   frames independently, so index N is a different moment per camera). */
+const SyncReplay = {
+  meta: null, cams: [], t: 0, speed: 1, timer: null,
+  // View entry: load once. (Clicks INSIDE the view bubble to the data-view router and
+  // re-enter here — reloading then would re-snapshot the buffer and rebuild the panes
+  // mid-playback. The "Load replay buffer" button is the explicit refresh.)
+  async ensure() { if (!this.meta) await this.load(); },
+  async load() {
+    try {
+      const meta = await jsonFetch("/api/replay/create", { method: "POST" });
+      this.meta = meta;
+      const available = meta.camera_ids || [];
+      if (!this.cams.length) this.cams = available.slice(0, 2);
+      this.cams = this.cams.filter((id) => available.includes(id));
+      this.renderPills(available);
+      this.renderPanes();
+      if (meta.start_timestamp_ms != null) {
+        this.show(meta.start_timestamp_ms);
+      } else {
+        const label = document.getElementById("syncrep-label");
+        if (label) label.textContent = "No frames buffered yet — start the cameras first";
+      }
+    } catch {
+      const grid = document.getElementById("syncrep-grid");
+      if (grid) grid.innerHTML = `<div class="rev-empty">Backend offline — sync replay unavailable.</div>`;
+    }
+  },
+  renderPills(available) {
+    const host = document.getElementById("syncrep-cams");
+    if (!host) return;
+    host.innerHTML = available.map((id) => `
+      <button type="button" class="rev-chip ${this.cams.includes(id) ? "active" : ""}" data-sync-cam="${id}">${cameraRoleFor(id)} · ${id}</button>`).join("");
+  },
+  renderPanes() {
+    const grid = document.getElementById("syncrep-grid");
+    if (!grid) return;
+    if (!this.cams.length) { grid.innerHTML = `<div class="rev-empty">Pick 1–3 cameras above.</div>`; return; }
+    grid.dataset.count = String(this.cams.length);
+    grid.innerHTML = this.cams.map((id) => `
+      <figure class="sync-pane">
+        <img data-sync-pane="${id}" alt="Camera ${id} replay" />
+        <figcaption>${cameraRoleFor(id)} · Cam ${id}</figcaption>
+      </figure>`).join("");
+  },
+  show(t) {
+    const m = this.meta;
+    if (!m || m.start_timestamp_ms == null) return;
+    this.t = Math.max(m.start_timestamp_ms, Math.min(m.end_timestamp_ms, t));
+    this.cams.forEach((id) => {
+      const img = document.querySelector(`[data-sync-pane="${id}"]`);
+      if (img) img.src = `${API_BASE}/api/replay/${id}.jpg?timestamp_ms=${this.t}&t=${Date.now()}`;
+    });
+    const span = (m.end_timestamp_ms - m.start_timestamp_ms) || 1;
+    const slider = document.getElementById("syncrep-timeline");
+    if (slider) slider.value = String(Math.round(((this.t - m.start_timestamp_ms) / span) * 1000));
+    const label = document.getElementById("syncrep-label");
+    if (label) label.textContent = `${((this.t - m.start_timestamp_ms) / 1000).toFixed(2)}s / ${(span / 1000).toFixed(2)}s · ${this.cams.length} cam${this.cams.length === 1 ? "" : "s"}`;
+  },
+  play() {
+    if (!this.meta || this.meta.start_timestamp_ms == null) return;
+    this.pause();
+    this.timer = setInterval(() => {
+      if (this.t >= this.meta.end_timestamp_ms) { this.pause(); return; }
+      this.show(this.t + (1000 / 30) * this.speed);
+    }, 1000 / 30);
+  },
+  pause() { clearInterval(this.timer); this.timer = null; },
+  step(direction) { this.pause(); this.show(this.t + direction * (1000 / 30)); },
+};
+
 async function exportReplay() {
   els.frameLabel.textContent = "Exporting replay...";
   try {
@@ -2603,6 +2678,32 @@ els.reviewsList?.addEventListener("click", (event) => {
   if (btn) exportReviewJson(btn.dataset.exportReview);
 });
 els.activityRefresh?.addEventListener("click", renderActivityLog);
+
+// Sync Replay: one master timeline drives every selected camera pane.
+document.getElementById("syncrep-load")?.addEventListener("click", () => SyncReplay.load());
+document.getElementById("syncrep-play")?.addEventListener("click", () => SyncReplay.play());
+document.getElementById("syncrep-pause")?.addEventListener("click", () => SyncReplay.pause());
+document.getElementById("syncrep-back")?.addEventListener("click", () => SyncReplay.step(-1));
+document.getElementById("syncrep-forward")?.addEventListener("click", () => SyncReplay.step(1));
+document.getElementById("syncrep-speed")?.addEventListener("change", (e) => { SyncReplay.speed = Number(e.target.value) || 1; });
+document.getElementById("syncrep-timeline")?.addEventListener("input", (e) => {
+  const m = SyncReplay.meta;
+  if (!m || m.start_timestamp_ms == null) return;
+  SyncReplay.pause();
+  const span = m.end_timestamp_ms - m.start_timestamp_ms;
+  SyncReplay.show(m.start_timestamp_ms + (Number(e.target.value) / 1000) * span);
+});
+document.getElementById("syncrep-cams")?.addEventListener("click", (e) => {
+  const pill = e.target.closest("[data-sync-cam]");
+  if (!pill) return;
+  const id = Number(pill.dataset.syncCam);
+  const at = SyncReplay.cams.indexOf(id);
+  if (at >= 0) SyncReplay.cams.splice(at, 1);
+  else { if (SyncReplay.cams.length >= 3) SyncReplay.cams.shift(); SyncReplay.cams.push(id); }
+  SyncReplay.renderPills(SyncReplay.meta?.camera_ids || []);
+  SyncReplay.renderPanes();
+  SyncReplay.show(SyncReplay.t);
+});
 // Review Mode chip → exit the overlay and land on the Observed Trajectory replay.
 document.getElementById("rm-canonical-status")?.addEventListener("click", () => {
   document.getElementById("rm-back")?.click();
