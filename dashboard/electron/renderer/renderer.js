@@ -261,11 +261,9 @@ const els = {
   requestReview: document.getElementById("request-review"),
   confirmOut: document.getElementById("confirm-out"),
   confirmNotOut: document.getElementById("confirm-not-out"),
-  openReplay: document.getElementById("open-replay"),
   exportReview: document.getElementById("export-review"),
   resetReview: document.getElementById("reset-review"),
   calibrationButton: document.getElementById("calibration-button"),
-  replayTrajectory: document.getElementById("replay-trajectory"),
   resetCamera: document.getElementById("reset-camera"),
   replayBack: document.getElementById("replay-back"),
   replayForward: document.getElementById("replay-forward"),
@@ -397,6 +395,8 @@ function setOperatorMode(mode) {
   if (!engineer && (state.lbwView === "broadcast" || state.lbwView === "3d")) {
     document.getElementById("lbw-observed-btn")?.click();
   }
+  // Re-render the review summary so diagnostic rows appear/disappear immediately.
+  if (state.decision) renderReviewSummary(state.decision);
 }
 
 function applySidebarState() {
@@ -966,7 +966,6 @@ function renderDecisionState(status) {
   els.requestReview.hidden = reviewing || phase !== "waiting";
   els.confirmOut.hidden = reviewing || phase === "waiting";
   els.confirmNotOut.hidden = reviewing || phase === "waiting";
-  els.openReplay.hidden = reviewing || phase === "waiting";
   els.exportReview.hidden = reviewing || phase === "waiting";
   els.resetReview.hidden = reviewing || phase === "waiting";
   els.confirmOut.disabled = false;
@@ -1087,7 +1086,12 @@ function renderReviewSummary(decision) {
   const measurements = Array.isArray(rr.measurements) && rr.measurements.length
     ? rr.measurements
     : (mod.decisionCard || []).filter((label) => label !== "Decision").map((label) => ({ label, value: "--" }));
-  for (const m of measurements.slice(0, 6)) {
+  // Match Mode shows only decision-relevant rows — tracking diagnostics (detection
+  // rate, frames tracked, confidence, model) are engineering detail → Engineer Mode.
+  const DIAGNOSTIC_ROWS = /detection rate|frames? tracked|confidence|model|fps|tracking/i;
+  const engineerMode = state.operatorMode === "engineer";
+  const visibleMeasurements = engineerMode ? measurements : measurements.filter((m) => !DIAGNOSTIC_ROWS.test(m.label || ""));
+  for (const m of visibleMeasurements.slice(0, 6)) {
     const row = document.createElement("div");
     row.dataset.rsDynamic = "1";
     const labelEl = document.createElement("span");
@@ -1963,28 +1967,6 @@ function resetThreeCamera() {
 // Open the Replay workspace on the frozen buffer and start playback. Shared by
 // every "Replay" button (Review State panel + LBW analysis card). Gives honest
 // feedback when there is nothing buffered instead of a silent blank stage.
-async function openReplayWorkspace() {
-  // Review Mode is a fullscreen overlay that re-asserts on every poll — leaving it
-  // up would hide the replay workspace we're switching to (the "Replay button does
-  // nothing" bug). Exit it first so the workspace is actually visible.
-  if (ReviewMode.active) ReviewMode.exit();
-  setView("replay");
-  try {
-    let st = await jsonFetch("/api/replay/state");
-    if (!st || !st.total_frames) {
-      st = await jsonFetch("/api/replay/create", { method: "POST" });
-    }
-    if (!st || !st.total_frames) {
-      showToast("No buffered frames to replay yet", "out");
-      return;
-    }
-    await replayControl("seek", { frame_index: 0 });
-    await replayControl("play", { speed: Number(els.replaySpeed?.value || 1) });
-  } catch {
-    showToast("Replay unavailable — backend not reachable", "out");
-  }
-}
-
 async function replayControl(action, extra = {}) {
   const payload = await jsonFetch("/api/replay/control", {
     method: "POST",
@@ -2848,7 +2830,6 @@ els.requestReview?.addEventListener("click", requestReview);
 els.confirmOut?.addEventListener("click", () => confirmDecision("OUT"));
 els.confirmNotOut?.addEventListener("click", () => confirmDecision("NOT_OUT"));
 els.resetReview?.addEventListener("click", resetReview);
-els.openReplay?.addEventListener("click", openReplayWorkspace);
 els.exportReview?.addEventListener("click", async () => {
   // ONE export, browser-download style: a save dialog asks WHERE, the backend
   // renders the broadcast review clip (UltraEdge scene + verdict) to that path.
@@ -2938,7 +2919,6 @@ document.getElementById("syncrep-cams")?.addEventListener("click", (e) => {
   SyncReplay.show(SyncReplay.t);
 });
 els.modeToggle?.addEventListener("click", toggleMode);
-els.replayTrajectory?.addEventListener("click", openReplayWorkspace);
 els.resetCamera?.addEventListener("click", resetThreeCamera);
 els.replayPlay?.addEventListener("click", () => replayControl("play", { speed: Number(els.replaySpeed.value) }));
 els.replayPause?.addEventListener("click", () => replayControl("pause"));

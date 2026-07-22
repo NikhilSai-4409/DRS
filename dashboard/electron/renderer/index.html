@@ -122,9 +122,8 @@
             <article class="card d-detail">
               <header class="card-h">
                 <div><strong id="detail-title">LBW Review</strong><small id="detail-sub">Ball-tracking trajectory</small></div>
-                <div class="scene-tools" id="lbw-tools">
-                  <button id="replay-trajectory" type="button" title="Open the replay workspace and play the tracked delivery">▶ Replay</button>
-                  <button id="reset-camera" type="button" class="engineer-only" title="Engineer: reset the 3D camera view">Reset View</button>
+                <div class="scene-tools engineer-only" id="lbw-tools">
+                  <button id="reset-camera" type="button" title="Engineer: reset the 3D camera view">Reset View</button>
                 </div>
               </header>
 
@@ -302,7 +301,6 @@
               <div class="decision-actions" id="decision-actions">
                 <button id="confirm-out" type="button" class="danger" title="Shortcut: O" hidden>Confirm OUT</button>
                 <button id="confirm-not-out" type="button" class="success" title="Shortcut: N" hidden>Confirm NOT OUT</button>
-                <button id="open-replay" type="button" hidden>Replay</button>
                 <button id="export-review" type="button" hidden title="Save this review's broadcast clip (asks where to save)">Export</button>
                 <button id="reset-review" type="button" hidden>New Review</button>
               </div>
