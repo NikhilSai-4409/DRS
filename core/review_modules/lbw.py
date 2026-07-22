@@ -23,12 +23,14 @@ class LbwReviewModule(ReviewModule):
     key = "lbw"
     label = "LBW"
     required_role = BALL_TRACKING
-    timeline = ("Appeal", "Pitching", "Impact", "Wickets", "Decision")
-    evidence = ("ball_tracking", "bounce_point", "impact_point", "predicted_trajectory",
-                "pitching", "impact", "wickets", "ball_speed", "replay")
+    # DRS protocol order: the umpire clears BAT INVOLVEMENT (UltraEdge) before
+    # reading the ball-tracking gates — bat-first contact kills an LBW appeal.
+    timeline = ("Appeal", "UltraEdge", "Pitching", "Impact", "Wickets", "Decision")
+    evidence = ("ultraedge_check", "ball_tracking", "bounce_point", "impact_point",
+                "predicted_trajectory", "pitching", "impact", "wickets", "ball_speed", "replay")
     replay_mode = "trajectory"
-    decision_card = ("Pitching", "Impact", "Wickets", "Decision")
-    supports = {"trajectory": True, "frame_step": True, "measurement": True}
+    decision_card = ("UltraEdge", "Pitching", "Impact", "Wickets", "Decision")
+    supports = {"trajectory": True, "audio": True, "frame_step": True, "measurement": True}
 
     def analyze(self, ctx: ReviewContext) -> dict:
         camera_id = self.select_camera(ctx)
@@ -75,9 +77,37 @@ class LbwReviewModule(ReviewModule):
         if samples:
             result["geometry"] = self._geometry(camera_id, samples, prediction)
 
+        # DRS protocol: run the UltraEdge check on the SAME captured frames in the same
+        # appeal — bat-first contact invalidates LBW, so the umpire clears the edge
+        # BEFORE reading the tracking gates. Without a stump mic the edge module
+        # honestly reports inconclusive; the reminder to clear it manually stands.
+        try:
+            from core.review_modules.edge import EdgeReviewModule
+
+            edge_result = EdgeReviewModule().analyze(ctx) or {}
+            if edge_result.get("edge_analysis") is not None:
+                result["edge_analysis"] = edge_result["edge_analysis"]
+            if edge_result.get("hotspot_analysis") is not None:
+                result["hotspot_analysis"] = edge_result["hotspot_analysis"]
+        except Exception:
+            pass
+        edge = result.get("edge_analysis") or {}
+        if edge.get("inconclusive"):
+            edge_value = "Inconclusive — clear manually"
+            warnings.append("UltraEdge inconclusive (no stump-mic audio) — manually clear bat involvement before confirming OUT.")
+        elif edge.get("edge_probability") is not None:
+            edge_value = f"{(edge.get('edge_probability') or 0.0) * 100:.0f}% spike"
+            if (edge.get("edge_probability") or 0.0) >= 0.5:
+                warnings.append("Possible BAT INVOLVEMENT (UltraEdge spike) — bat-first contact means NOT OUT for LBW.")
+        else:
+            edge_value = "Not run — clear manually"
+            warnings.append("UltraEdge check unavailable for this appeal — clear bat involvement manually.")
+
         result["summary"] = {
             "headline": headline,
             "measurements": [
+                {"label": "UltraEdge", "value": edge_value,
+                 "flag": (edge.get("edge_probability") or 0.0) >= 0.5},
                 {"label": "Detection rate", "value": f"{detection_rate * 100:.0f}%"},
                 {"label": "Frames tracked", "value": str(len(samples))},
             ],
