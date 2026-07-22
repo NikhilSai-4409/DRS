@@ -159,6 +159,17 @@ class DRSBackend:
                 log.warning("UltraEdge audio: no input device — edge evidence disabled")
         except Exception as exc:
             log.warning("UltraEdge audio unavailable: {}", exc)
+        # Sound classifier (bat/pad/glove/ground/stump/noise) — present only after
+        # scripts/train_ultraedge.py has been run on labeled nets recordings.
+        self.audio_classifier = None
+        try:
+            from core.audio_classifier import UltraEdgeClassifier
+
+            classifier = UltraEdgeClassifier()
+            if classifier.available:
+                self.audio_classifier = classifier
+        except Exception as exc:
+            log.warning("UltraEdge classifier unavailable: {}", exc)
 
     def stop(self) -> None:
         self._save_session()
@@ -177,6 +188,7 @@ class DRSBackend:
         events are deduped (<120 ms apart = one contact) and mapped to replay frame
         indices so the UI's spike timeline can seek straight to them."""
         analyzer = self.audio_pipeline.analyzer
+        classifier = getattr(self, "audio_classifier", None)
         events: list[dict] = []
         span = max(1.0, end_ms - start_ms)
         t = start_ms
@@ -184,22 +196,40 @@ class DRSBackend:
             r = analyzer.detect_edge_at(t)
             if r.has_edge:
                 if not events or abs(r.edge_timestamp_ms - events[-1]["timestamp_ms"]) > 120.0:
-                    events.append({
+                    event = {
                         "timestamp_ms": round(r.edge_timestamp_ms, 1),
                         "frame_id": int(max(0, min(total_frames - 1,
                                                    (r.edge_timestamp_ms - start_ms) / span * total_frames))),
                         "confidence": round(float(r.edge_confidence), 3),
-                    })
+                    }
+                    if classifier is not None:
+                        window = analyzer.get_waveform_window(r.edge_timestamp_ms, duration_s=0.3)
+                        info = classifier.classify(window.samples, window.sample_rate)
+                        if info:
+                            event.update(info)
+                    events.append(event)
             t += 500.0
+        # With a trained classifier, only BAT-labeled spikes count as edge evidence
+        # (ambient/speech/ground spikes are real sounds but not bat involvement).
+        # Without one, every transient counts — honest, but unfiltered.
+        if classifier is not None:
+            probability = max((e["label_confidence"] for e in events if e.get("is_bat")), default=0.0)
+            bat_count = sum(1 for e in events if e.get("is_bat"))
+            reason = (f"{bat_count} bat sound(s) among {len(events)} transient(s)"
+                      if events else "no snick-band transient in the captured window")
+        else:
+            probability = max((e["confidence"] for e in events), default=0.0)
+            reason = (f"{len(events)} transient(s) in the {span / 1000.0:.1f}s window (unclassified — train the sound model)"
+                      if events else "no snick-band transient in the captured window")
         return {
             "available": True,
             "source": "microphone",
+            "classified": classifier is not None,
             "inconclusive": False,
-            "edge_probability": max((e["confidence"] for e in events), default=0.0),
+            "edge_probability": probability,
             "events": events,
             "window_s": round(span / 1000.0, 2),
-            "reason": (f"{len(events)} transient(s) in the {span / 1000.0:.1f}s window"
-                       if events else "no snick-band transient in the captured window"),
+            "reason": reason,
         }
 
     def health(self) -> dict:
