@@ -31,6 +31,7 @@ if (!app.isPackaged) {
 let engineProcess = null;
 let testingPlatformProcess = null;
 let mainWindow = null;
+let programWindow = null;
 
 const startupState = {
   engine: { status: "pending", message: "Starting backend..." },
@@ -67,6 +68,39 @@ function createWindow() {
   loadLoadingScreen(startupState.engine.message);
   mainWindow.on("closed", () => {
     mainWindow = null;
+  });
+}
+
+// Broadcast "Program Output" — a second window holding only the clean 16:9
+// broadcast frame (live / UltraEdge / decision scenes). OBS captures this window
+// for the stream; every operator control stays in the dashboard and drives it
+// through the program-command relay registered below.
+function createProgramWindow() {
+  if (programWindow) {
+    programWindow.focus();
+    return;
+  }
+  programWindow = new BrowserWindow({
+    width: 1280,
+    height: 720,
+    useContentSize: true,
+    backgroundColor: "#000000",
+    autoHideMenuBar: true,
+    title: "DRS Program Output",
+    show: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  const file = path.join(__dirname, "renderer", "program-output.html");
+  programWindow.loadURL(pathToFileURL(file).toString()).catch((error) => {
+    logError("Program output load failed:", error.message);
+  });
+  programWindow.on("closed", () => {
+    programWindow = null;
+    mainWindow?.webContents.send("program-output-closed");
   });
 }
 
@@ -462,6 +496,15 @@ ipcMain.handle("get-startup-status", async () => startupState);
 ipcMain.handle("get-ai-development-status", async () => runDevelopmentJson(["status"]));
 ipcMain.handle("run-ai-development-command", async (_event, name) => runDevelopmentCommand(name));
 ipcMain.handle("open-vision-studio", async (_event, opts = {}) => openVisionStudio(opts));
+ipcMain.handle("open-program-output", async () => {
+  createProgramWindow();
+  return { open: true };
+});
+ipcMain.handle("program-command", async (_event, command) => {
+  if (!programWindow) return { delivered: false };
+  programWindow.webContents.send("program-command", command);
+  return { delivered: true };
+});
 ipcMain.handle("pick-model-file", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: "Select a .pt model",

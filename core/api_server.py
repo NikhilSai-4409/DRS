@@ -232,6 +232,29 @@ class DRSBackend:
             "reason": reason,
         }
 
+    def audio_waveform_for_window(self, start_ms: float, end_ms: float, buckets: int) -> dict:
+        """Downsampled waveform envelope for the broadcast UltraEdge panel: raw
+        ring samples inside the window reduced to per-bucket [min, max] pairs
+        normalised to the window peak. Frame sync is the caller's mapping of
+        buckets onto replay frame indices — both axes are linear in capture time."""
+        from core.audio_analyzer import envelope_buckets
+
+        analyzer = self.audio_pipeline.analyzer
+        data = envelope_buckets(analyzer.samples, analyzer.timestamps_ms,
+                                start_ms, end_ms, buckets)
+        available = data["samples"] > 0
+        return {
+            "available": available,
+            "source": "microphone",
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "sample_rate": analyzer.sample_rate,
+            "sample_count": data["samples"],
+            "peak": data["peak"],
+            "buckets": data["buckets"],
+            "reason": None if available else "no audio captured inside the requested window",
+        }
+
     def health(self) -> dict:
         frames = self.camera_manager.latest_frames(write_recording=False)
         sync_report = self.sync_verifier.evaluate(frames)
@@ -1517,6 +1540,27 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
             "edge_timestamp_ms": round(float(result.edge_timestamp_ms), 1),
             "reason": result.reason,
         }
+
+    @app.get("/api/audio/waveform")
+    def audio_waveform(
+        start_ms: float | None = Query(default=None),
+        end_ms: float | None = Query(default=None),
+        buckets: int = Query(default=600, ge=16, le=4000),
+    ) -> dict:
+        """Waveform envelope for the Program Output UltraEdge panel. Defaults to
+        the frozen replay window when start/end are omitted. Honest when no
+        microphone is capturing or no window exists."""
+        if getattr(backend, "audio_pipeline", None) is None:
+            return {"available": False, "buckets": [],
+                    "reason": "no microphone — audio capture not running"}
+        if (start_ms is None or end_ms is None) and backend.active_replay is not None:
+            window = backend.replay_state()
+            start_ms = window.get("start_timestamp_ms") if start_ms is None else start_ms
+            end_ms = window.get("end_timestamp_ms") if end_ms is None else end_ms
+        if start_ms is None or end_ms is None or float(end_ms) <= float(start_ms):
+            return {"available": False, "buckets": [],
+                    "reason": "no replay window — create a replay or pass start_ms/end_ms"}
+        return backend.audio_waveform_for_window(float(start_ms), float(end_ms), int(buckets))
 
     @app.get("/api/live/{camera_id}.jpg")
     def live_frame(camera_id: int) -> Response:

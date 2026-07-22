@@ -42,6 +42,21 @@ async def test_dashboard_backend_routes_without_camera_startup():
 
 
 @pytest.mark.asyncio
+async def test_audio_waveform_honest_without_microphone():
+    # No lifespan startup here, so audio_pipeline never exists: the waveform route
+    # must degrade honestly (same contract as /api/audio/edge), never fabricate data.
+    app = create_app([0], record=False)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/audio/waveform")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["available"] is False
+    assert body["buckets"] == []
+    assert "reason" in body
+
+
+@pytest.mark.asyncio
 async def test_confirm_decision_records_review_history():
     app = create_app([0], record=False)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

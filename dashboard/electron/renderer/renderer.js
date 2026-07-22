@@ -743,6 +743,9 @@ function renderDecision(decision) {
     state.reviewElapsed = state.reviewStartMs ? (Date.now() - state.reviewStartMs) / 1000 : null;
   }
   state.lastStatus = status;
+  // A fresh appeal freezes the replay buffer + attaches edge_analysis — push the
+  // whole review to the broadcast Program Output window the moment that happens.
+  if (justResolved) sendReviewToProgram();
   if (justResolved && !state.revealing) {
     playDecisionReveal(status, decision);
   } else if (!state.revealing) {
@@ -2938,6 +2941,80 @@ window.drs?.onStartupStatus?.((status) => {
   if (status?.testingPlatform?.status === "unavailable") {
     els.explanation.textContent = status.testingPlatform.message;
   }
+});
+
+// ---- Broadcast Program Output (OBS-facing second window) --------------------
+// The program window renders only the clean 16:9 broadcast frame; every control
+// lives here in the dashboard and travels over the program-command IPC relay.
+const programOut = { open: false };
+
+function programCmd(cmd) {
+  if (!programOut.open) return;
+  window.drs?.sendProgramCommand?.(cmd);
+}
+
+async function sendReviewToProgram() {
+  if (!programOut.open || !state.decision) return;
+  let replayWindow = null;
+  try { replayWindow = await jsonFetch("/api/replay/state"); } catch {}
+  programCmd({
+    type: "load",
+    decision: state.decision,
+    window: replayWindow,
+    cameraId: getPrimaryCameraId(),
+  });
+}
+
+function ensureProgramStrip() {
+  let strip = document.getElementById("program-strip");
+  if (strip) return strip;
+  strip = document.createElement("div");
+  strip.id = "program-strip";
+  strip.innerHTML = `
+    <span class="ps-label">PROGRAM</span>
+    <button type="button" data-ps-scene="live">Live</button>
+    <button type="button" data-ps-scene="ultraedge">UltraEdge</button>
+    <button type="button" data-ps-scene="decision">Decision</button>
+    <span class="ps-sep"></span>
+    <button type="button" data-ps="stepb" title="Step back">&#9664;</button>
+    <button type="button" data-ps="toggle" title="Play / pause">&#9199;</button>
+    <button type="button" data-ps="stepf" title="Step forward">&#9654;</button>
+    <span class="ps-sep"></span>
+    <button type="button" data-ps="send" title="Send the current review to the program window">Send review</button>`;
+  strip.addEventListener("click", (event) => {
+    const btn = event.target.closest("button");
+    if (!btn) return;
+    const scene = btn.dataset.psScene;
+    if (scene) {
+      strip.querySelectorAll("[data-ps-scene]").forEach((b) => b.classList.toggle("active", b === btn));
+      if (scene === "live") programCmd({ type: "live-config", cameraId: getPrimaryCameraId() });
+      programCmd({ type: "scene", scene });
+      return;
+    }
+    if (btn.dataset.ps === "toggle") programCmd({ type: "toggle" });
+    if (btn.dataset.ps === "stepb") programCmd({ type: "step", dir: -1 });
+    if (btn.dataset.ps === "stepf") programCmd({ type: "step", dir: 1 });
+    if (btn.dataset.ps === "send") sendReviewToProgram();
+  });
+  document.body.appendChild(strip);
+  return strip;
+}
+
+async function openProgramOutput() {
+  if (!window.drs?.openProgramOutput) return;
+  await window.drs.openProgramOutput();
+  programOut.open = true;
+  const strip = ensureProgramStrip();
+  strip.hidden = false;
+  programCmd({ type: "live-config", cameraId: getPrimaryCameraId() });
+  if (state.activeAppeal) sendReviewToProgram();
+}
+
+document.getElementById("open-program")?.addEventListener("click", openProgramOutput);
+window.drs?.onProgramOutputClosed?.(() => {
+  programOut.open = false;
+  const strip = document.getElementById("program-strip");
+  if (strip) strip.hidden = true;
 });
 
 // initial UI state from persisted preferences

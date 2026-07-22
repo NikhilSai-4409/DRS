@@ -21,4 +21,10 @@ contextBridge.exposeInMainWorld("drs", {
   setAnalysisMode: (data) => ipcRenderer.invoke("set-analysis-mode", data),
   saveCalibrationProfile: (data) => ipcRenderer.invoke("save-calibration-profile", data),
   command: (name) => ipcRenderer.invoke("operator-command", name),
+  // Broadcast Program Output window (OBS-facing) — opened from the dashboard,
+  // driven over the program-command relay; the program window listens.
+  openProgramOutput: () => ipcRenderer.invoke("open-program-output"),
+  sendProgramCommand: (cmd) => ipcRenderer.invoke("program-command", cmd),
+  onProgramCommand: (cb) => ipcRenderer.on("program-command", (_event, cmd) => cb(cmd)),
+  onProgramOutputClosed: (cb) => ipcRenderer.on("program-output-closed", () => cb()),
 });

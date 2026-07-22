@@ -18,6 +18,34 @@ class WaveformWindow:
     sample_rate: int
 
 
+def envelope_buckets(samples: np.ndarray, timestamps_ms: np.ndarray,
+                     start_ms: float, end_ms: float, buckets: int) -> dict:
+    """Reduce raw ring samples inside [start_ms, end_ms] to per-bucket [min, max]
+    pairs normalised to the window peak — render-ready waveform data whose
+    resolution is independent of sample rate. The ring wraps, so selected samples
+    are re-ordered by capture time before bucketing."""
+    mask = (timestamps_ms >= start_ms) & (timestamps_ms <= end_ms)
+    values = np.asarray(samples[mask], dtype=np.float32)
+    if values.size:
+        values = values[np.argsort(timestamps_ms[mask], kind="stable")]
+    n = int(values.size)
+    buckets = max(1, int(buckets))
+    if n == 0:
+        return {"buckets": [], "samples": 0, "peak": 0.0}
+    peak = float(np.max(np.abs(values)))
+    scale = peak if peak > 1e-9 else 1.0
+    edges = np.linspace(0, n, buckets + 1).astype(int)
+    pairs = []
+    for i in range(buckets):
+        seg = values[edges[i]:edges[i + 1]]
+        if seg.size == 0:
+            pairs.append([0.0, 0.0])
+        else:
+            pairs.append([round(float(seg.min() / scale), 4),
+                          round(float(seg.max() / scale), 4)])
+    return {"buckets": pairs, "samples": n, "peak": peak}
+
+
 @dataclass(slots=True)
 class EdgeResult:
     has_edge: bool
