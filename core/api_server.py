@@ -141,11 +141,66 @@ class DRSBackend:
         log.info("API backend started with cameras {}", self.camera_ids)
         activity_log.record("backend_started", "DRS backend started",
                             cameras=list(self.camera_ids))
+        # UltraEdge capture: best-effort — a missing/busy microphone must never block
+        # the video backend. Preflight and /api/audio/edge report the honest state.
+        # Buffer matches the video replay window so an appeal can query the whole
+        # delivery; audio chunks share the video frames' wall-clock milliseconds.
+        self.audio_pipeline = None
+        try:
+            from core.audio_pipeline import UltraEdgeAudioPipeline
+
+            pipeline = UltraEdgeAudioPipeline(buffer_seconds=float(BUFFER_SECONDS))
+            pipeline.start_capture()
+            if getattr(pipeline.analyzer, "running", False):
+                self.audio_pipeline = pipeline
+                activity_log.record("audio_started", "UltraEdge audio capture started")
+                log.info("UltraEdge audio capture running ({} Hz)", pipeline.sample_rate)
+            else:
+                log.warning("UltraEdge audio: no input device — edge evidence disabled")
+        except Exception as exc:
+            log.warning("UltraEdge audio unavailable: {}", exc)
 
     def stop(self) -> None:
         self._save_session()
+        if getattr(self, "audio_pipeline", None) is not None:
+            try:
+                self.audio_pipeline.stop_capture()
+            except Exception:
+                pass
         self.camera_manager.stop()
         log.info("API backend stopped")
+
+    def audio_edge_for_window(self, start_ms: float, end_ms: float, total_frames: int) -> dict:
+        """Scan the captured audio across a replay window for snick transients.
+
+        Coarse 0.5 s stride with the analyzer's 3-sigma band-limited detector;
+        events are deduped (<120 ms apart = one contact) and mapped to replay frame
+        indices so the UI's spike timeline can seek straight to them."""
+        analyzer = self.audio_pipeline.analyzer
+        events: list[dict] = []
+        span = max(1.0, end_ms - start_ms)
+        t = start_ms
+        while t <= end_ms:
+            r = analyzer.detect_edge_at(t)
+            if r.has_edge:
+                if not events or abs(r.edge_timestamp_ms - events[-1]["timestamp_ms"]) > 120.0:
+                    events.append({
+                        "timestamp_ms": round(r.edge_timestamp_ms, 1),
+                        "frame_id": int(max(0, min(total_frames - 1,
+                                                   (r.edge_timestamp_ms - start_ms) / span * total_frames))),
+                        "confidence": round(float(r.edge_confidence), 3),
+                    })
+            t += 500.0
+        return {
+            "available": True,
+            "source": "microphone",
+            "inconclusive": False,
+            "edge_probability": max((e["confidence"] for e in events), default=0.0),
+            "events": events,
+            "window_s": round(span / 1000.0, 2),
+            "reason": (f"{len(events)} transient(s) in the {span / 1000.0:.1f}s window"
+                       if events else "no snick-band transient in the captured window"),
+        }
 
     def health(self) -> dict:
         frames = self.camera_manager.latest_frames(write_recording=False)
@@ -598,6 +653,33 @@ class DRSBackend:
                     "frame_count": replay_meta.get("frame_count"),
                     "duration_s": replay_meta.get("duration_s"),
                 }
+
+        # Real UltraEdge: when the microphone is live, replace the module's no-audio
+        # placeholder with actual snick-band analysis over the SAME frozen replay
+        # window (events carry frame ids so the spike timeline can seek to them).
+        if (getattr(self, "audio_pipeline", None) is not None
+                and review_type in {"lbw", "edge", "ultraedge", "ultra_edge", "snicko"}
+                and replay.get("start_timestamp_ms") is not None):
+            try:
+                audio = self.audio_edge_for_window(
+                    float(replay["start_timestamp_ms"]),
+                    float(replay["end_timestamp_ms"]),
+                    int(replay.get("total_frames") or 1),
+                )
+                decision["edge_analysis"] = audio
+                prob = audio["edge_probability"]
+                summary = decision.get("summary") or {}
+                for row in summary.get("measurements", []):
+                    if row.get("label") == "UltraEdge":
+                        row["value"] = f"{prob * 100:.0f}% spike" if audio["events"] else "No spike — mic live"
+                        row["flag"] = prob >= 0.5
+                summary["warnings"] = [w for w in summary.get("warnings", [])
+                                       if "UltraEdge inconclusive" not in w]
+                if prob >= 0.5:
+                    summary["warnings"].append(
+                        "UltraEdge spike detected — check bat involvement before confirming OUT.")
+            except Exception as exc:
+                log.warning("Audio edge analysis failed: {}", exc)
 
         self.current_decision = decision
         self._save_session()
@@ -1384,11 +1466,26 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
 
     @app.get("/api/audio/edge")
     def edge_audio(timestamp_ms: float | None = Query(default=None)) -> dict:
+        """Live UltraEdge query. With a timestamp: was there a snick-band transient
+        within the analyzer's window around that instant? Without: check the last
+        ~0.6 s. Honest when no microphone is capturing."""
+        if getattr(backend, "audio_pipeline", None) is None:
+            return {
+                "available": False,
+                "timestamp_ms": timestamp_ms,
+                "edge_probability": 0.0,
+                "status": "no microphone — audio capture not running",
+            }
+        query_ts = float(timestamp_ms) if timestamp_ms is not None else time.time() * 1000.0 - 600.0
+        result = backend.audio_pipeline.analyzer.detect_edge_at(query_ts)
         return {
-            "timestamp_ms": timestamp_ms,
-            "edge_probability": 0.0,
-            "peaks": [],
-            "status": "audio capture not started",
+            "available": True,
+            "status": "live",
+            "timestamp_ms": query_ts,
+            "has_edge": result.has_edge,
+            "edge_probability": round(float(result.edge_confidence), 3),
+            "edge_timestamp_ms": round(float(result.edge_timestamp_ms), 1),
+            "reason": result.reason,
         }
 
     @app.get("/api/live/{camera_id}.jpg")
