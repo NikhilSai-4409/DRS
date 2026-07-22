@@ -57,6 +57,18 @@ async def test_audio_waveform_honest_without_microphone():
 
 
 @pytest.mark.asyncio
+async def test_broadcast_export_honest_without_replay_frames():
+    # No cameras started -> no frozen buffer with frames: the export must refuse
+    # with a clear reason, never write an empty/fabricated clip.
+    app = create_app([0], record=False)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/broadcast/export", json={})
+
+    assert response.status_code == 409
+    assert "replay buffer" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_confirm_decision_records_review_history():
     app = create_app([0], record=False)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

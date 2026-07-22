@@ -262,6 +262,7 @@ const els = {
   confirmOut: document.getElementById("confirm-out"),
   confirmNotOut: document.getElementById("confirm-not-out"),
   openReplay: document.getElementById("open-replay"),
+  exportBroadcast: document.getElementById("export-broadcast"),
   exportReview: document.getElementById("export-review"),
   resetReview: document.getElementById("reset-review"),
   replaySave: document.getElementById("replay-save"),
@@ -378,7 +379,7 @@ function setView(view) {
   if (view === "cameras") renderCamerasInUse();
   if (view === "reviews") renderReviews();
   if (view === "health") renderSystemView();
-  if (view === "replay") applyReplayMode();
+  if (view === "replay") { applyReplayMode(); armReplayWorkspace(); }
   if (view === "sync-replay") SyncReplay.ensure();
   if (view === "camera-health") renderCameraHealth();
   if (view === "calibration") state.calibrationModal?.activate?.();
@@ -705,7 +706,9 @@ function refreshCameraFrames() {
   if (primaryId != null) {
     const psrc = `${API_BASE}/api/live/${primaryId}.jpg?t=${stamp}`;
     if (els.primaryFeed) els.primaryFeed.src = psrc;
-    if (els.replayFeed) els.replayFeed.src = psrc;
+    // The replay stage mirrors live ONLY until a frozen buffer is armed —
+    // after that the stage belongs to the buffer frames at the cursor.
+    if (els.replayFeed && !state.replayArmed) els.replayFeed.src = psrc;
   }
 }
 
@@ -720,7 +723,7 @@ function renderLiveFrames(frames) {
     if (thumb) thumb.src = src;
     if (Number(cameraId) === primaryId) {
       if (els.primaryFeed) els.primaryFeed.src = src;
-      if (els.replayFeed) els.replayFeed.src = src;
+      if (els.replayFeed && !state.replayArmed) els.replayFeed.src = src;
     }
   });
 }
@@ -955,6 +958,7 @@ function renderDecisionState(status) {
   els.confirmOut.hidden = reviewing || phase === "waiting";
   els.confirmNotOut.hidden = reviewing || phase === "waiting";
   els.openReplay.hidden = reviewing || phase === "waiting";
+  if (els.exportBroadcast) els.exportBroadcast.hidden = reviewing || phase === "waiting";
   els.exportReview.hidden = reviewing || phase === "waiting";
   els.resetReview.hidden = reviewing || phase === "waiting";
   els.confirmOut.disabled = false;
@@ -1976,6 +1980,45 @@ function renderReplayState(payload) {
   els.frameTimeline.max = String(total);
   els.frameTimeline.value = String(Math.min(total, Number(payload.cursor || 0)));
   els.frameLabel.textContent = `Frame ${els.frameTimeline.value} | ${payload.playing ? "Playing" : "Paused"} | ${Number(payload.speed || 1)}x`;
+  showReplayBufferFrame(payload);
+  ensureReplayClock(Boolean(payload.playing));
+}
+
+// The Replay workspace stage shows the FROZEN BUFFER frame at the backend
+// cursor — never the live feed (that was the "No replay buffer loaded" bug:
+// controls moved the cursor but nothing ever fetched the buffer's frames).
+function showReplayBufferFrame(payload) {
+  const cams = payload.camera_ids || [];
+  if (!payload.total_frames || !cams.length) {
+    state.replayArmed = false;
+    return;
+  }
+  state.replayArmed = true;
+  const primary = getPrimaryCameraId();
+  const cam = cams.includes(primary) ? primary : cams[0];
+  if (els.replayFeed) {
+    els.replayFeed.src = `${API_BASE}/api/replay/${cam}.jpg?frame_index=${Number(payload.cursor || 0)}&t=${Date.now()}`;
+  }
+}
+
+// Entering the Replay view (or clicking Replay on a review) attaches to the
+// existing frozen buffer via GET state — read-only, never clobbers the snapshot.
+async function armReplayWorkspace() {
+  try { renderReplayState(await jsonFetch("/api/replay/state")); } catch {}
+}
+
+// While the backend replay is playing its cursor advances server-side; poll the
+// state so the stage animates even when no /ws/replay push arrives.
+function ensureReplayClock(playing) {
+  if (playing && !timers.replayClock) {
+    timers.replayClock = setInterval(async () => {
+      try { renderReplayState(await jsonFetch("/api/replay/state")); } catch {}
+    }, 150);
+  }
+  if (!playing && timers.replayClock) {
+    clearInterval(timers.replayClock);
+    timers.replayClock = null;
+  }
 }
 
 /* ===================== Replay engine: mode-driven scene =====================
@@ -2706,7 +2749,14 @@ els.requestReview.addEventListener("click", requestReview);
 els.confirmOut.addEventListener("click", () => confirmDecision("OUT"));
 els.confirmNotOut.addEventListener("click", () => confirmDecision("NOT_OUT"));
 els.resetReview.addEventListener("click", resetReview);
-els.openReplay?.addEventListener("click", () => setView("replay"));
+els.openReplay?.addEventListener("click", async () => {
+  // Replay on a review = open the workspace ON the frozen buffer and play it.
+  setView("replay");
+  try {
+    await replayControl("seek", { frame_index: 0 });
+    await replayControl("play", { speed: Number(els.replaySpeed?.value || 1) });
+  } catch {}
+});
 els.exportReview?.addEventListener("click", exportReplay);
 
 // Reviews page: type-filter chips, search box, and per-row JSON export.
@@ -2923,6 +2973,11 @@ if (els.primaryFeed) {
   els.primaryFeed.addEventListener("load", () => { els.primaryFeed.style.opacity = "1"; if (placeholder) placeholder.style.display = "none"; });
   els.primaryFeed.addEventListener("error", () => { els.primaryFeed.style.opacity = "0"; if (placeholder) placeholder.style.display = "grid"; });
 }
+if (els.replayFeed) {
+  const replayPlaceholder = document.querySelector(".replay-stage .primary-placeholder");
+  els.replayFeed.addEventListener("load", () => { els.replayFeed.style.opacity = "1"; if (replayPlaceholder) replayPlaceholder.style.display = "none"; });
+  els.replayFeed.addEventListener("error", () => { els.replayFeed.style.opacity = "0"; if (replayPlaceholder) replayPlaceholder.style.display = "grid"; });
+}
 document.addEventListener("click", (event) => {
   if (!event.target.closest(".cam-role")) closeRoleMenus();
 });
@@ -3015,6 +3070,29 @@ window.drs?.onProgramOutputClosed?.(() => {
   programOut.open = false;
   const strip = document.getElementById("program-strip");
   if (strip) strip.hidden = true;
+});
+
+// Broadcast MP4: render the review's UltraEdge clip server-side and reveal the
+// file — the operator drops it into their streaming app (media source).
+els.exportBroadcast?.addEventListener("click", async () => {
+  const btn = els.exportBroadcast;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Rendering…";
+  try {
+    const result = await jsonFetch("/api/broadcast/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    showToast(`Broadcast clip ready: ${result.path}`, "not-out");
+    window.drs?.revealPath?.(result.path);
+  } catch {
+    showToast("Broadcast export failed — is a review loaded?", "out");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 });
 
 // initial UI state from persisted preferences

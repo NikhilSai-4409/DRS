@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld("drs", {
   // Broadcast Program Output window (OBS-facing) — opened from the dashboard,
   // driven over the program-command relay; the program window listens.
   openProgramOutput: () => ipcRenderer.invoke("open-program-output"),
+  revealPath: (p) => ipcRenderer.invoke("reveal-path", p),
   sendProgramCommand: (cmd) => ipcRenderer.invoke("program-command", cmd),
   onProgramCommand: (cb) => ipcRenderer.on("program-command", (_event, cmd) => cb(cmd)),
   onProgramOutputClosed: (cb) => ipcRenderer.on("program-output-closed", () => cb()),

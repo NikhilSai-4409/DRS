@@ -255,6 +255,86 @@ class DRSBackend:
             "reason": None if available else "no audio captured inside the requested window",
         }
 
+    def export_broadcast_clip(self, camera_id: int | None = None) -> dict:
+        """Render the active review's UltraEdge broadcast MP4 for the operator's
+        streaming rig (their YouTube application plays finished files — it cannot
+        capture our windows). Clip = ±18 replay frames around the strongest edge
+        event, waveform panel composited in-frame, verdict tail when decided.
+        Honest failures raise ValueError (route maps them to 409)."""
+        if self.active_replay is None or self.active_replay.total_frames == 0:
+            raise ValueError("no frozen replay buffer — request a review first")
+        window = self.replay_state()
+        total = window["total_frames"]
+        start = window.get("start_timestamp_ms")
+        end = window.get("end_timestamp_ms")
+        cams = window.get("camera_ids") or []
+        cam = camera_id if camera_id in cams else (cams[0] if cams else None)
+        if cam is None:
+            raise ValueError("replay buffer has no camera frames")
+        decision = self.current_decision or {}
+        events = (decision.get("edge_analysis") or {}).get("events") or []
+        preferred = [e for e in events if e.get("is_bat")] or events
+        top = max(preferred,
+                  key=lambda e: e.get("label_confidence") or e.get("confidence") or 0,
+                  default=None)
+        centre = int(top["frame_id"]) if top and top.get("frame_id") is not None else total // 2
+        lo = max(0, centre - 18)
+        hi = min(total - 1, centre + 18)
+        frames = []
+        for index in range(lo, hi + 1):
+            try:
+                frames.append(self.replay_frame(cam, index, None).frame)
+            except KeyError:
+                break
+        if len(frames) < 5:
+            raise ValueError("replay buffer too short to render a broadcast clip")
+        n = len(frames)
+        buckets: list = []
+        wave_reason = None
+        if self.audio_pipeline is None:
+            wave_reason = "no microphone — audio capture not running"
+        elif start is None or end is None or end <= start:
+            wave_reason = "replay window has no capture timestamps"
+        else:
+            span = end - start
+            clip_start = start + lo / total * span
+            clip_end = start + (lo + n) / total * span
+            waveform = self.audio_waveform_for_window(clip_start, clip_end, n * 10)
+            if waveform["available"]:
+                buckets = waveform["buckets"]
+            else:
+                wave_reason = waveform["reason"]
+        spikes = sorted({int(e["frame_id"]) - lo for e in events
+                         if e.get("frame_id") is not None and lo <= int(e["frame_id"]) <= hi})
+        impact = centre - lo if top is not None else None
+        review_result = decision.get("review_result") or {}
+        verdict = review_result.get("verdict") or None
+        cards = [(m.get("label") or m.get("name") or "",
+                  str(m.get("value") if m.get("value") is not None else m.get("status", "")))
+                 for m in (review_result.get("measurements") or [])[:4]]
+        from core.broadcast_clip import render_ultraedge_clip, resolve_export_dir
+
+        out_dir = resolve_export_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        review_type = str(decision.get("review_type") or "review")
+        path = out_dir / f"broadcast_{review_type}_{int(time.time())}.mp4"
+        render_ultraedge_clip(
+            frames, buckets, spikes, impact, path,
+            review_label=review_type.upper().replace("_", " "),
+            verdict=verdict, cards=cards, waveform_note=wave_reason,
+        )
+        activity_log.record("broadcast_export", "Broadcast clip exported",
+                            path=str(path), frames=n, review_type=review_type)
+        return {
+            "status": "exported",
+            "path": str(path),
+            "frames": n,
+            "impact_frame": impact,
+            "spike_frames": spikes,
+            "waveform": bool(buckets),
+            "reason": wave_reason,
+        }
+
     def health(self) -> dict:
         frames = self.camera_manager.latest_frames(write_recording=False)
         sync_report = self.sync_verifier.evaluate(frames)
@@ -1561,6 +1641,17 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
             return {"available": False, "buckets": [],
                     "reason": "no replay window — create a replay or pass start_ms/end_ms"}
         return backend.audio_waveform_for_window(float(start_ms), float(end_ms), int(buckets))
+
+    @app.post("/api/broadcast/export")
+    def broadcast_export(payload: dict = Body(default_factory=dict)) -> dict:
+        """Render the current review's broadcast MP4 (UltraEdge scene + verdict
+        tail) into the export folder the operator's streaming app reads."""
+        camera_id = payload.get("camera_id")
+        try:
+            return backend.export_broadcast_clip(
+                int(camera_id) if camera_id is not None else None)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     @app.get("/api/live/{camera_id}.jpg")
     def live_frame(camera_id: int) -> Response:

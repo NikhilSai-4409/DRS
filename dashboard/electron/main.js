@@ -500,6 +500,10 @@ ipcMain.handle("open-program-output", async () => {
   createProgramWindow();
   return { open: true };
 });
+ipcMain.handle("reveal-path", async (_event, target) => {
+  if (typeof target === "string" && target) shell.showItemInFolder(path.resolve(target));
+  return { ok: true };
+});
 ipcMain.handle("program-command", async (_event, command) => {
   if (!programWindow) return { delivered: false };
   programWindow.webContents.send("program-command", command);
