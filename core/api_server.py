@@ -26,7 +26,6 @@ from core.camera_manager import CameraManager, ReplayController, VideoFrame
 from core.camera_roles import normalize_roles
 from core.frame_buffer import FrameBuffer
 from core.integration import DRSPipeline, PipelineState
-from core.intrinsics_calibration import IntrinsicsCalibrationService
 from core.overlay_builder import build_overlay_payload
 from core.pitch_calibration import calibration_status_payload
 from core.review_logger import ReviewLogger
@@ -1170,53 +1169,6 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
             "confidence": 0.0,
             "note": "Proposed positions — drag each numbered marker onto the real stump base or crease line.",
         }
-
-    # ---- ChArUco intrinsics (Slice 2): capture → coverage → compute → save ----
-    # The service holds all logic; these routes are the thin layer, and only
-    # /capture touches the live feed (via backend.latest_frame).
-    intrinsics_service = IntrinsicsCalibrationService()
-    app.state.intrinsics_service = intrinsics_service
-
-    @app.get("/api/calibration/intrinsics/{camera_id}/status")
-    async def intrinsics_status(camera_id: int) -> dict:
-        return intrinsics_service.status(camera_id)
-
-    @app.post("/api/calibration/intrinsics/{camera_id}/capture")
-    async def intrinsics_capture(camera_id: int) -> dict:
-        """Grab the current live frame for a camera and add it as an intrinsics view."""
-        try:
-            frame = backend.latest_frame(camera_id).frame
-        except KeyError:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Camera {camera_id} has no live frame — check it is connected and streaming.",
-            )
-        return intrinsics_service.add_capture(camera_id, frame)
-
-    @app.post("/api/calibration/intrinsics/{camera_id}/compute")
-    async def intrinsics_compute(camera_id: int) -> dict:
-        try:
-            result = intrinsics_service.compute(camera_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        activity_log.record(
-            "intrinsics_saved",
-            f"Intrinsics calibrated for camera {camera_id}",
-            camera_id=camera_id,
-            rms_error=result["rms_error"],
-        )
-        return result
-
-    @app.post("/api/calibration/intrinsics/{camera_id}/clear")
-    async def intrinsics_clear(camera_id: int) -> dict:
-        return {"cleared": intrinsics_service.clear_captures(camera_id), "camera_id": camera_id}
-
-    @app.get("/api/calibration/intrinsics/{camera_id}")
-    async def intrinsics_inspect(camera_id: int) -> dict:
-        data = intrinsics_service.load_saved(camera_id)
-        if data is None:
-            raise HTTPException(status_code=404, detail=f"No intrinsics calibration for camera {camera_id}")
-        return data
 
     @app.get("/api/decision/current")
     def decision_current() -> dict:
