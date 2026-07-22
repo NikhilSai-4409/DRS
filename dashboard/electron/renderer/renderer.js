@@ -1392,6 +1392,12 @@ async function showArchivedMatch(matchId) {
 function renderSystemStatus() {
   const alerts = [];
   const health = state.lastHealth || {};
+  // Backend-connection honesty (never silently show a synthetic feed): if the app
+  // attached to a dev/synthetic/external backend, say so prominently and persistently.
+  const eng = state.engineInfo || {};
+  if (eng.synthetic) alerts.push("Developer Mode — synthetic backend, not your cameras");
+  else if (eng.external) alerts.push("Connected to an external backend (not started by this app)");
+  if (eng.status === "offline" || eng.status === "failed") alerts.push("No backend running");
   state.cameras.filter((camera) => !camera.connected).forEach((camera) => alerts.push(`Camera ${camera.id} offline`));
   const gpu = health.gpu || {};
   if (gpu.available && Number(gpu.percent) >= 92) alerts.push("GPU overload");
@@ -3182,13 +3188,17 @@ window.addEventListener("keydown", (event) => {
   if (key === "n" && state.activeAppeal) confirmDecision("NOT_OUT");
 });
 
-window.drs?.onStartupStatus?.((status) => {
-  // Optional dev-tool status — log it; never hijack the Decision card's explanation
-  // line with "install the React testing platform" text during a match.
+function applyEngineInfo(status) {
+  if (status?.engine) { state.engineInfo = status.engine; renderSystemStatus(); }
   if (status?.testingPlatform?.status === "unavailable") {
+    // Optional dev-tool status — log it; never hijack the Decision card's explanation.
     console.info("[DRS] Testing platform:", status.testingPlatform.message);
   }
-});
+}
+window.drs?.onStartupStatus?.(applyEngineInfo);
+// Also pull the current status on load (the push may have fired before we listened),
+// so the Developer-Mode / synthetic-backend banner shows immediately.
+window.drs?.getStartupStatus?.().then(applyEngineInfo).catch(() => {});
 
 // initial UI state from persisted preferences
 applySidebarState();

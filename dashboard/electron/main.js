@@ -180,6 +180,14 @@ function fetchHealthJson() {
   });
 }
 
+// Does a /api/health payload report any synthetic camera? Used to warn when the
+// app connects to a dev/test backend instead of one driving real cameras.
+function healthHasSynthetic(health) {
+  const cams = health && health.health;
+  if (!cams || typeof cams !== "object") return false;
+  return Object.values(cams).some((c) => Number(c && c.synthetic) === 1);
+}
+
 // Content hash of the backend Python sources — MUST match core/api_server.py's
 // _compute_code_version() (same file set + ordering): core/**/*.py sorted by posix
 // relpath, then drs_app.py, then config/settings.py; each contributes relpath\0bytes\0.
@@ -259,8 +267,20 @@ async function startEngine() {
   if (existing) {
     const expected = computeCodeVersion();
     if (existing.code_version && existing.code_version === expected) {
-      startupState.engine = { status: "online", message: "Using existing backend on port 8765" };
-      log("Backend already running with matching code — reusing", { code_version: expected });
+      // A matching backend is already on 8765 that THIS app did not start (e.g. a
+      // dev/test backend, possibly with synthetic cameras). Never attach silently —
+      // that once made the dashboard show a fake green synthetic feed. Reuse it, but
+      // flag it clearly so the renderer can warn the operator (Developer Mode banner).
+      const synthetic = healthHasSynthetic(existing);
+      startupState.engine = {
+        status: "online",
+        external: true,
+        synthetic,
+        message: synthetic
+          ? "Connected to a synthetic backend (Developer Mode) — not your cameras"
+          : "Connected to an existing backend on port 8765 (not started by this app)",
+      };
+      log("Backend already running with matching code — reusing (external)", { code_version: expected, synthetic });
       return true;
     }
     log("Stale backend on 8765 — replacing", { running: existing.code_version || "unknown", expected });
