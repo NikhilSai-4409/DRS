@@ -1085,6 +1085,16 @@ g[data-rlayer="crease"] .rp-guide-text { fill: #4aa3ff; }
 .activity-row .act-msg { flex: 1 1 auto; }
 .activity-row .act-time { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
 
+/* ---------- session identity chip + popover ---------- */
+button.user-chip { background: none; border: 0; padding: 0; cursor: pointer; text-align: left; }
+.session-pop { position: absolute; top: 58px; right: 14px; z-index: 70; width: 320px; background: var(--panel-2); border: 1px solid var(--border-2); border-radius: 14px; padding: 14px; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5); }
+.session-pop h4 { margin: 0 0 10px; font-size: 15px; }
+.sp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.sp-grid div { display: grid; gap: 2px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-3); }
+.sp-grid span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+.sp-grid strong { font-size: 12px; font-weight: 600; word-break: break-word; }
+.sp-note { display: block; margin-top: 10px; color: var(--muted); font-size: 11px; }
+
 /* ---------- Sync Replay (multi-cam, one timeline) ---------- */
 .sync-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .sync-cam-pills { display: flex; gap: 6px; flex-wrap: wrap; }

@@ -244,7 +244,8 @@ const els = {
   newMatchDialog: document.getElementById("new-match-dialog"),
   nmCurrentName: document.getElementById("nm-current-name"),
   nmCurrentCount: document.getElementById("nm-current-count"),
-  nmName: document.getElementById("nm-name"),
+  nmTeam1: document.getElementById("nm-team1"),
+  nmTeam2: document.getElementById("nm-team2"),
   nmOperator: document.getElementById("nm-operator"),
   nmTournament: document.getElementById("nm-tournament"),
   nmVenue: document.getElementById("nm-venue"),
@@ -1176,6 +1177,7 @@ async function loadCurrentMatch() {
     const match = await jsonFetch("/api/match/current");
     state.match = match;
     if (els.matchName) els.matchName.textContent = match.name || "Untitled Match";
+    updateSessionChip();
     // Rebuild the queue oldest-first so new reviews still append at the tail.
     state.queue = [];
     state.queueSeq = 0;
@@ -1195,12 +1197,38 @@ async function loadCurrentMatch() {
   } catch {}
 }
 
+/* ===================== session identity chip ===================== */
+// The topbar avatar is the SESSION, not decoration: label shows the operator once a
+// session starts; clicking opens the full session card (teams/venue/model/…).
+function updateSessionChip() {
+  const m = state.match || {};
+  const s = m.session || {};
+  const operator = s.operator || "";
+  const nameEl = document.getElementById("user-name");
+  const roleEl = document.getElementById("user-role");
+  const avaEl = document.getElementById("user-ava");
+  if (nameEl) nameEl.textContent = operator || "Admin";
+  if (roleEl) roleEl.textContent = m.name && m.name !== "Untitled Match" ? m.name : "Administrator";
+  if (avaEl) avaEl.textContent = operator ? operator.trim().slice(0, 2).toUpperCase() : "AD";
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v || "--"; };
+  set("sp-match", m.name && m.name !== "Untitled Match" ? m.name : "No session started");
+  set("sp-operator", operator);
+  set("sp-started", m.started_at ? new Date(m.started_at).toLocaleString() : "");
+  set("sp-venue", s.venue);
+  set("sp-ground", s.ground);
+  set("sp-tournament", s.tournament);
+  set("sp-reviews", String(m.review_count ?? 0));
+  set("sp-model", s.active_model);
+  set("sp-calibration", s.calibration_profile);
+}
+
 /* ===================== new match + session history ===================== */
 function openNewMatchDialog() {
   const m = state.match || {};
   if (els.nmCurrentName) els.nmCurrentName.textContent = m.name || "Untitled Match";
   if (els.nmCurrentCount) els.nmCurrentCount.textContent = String(m.review_count ?? (m.reviews?.length ?? 0));
-  if (els.nmName) els.nmName.value = "";
+  if (els.nmTeam1) els.nmTeam1.value = "";
+  if (els.nmTeam2) els.nmTeam2.value = "";
   // Carry the operator forward (same person usually runs consecutive sessions);
   // clear the venue-specific fields so they are re-entered per ground.
   const prevSession = (state.match && state.match.session) || {};
@@ -1209,14 +1237,22 @@ function openNewMatchDialog() {
 }
 
 async function confirmNewMatch() {
-  const name = els.nmName?.value.trim();
+  // Match name composes from the two teams ("India vs Australia"); one team alone
+  // names the session after it; none → backend default "Untitled Match".
+  const team1 = els.nmTeam1?.value.trim() || "";
+  const team2 = els.nmTeam2?.value.trim() || "";
+  const name = [team1, team2].filter(Boolean).join(" vs ") || undefined;
   const session = {
     operator: els.nmOperator?.value.trim() || undefined,
     tournament: els.nmTournament?.value.trim() || undefined,
     venue: els.nmVenue?.value.trim() || undefined,
     ground: els.nmGround?.value.trim() || undefined,
   };
-  const payload = { ...(name ? { name } : {}), session };
+  const payload = {
+    ...(name ? { name } : {}),
+    ...(team1 || team2 ? { teams: { team1, team2 } } : {}),
+    session,
+  };
   try {
     await jsonFetch("/api/match/new", {
       method: "POST",
@@ -2678,6 +2714,19 @@ els.reviewsList?.addEventListener("click", (event) => {
   if (btn) exportReviewJson(btn.dataset.exportReview);
 });
 els.activityRefresh?.addEventListener("click", renderActivityLog);
+
+// Session identity chip: toggle the session card; close on any outside click.
+document.getElementById("user-chip")?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  const pop = document.getElementById("session-pop");
+  if (!pop) return;
+  updateSessionChip();          // fresh data every open
+  pop.hidden = !pop.hidden;
+});
+document.addEventListener("click", (event) => {
+  const pop = document.getElementById("session-pop");
+  if (pop && !pop.hidden && !event.target.closest("#session-pop")) pop.hidden = true;
+});
 
 // Sync Replay: one master timeline drives every selected camera pane.
 document.getElementById("syncrep-load")?.addEventListener("click", () => SyncReplay.load());

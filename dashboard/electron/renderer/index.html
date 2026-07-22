@@ -54,7 +54,26 @@
             </div>
             <button id="mode-toggle" type="button" title="Switch visible/demo thermal mode">Mode</button>
             <button id="open-settings" type="button" title="Settings">⚙</button>
-            <div class="user-chip"><div class="ava">AD</div><div class="user-text"><strong>Admin</strong><small>Administrator</small></div></div>
+            <!-- Session identity: shows the operator once a session starts; click for
+                 the full session card (teams, venue, model, calibration, started). -->
+            <button id="user-chip" class="user-chip" type="button" title="Session details">
+              <div class="ava" id="user-ava">AD</div>
+              <div class="user-text"><strong id="user-name">Admin</strong><small id="user-role">Administrator</small></div>
+            </button>
+            <div id="session-pop" class="session-pop" hidden>
+              <h4 id="sp-match">No session started</h4>
+              <div class="sp-grid">
+                <div><span>Operator</span><strong id="sp-operator">--</strong></div>
+                <div><span>Started</span><strong id="sp-started">--</strong></div>
+                <div><span>Venue</span><strong id="sp-venue">--</strong></div>
+                <div><span>Ground</span><strong id="sp-ground">--</strong></div>
+                <div><span>Tournament</span><strong id="sp-tournament">--</strong></div>
+                <div><span>Reviews</span><strong id="sp-reviews">--</strong></div>
+                <div><span>Model</span><strong id="sp-model">--</strong></div>
+                <div><span>Calibration</span><strong id="sp-calibration">--</strong></div>
+              </div>
+              <small class="sp-note">Captured per session — every review is reproducible.</small>
+            </div>
           </div>
         </header>
 
@@ -644,9 +663,14 @@
       <div class="nm-body">
         <div class="nm-row"><span>Current match</span><strong id="nm-current-name">--</strong></div>
         <div class="nm-row"><span>Completed reviews</span><strong id="nm-current-count">0</strong></div>
-        <label class="nm-field">New match name
-          <input id="nm-name" type="text" placeholder="e.g. India vs Australia" />
-        </label>
+        <div class="nm-grid">
+          <label class="nm-field">Team 1
+            <input id="nm-team1" type="text" placeholder="e.g. India" />
+          </label>
+          <label class="nm-field">Team 2
+            <input id="nm-team2" type="text" placeholder="e.g. Australia" />
+          </label>
+        </div>
         <div class="nm-grid">
           <label class="nm-field">Operator
             <input id="nm-operator" type="text" placeholder="e.g. Nikhil" />
