@@ -23,14 +23,16 @@ class LbwReviewModule(ReviewModule):
     key = "lbw"
     label = "LBW"
     required_role = BALL_TRACKING
-    # DRS protocol order: the umpire clears BAT INVOLVEMENT (UltraEdge) before
-    # reading the ball-tracking gates — bat-first contact kills an LBW appeal.
-    timeline = ("Appeal", "UltraEdge", "Pitching", "Impact", "Wickets", "Decision")
-    evidence = ("ultraedge_check", "ball_tracking", "bounce_point", "impact_point",
-                "predicted_trajectory", "pitching", "impact", "wickets", "ball_speed", "replay")
+    # DRS protocol order: a front-foot NO BALL voids the dismissal outright, then the
+    # umpire clears BAT INVOLVEMENT (UltraEdge), and only then reads ball-tracking.
+    timeline = ("Appeal", "No Ball", "UltraEdge", "Pitching", "Impact", "Wickets", "Decision")
+    evidence = ("front_foot_check", "ultraedge_check", "ball_tracking", "bounce_point",
+                "impact_point", "predicted_trajectory", "pitching", "impact", "wickets",
+                "ball_speed", "replay")
     replay_mode = "trajectory"
-    decision_card = ("UltraEdge", "Pitching", "Impact", "Wickets", "Decision")
-    supports = {"trajectory": True, "audio": True, "frame_step": True, "measurement": True}
+    decision_card = ("No Ball", "UltraEdge", "Pitching", "Impact", "Wickets", "Decision")
+    supports = {"trajectory": True, "audio": True, "crease": True,
+                "frame_step": True, "measurement": True}
 
     def analyze(self, ctx: ReviewContext) -> dict:
         camera_id = self.select_camera(ctx)
@@ -77,9 +79,38 @@ class LbwReviewModule(ReviewModule):
         if samples:
             result["geometry"] = self._geometry(camera_id, samples, prediction)
 
-        # DRS protocol: run the UltraEdge check on the SAME captured frames in the same
-        # appeal — bat-first contact invalidates LBW, so the umpire clears the edge
-        # BEFORE reading the tracking gates. Without a stump mic the edge module
+        # DRS protocol step 1: FRONT-FOOT NO BALL. A no-ball voids the dismissal
+        # outright — checked before anything else. Only the no_ball_analysis block is
+        # merged (the module's own result would clear LBW's trajectory fields).
+        no_ball_value = "Unchecked — verify manually"
+        no_ball_flag = False
+        try:
+            from core.review_modules.no_ball import NoBallReviewModule
+
+            nb_result = NoBallReviewModule().analyze(ctx) or {}
+            if nb_result.get("no_ball_analysis") is not None:
+                result["no_ball_analysis"] = nb_result["no_ball_analysis"]
+        except Exception:
+            pass
+        no_ball = result.get("no_ball_analysis") or {}
+        if no_ball.get("is_no_ball") is True:
+            overstep = no_ball.get("distance_past_cm")
+            no_ball_value = f"NO BALL — over by {abs(overstep):.1f} cm" if overstep is not None else "NO BALL"
+            no_ball_flag = True
+            # Protocol override: the batter cannot be out LBW off a no-ball.
+            result["verdict"] = "NOT OUT - NO BALL"
+            warnings.append("FRONT-FOOT NO BALL — the delivery is illegal; the batter cannot be out LBW.")
+        elif no_ball.get("is_no_ball") is False:
+            behind = no_ball.get("distance_past_cm")
+            no_ball_value = f"Legal ({abs(behind):.1f} cm behind)" if behind is not None else "Legal delivery"
+        else:
+            reason = no_ball.get("reason") or "front-foot camera not available/calibrated"
+            no_ball_value = "Unchecked — verify manually"
+            warnings.append(f"Front-foot no-ball unchecked ({reason}) — verify before confirming OUT.")
+
+        # DRS protocol step 2: run the UltraEdge check on the SAME captured frames in
+        # the same appeal — bat-first contact invalidates LBW, so the umpire clears the
+        # edge BEFORE reading the tracking gates. Without a stump mic the edge module
         # honestly reports inconclusive; the reminder to clear it manually stands.
         try:
             from core.review_modules.edge import EdgeReviewModule
@@ -104,8 +135,9 @@ class LbwReviewModule(ReviewModule):
             warnings.append("UltraEdge check unavailable for this appeal — clear bat involvement manually.")
 
         result["summary"] = {
-            "headline": headline,
+            "headline": "NOT OUT — NO BALL" if no_ball_flag else headline,
             "measurements": [
+                {"label": "No Ball", "value": no_ball_value, "flag": no_ball_flag},
                 {"label": "UltraEdge", "value": edge_value,
                  "flag": (edge.get("edge_probability") or 0.0) >= 0.5},
                 {"label": "Detection rate", "value": f"{detection_rate * 100:.0f}%"},

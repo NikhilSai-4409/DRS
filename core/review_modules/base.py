@@ -274,14 +274,20 @@ def _verdict_for(review_type: str, decision: dict) -> str:
     branch here; the UI never changes."""
     wide = decision.get("wide_analysis") or {}
     no_ball = decision.get("no_ball_analysis") or {}
-    if review_type == "wide" or "wide_analysis" in decision:
+    # The DECLARED review type always wins; the *_analysis presence checks are a
+    # fallback for legacy untyped decisions only. An LBW review legitimately carries
+    # no_ball/edge analysis (protocol pre-checks) without becoming a No Ball review.
+    known = {"lbw", "wide", "noball", "no_ball", "front_foot", "frontfoot",
+             "runout", "run_out", "stumping", "stump", "edge", "ultraedge", "ultra_edge", "snicko"}
+    untyped = review_type not in known
+    if review_type == "wide" or (untyped and "wide_analysis" in decision):
         return {True: "WIDE", False: "NOT WIDE"}.get(wide.get("is_wide"), "AWAITING")
-    if review_type in {"noball", "no_ball", "front_foot", "frontfoot"} or "no_ball_analysis" in decision:
+    if review_type in {"noball", "no_ball", "front_foot", "frontfoot"} or (untyped and "no_ball_analysis" in decision):
         return {True: "NO BALL", False: "LEGAL"}.get(no_ball.get("is_no_ball"), "AWAITING")
-    if review_type in {"runout", "run_out"} or "run_out_analysis" in decision:
+    if review_type in {"runout", "run_out"} or (untyped and "run_out_analysis" in decision):
         run_out = decision.get("run_out_analysis") or {}
         return {True: "OUT", False: "NOT OUT"}.get(run_out.get("is_out"), "AWAITING")
-    if review_type in {"stumping", "stump"} or "stumping_analysis" in decision:
+    if review_type in {"stumping", "stump"} or (untyped and "stumping_analysis" in decision):
         stumping = decision.get("stumping_analysis") or {}
         return {True: "OUT", False: "NOT OUT"}.get(stumping.get("is_out"), "AWAITING")
     if review_type in {"edge", "ultraedge", "ultra_edge", "snicko"}:

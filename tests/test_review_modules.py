@@ -87,6 +87,36 @@ def test_registry_supports_all_review_types() -> None:
     assert set(supported_types()) == {"lbw", "wide", "noball", "edge", "runout", "stumping"}
 
 
+def test_lbw_no_ball_voids_dismissal(monkeypatch) -> None:
+    # DRS protocol: a front-foot NO BALL voids the dismissal — the LBW verdict
+    # overrides to NOT OUT and the decision card's first row is the flagged check.
+    from core.review_modules.no_ball import NoBallReviewModule
+
+    monkeypatch.setattr(NoBallReviewModule, "analyze", lambda self, ctx: {
+        "no_ball_analysis": {"is_no_ball": True, "distance_past_cm": 3.2}})
+    ctx = ReviewContext(
+        review_type="lbw", frames={0: [_frame(1), _frame(2), _frame(3)]}, detector=None,
+        calibrators={}, camera_roles={0: "Ball Tracking"}, primary_camera_id=0)
+    result = run_review("lbw", ctx)
+    rr = build_review_result("lbw", result)
+    assert rr["verdict"] == "NOT OUT - NO BALL"
+    first = result["summary"]["measurements"][0]
+    assert first["label"] == "No Ball" and first["flag"] is True
+    assert any("cannot be out LBW" in w for w in result["summary"]["warnings"])
+
+
+def test_lbw_verdict_not_hijacked_by_merged_precheck_analysis() -> None:
+    # An LBW decision now legitimately CARRIES no_ball/edge pre-check blocks; the
+    # declared review type must keep verdict precedence (regression: presence-based
+    # fallback used to reroute an LBW verdict to "LEGAL").
+    rr = build_review_result("lbw", {
+        "no_ball_analysis": {"is_no_ball": False},
+        "edge_analysis": {"edge_probability": 0.0},
+        "wicket_zone_status": "HITTING",
+    })
+    assert rr["verdict"] == "HITTING"
+
+
 def test_wide_ball_outside_line_is_wide() -> None:
     # 1.00 m from middle stump, wide line at 0.889 m -> ~11 cm outside -> WIDE.
     result = run_review("wide", _wide_context(lateral_mm=1000.0))
