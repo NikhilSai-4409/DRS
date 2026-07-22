@@ -902,8 +902,9 @@ function syncCanonicalSurfaces() {
     if (showInReplay) renderCanonicalReview(replayHost, c.jobId, c.results);
     else replayHost.innerHTML = "";
   }
-  // The Ball-Tracking step of the protocol strip depends on the async gates.
-  if (state.decision) updateProtocolStrip(state.decision);
+  // The Ball-Tracking stage depends on the async gates — refresh the Review Mode
+  // protocol from the single state machine now that canonical results have landed.
+  if (ReviewMode.active) ReviewMode.renderProtocol();
 }
 
 function renderCanonicalReview(host, jobId, results, which = "both") {
@@ -1014,77 +1015,59 @@ function renderConfidence(decision) {
   `).join("");
 }
 
-// LBW 3-step protocol strip: Front Foot (No Ball) → UltraEdge → Ball Tracking.
-// Every value read straight off the live decision object, except Ball Tracking
-// which comes from the async canonical job (gates) — so this is also called from
-// syncCanonicalSurfaces when that lands. Each step is a small titled chip with a
-// clear status + colour (green ok / red concern / amber pending or inconclusive).
-function protocolStep(num, title, status, tone, detail) {
-  return `<div class="ps-step ps-${tone}">
-    <span class="ps-num">${num}</span>
-    <div class="ps-text">
-      <span class="ps-title">${title}</span>
-      <span class="ps-status">${status}</span>
-      ${detail ? `<span class="ps-detail">${detail}</span>` : ""}
-    </div>
-  </div>`;
-}
+// ── LBW protocol state machine — the SINGLE source of truth ──────────────────
+// Every stage is exactly one of: "waiting" | "processing" | "passed" | "failed".
+// The Review Mode UI is driven ONLY from this object, so the display is
+// deterministic — never inferred ad hoc from whichever backend field arrives
+// first (which is what made steps read "waiting" while actually processing).
+//   waiting    — not started yet
+//   processing — the review is live but this stage's result hasn't arrived
+//   passed     — the check completed successfully
+//   failed     — the check completed but couldn't run (no camera / mic / track)
+const PROTOCOL_STAGES = ["frontFoot", "ultraEdge", "ballTracking"];
 
-function updateProtocolStrip(decision) {
-  const strips = [document.getElementById("protocol-strip"),
-                  document.getElementById("rm-protocol-strip")].filter(Boolean);
-  if (!strips.length) return;
-  const status = decision.status || state.lastStatus;
-  const show = state.reviewType === "lbw" && status && status !== "WAITING";
-  if (!show) { strips.forEach((s) => { s.hidden = true; s.innerHTML = ""; }); return; }
+function computeProtocol(decision) {
+  decision = decision || {};
+  const status = decision.status || state.lastStatus || "WAITING";
+  // The review is "live" whenever Review Mode is open — not only when the last
+  // polled status says PROCESSING. During the appeal round-trip the poll can still
+  // report the stale pre-appeal WAITING decision; without this, pending stages
+  // would wrongly read "waiting" while the review is actually running.
+  const reviewLive = typeof ReviewMode !== "undefined" && ReviewMode.active;
+  const live = reviewLive || status === "PROCESSING" || status === "OUT" || status === "NOT_OUT";
+  const pending = live ? "processing" : "waiting";
 
-  // 1) FRONT FOOT (No Ball) — a no-ball makes the LBW dead, so it leads.
+  // ① Front Foot — front-foot no-ball check
   const nb = decision.no_ball_analysis || decision.noball || {};
-  let ff;
-  if (nb.is_no_ball === true) ff = protocolStep(1, "Front Foot", "NO BALL", "red", "delivery is illegal");
-  else if (nb.is_no_ball === false) {
-    const by = nb.distance_past_cm != null ? `${Math.abs(nb.distance_past_cm).toFixed(1)} cm behind` : "foot behind line";
-    ff = protocolStep(1, "Front Foot", "LEGAL", "green", by);
-  } else ff = protocolStep(1, "Front Foot", "NOT CHECKED", "amber", nb.reason || "no front-foot camera");
+  let frontFoot;
+  if (nb.is_no_ball === true || nb.is_no_ball === false) frontFoot = "passed";
+  else if (nb.reason && /no .*camera|not available|unavailable|not detected/i.test(nb.reason)) frontFoot = "failed";
+  else frontFoot = pending;
 
-  // 2) ULTRAEDGE — spike near impact means bat involved (inside edge → not out).
+  // ② UltraEdge — stump-mic audio analysis
   const edge = decision.edge_analysis || {};
-  let ue;
-  if (edge.available === false || edge.inconclusive) {
-    ue = protocolStep(2, "UltraEdge", "NO AUDIO", "amber", edge.reason || "stump mic not synced");
-  } else {
-    const events = edge.events || [];
-    const bat = events.some((e) => e.is_bat) || Number(edge.edge_probability || 0) >= 0.5;
-    ue = bat
-      ? protocolStep(2, "UltraEdge", "SPIKE", "amber", "possible bat contact")
-      : protocolStep(2, "UltraEdge", "NO SPIKE", "green", "no bat sound");
-  }
+  let ultraEdge;
+  if (edge.available === false) ultraEdge = "failed";
+  else if (edge.available === true || (edge.events && edge.events.length) || edge.inconclusive != null || edge.edge_probability != null) ultraEdge = "passed";
+  else ultraEdge = pending;
 
-  // 3) BALL TRACKING — the "is it hitting?" answer, from the canonical gates.
-  const gates = state.canonical?.results?.reconstruction?.gates;
-  let bt;
-  if (gates) {
-    const w = String(gates.wickets || "").toUpperCase();
-    const v = String(gates.verdict || "").toUpperCase();
-    const tone = w.includes("HIT") ? "red" : w.includes("MISS") ? "green" : "amber";
-    bt = protocolStep(3, "Ball Tracking", w || v || "—", tone,
-      `Pitch ${gates.pitching || "—"} · Impact ${gates.impact || "—"}`);
-  } else if (state.canonical && !state.canonical.results) {
-    bt = protocolStep(3, "Ball Tracking", "TRACKING…", "amber", "rendering the trajectory");
-  } else if (state.activeAppeal || status === "PROCESSING") {
-    bt = protocolStep(3, "Ball Tracking", "TRACKING…", "amber", "analysing the delivery");
-  } else {
-    bt = protocolStep(3, "Ball Tracking", "NO REPLAY", "amber", "trajectory not available");
-  }
+  // ③ Ball Tracking — the async trajectory/replay pipeline (canonical job)
+  let ballTracking;
+  const canon = state.canonical;
+  if (decision.canonical_skip_reason) ballTracking = "failed";
+  else if (canon && canon.results) {
+    const g = canon.results.reconstruction && canon.results.reconstruction.gates;
+    const hasReplay = Boolean((canon.results.exports || {}).replay_players);
+    ballTracking = (g || hasReplay) ? "passed" : "failed";
+  } else if (decision.canonical_job_id || (canon && !canon.results)) {
+    ballTracking = "processing";     // job created / trajectory rendering
+  } else ballTracking = pending;
 
-  const arrow = `<span class="ps-arrow" aria-hidden="true">→</span>`;
-  const html = ff + arrow + ue + arrow + bt;
-  strips.forEach((s) => { s.hidden = false; s.innerHTML = html; });
+  return { frontFoot, ultraEdge, ballTracking };
 }
 
 // Review summary shown on result (commercial-style record)
 function renderReviewSummary(decision) {
-  updateProtocolStrip(decision);
   const status = decision.status || state.lastStatus;
   const resolved = status === "OUT" || status === "NOT_OUT";
   const mod = REVIEW_MODULES[state.reviewType] || {};
@@ -1631,6 +1614,9 @@ function dashboardDecisionFromResults(results) {
 async function requestReview() {
   state.confirmHold = false;
   clearTimeout(state.confirmHoldTimer);
+  // Clear the PREVIOUS review's canonical result up-front so the new review's
+  // Ball-Tracking stage starts at "processing", not the last review's pass/fail.
+  state.canonical = null;
   setMatchStatus("review");
   const mod = REVIEW_MODULES[state.reviewType];
   state.reviewStartMs = Date.now();
@@ -1759,6 +1745,16 @@ const ReviewMode = {
     }
     box.innerHTML = `<video muted playsinline controls autoplay loop src="${API_BASE}/api/testing/jobs/${jobId}/exports/${key}"></video>`;
   },
+  // Drive the three step chips ENTIRELY from the protocol state machine — the one
+  // source of truth. Maps {frontFoot,ultraEdge,ballTracking} → the ff/ue/bt chips.
+  renderProtocol(decision) {
+    // The 3-step protocol + gates are LBW-specific — only LBW drives them.
+    if (state.reviewType !== "lbw") return;
+    const p = computeProtocol(decision || state.decision || {});
+    this.setStep("ff", p.frontFoot);
+    this.setStep("ue", p.ultraEdge);
+    this.setStep("bt", p.ballTracking);
+  },
   // Called when the canonical job's results land (from watchCanonicalReview).
   setCanonical(jobId, results) {
     if (!this.active || !results) return;
@@ -1768,7 +1764,7 @@ const ReviewMode = {
     document.getElementById("rm-gate-pitching").textContent = (g && g.pitching) || "—";
     document.getElementById("rm-gate-impact").textContent = (g && g.impact) || "—";
     document.getElementById("rm-gate-wickets").textContent = (g && g.wickets) || "—";
-    this.setStep("bt", g ? "complete" : "failed");
+    this.renderProtocol();   // ball-tracking stage → passed/failed per the state machine
   },
   enter(decision) {
     this.ensure();
@@ -1779,7 +1775,12 @@ const ReviewMode = {
     this.el.setAttribute("aria-hidden", "false");
     const mod = REVIEW_MODULES[decision.review_type || state.reviewType];
     document.getElementById("rm-type").textContent = `${(mod && mod.label) || "Review"} REVIEW`.toUpperCase();
-    ["ff", "ue", "bt"].forEach((k) => this.setStep(k, "processing"));
+    // Protocol steps + ball-tracking gates are LBW-only; hide them for other types.
+    const isLbw = (decision.review_type || state.reviewType) === "lbw";
+    const steps = this.el.querySelector("#rm-steps");
+    const gates = this.el.querySelector(".rm2-gates");
+    if (steps) steps.hidden = !isLbw;
+    if (gates) gates.hidden = !isLbw;
     document.getElementById("rm-gate-pitching").textContent = "—";
     document.getElementById("rm-gate-impact").textContent = "—";
     document.getElementById("rm-gate-wickets").textContent = "—";
@@ -1790,23 +1791,8 @@ const ReviewMode = {
   play(decision) { if (!this.active) return this.enter(decision); this.update(decision); },
   update(decision) {
     if (!this.active) return;
+    this.renderProtocol(decision);
     const status = decision.status || "PROCESSING";
-    const processing = status === "PROCESSING";
-    // ① Front Foot
-    const nb = decision.no_ball_analysis || decision.noball || {};
-    if (nb.is_no_ball === true || nb.is_no_ball === false) this.setStep("ff", "complete");
-    else if (nb.reason && /no .*camera|not available|unavailable/i.test(nb.reason)) this.setStep("ff", "failed");
-    else this.setStep("ff", processing ? "processing" : "waiting");
-    // ② UltraEdge
-    const edge = decision.edge_analysis || {};
-    if (edge.available === false) this.setStep("ue", "failed");
-    else if (edge.edge_probability != null || (edge.events && edge.events.length) || edge.inconclusive != null) this.setStep("ue", "complete");
-    else this.setStep("ue", processing ? "processing" : "waiting");
-    // ③ Ball Tracking — canonical drives complete/failed; here set the interim state
-    if (decision.canonical_skip_reason) this.setStep("bt", "failed");
-    else if (state.canonical && state.canonical.results) this.setCanonical(state.canonical.jobId, state.canonical.results);
-    else this.setStep("bt", processing ? "processing" : "waiting");
-    // Verdict + actions
     const rr = decision.review_result || {};
     const resolved = status === "OUT" || status === "NOT_OUT";
     const v = document.getElementById("rm-verdict");

@@ -280,10 +280,9 @@
 
               <section id="review-summary" class="review-summary">
                 <strong class="rs-h">Review Summary</strong>
-                <!-- LBW 3-step protocol at a glance: Front Foot → UltraEdge → Ball
-                     Tracking, each green/red/amber. Built by updateProtocolStrip;
-                     shown only for LBW once a review is in progress. -->
-                <div class="protocol-strip" id="protocol-strip" hidden></div>
+                <!-- The LBW 3-step protocol now lives ONLY in Review Mode (the single
+                     review workspace), driven by the computeProtocol state machine —
+                     not duplicated here on the dashboard. -->
                 <!-- Rows are built per review type from the module's capability contract
                      (decision_card) + its typed summary.measurements — an Edge review
                      shows Spike/HotSpot, a Wide shows Guideline/Margin, never a shared
