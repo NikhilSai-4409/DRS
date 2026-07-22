@@ -31,7 +31,6 @@ if (!app.isPackaged) {
 let engineProcess = null;
 let testingPlatformProcess = null;
 let mainWindow = null;
-let programWindow = null;
 
 const startupState = {
   engine: { status: "pending", message: "Starting backend..." },
@@ -68,39 +67,6 @@ function createWindow() {
   loadLoadingScreen(startupState.engine.message);
   mainWindow.on("closed", () => {
     mainWindow = null;
-  });
-}
-
-// Broadcast "Program Output" — a second window holding only the clean 16:9
-// broadcast frame (live / UltraEdge / decision scenes). OBS captures this window
-// for the stream; every operator control stays in the dashboard and drives it
-// through the program-command relay registered below.
-function createProgramWindow() {
-  if (programWindow) {
-    programWindow.focus();
-    return;
-  }
-  programWindow = new BrowserWindow({
-    width: 1280,
-    height: 720,
-    useContentSize: true,
-    backgroundColor: "#000000",
-    autoHideMenuBar: true,
-    title: "DRS Program Output",
-    show: true,
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-  const file = path.join(__dirname, "renderer", "program-output.html");
-  programWindow.loadURL(pathToFileURL(file).toString()).catch((error) => {
-    logError("Program output load failed:", error.message);
-  });
-  programWindow.on("closed", () => {
-    programWindow = null;
-    mainWindow?.webContents.send("program-output-closed");
   });
 }
 
@@ -496,18 +462,26 @@ ipcMain.handle("get-startup-status", async () => startupState);
 ipcMain.handle("get-ai-development-status", async () => runDevelopmentJson(["status"]));
 ipcMain.handle("run-ai-development-command", async (_event, name) => runDevelopmentCommand(name));
 ipcMain.handle("open-vision-studio", async (_event, opts = {}) => openVisionStudio(opts));
-ipcMain.handle("open-program-output", async () => {
-  createProgramWindow();
-  return { open: true };
-});
-ipcMain.handle("reveal-path", async (_event, target) => {
-  if (typeof target === "string" && target) shell.showItemInFolder(path.resolve(target));
-  return { ok: true };
-});
-ipcMain.handle("program-command", async (_event, command) => {
-  if (!programWindow) return { delivered: false };
-  programWindow.webContents.send("program-command", command);
-  return { delivered: true };
+// Export the review's broadcast MP4: ask WHERE first (native save dialog, like
+// a browser download), then have the backend render straight to that path, then
+// reveal the file for drag-into-the-streaming-app.
+ipcMain.handle("export-broadcast", async (_event, opts = {}) => {
+  const suggestedName = typeof opts?.suggestedName === "string" && opts.suggestedName
+    ? opts.suggestedName
+    : "DRS_Review.mp4";
+  const picked = await dialog.showSaveDialog(mainWindow, {
+    title: "Save review clip",
+    defaultPath: suggestedName,
+    filters: [{ name: "MP4 video", extensions: ["mp4"] }],
+  });
+  if (picked.canceled || !picked.filePath) return { canceled: true };
+  try {
+    const exported = await postJson("/api/broadcast/export", { out_path: picked.filePath }, false, 120000);
+    shell.showItemInFolder(picked.filePath);
+    return exported;
+  } catch (error) {
+    return { error: error.message };
+  }
 });
 ipcMain.handle("pick-model-file", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
@@ -863,7 +837,7 @@ function getJson(route) {
   });
 }
 
-function postJson(route, payload, emitDecision = false) {
+function postJson(route, payload, emitDecision = false, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload || {});
     const request = http.request(`${ENGINE_URL}${route}`, {
@@ -895,7 +869,7 @@ function postJson(route, payload, emitDecision = false) {
       });
     });
     request.on("error", reject);
-    request.setTimeout(10000, () => {
+    request.setTimeout(timeoutMs, () => {
       request.destroy();
       reject(new Error(`Timeout posting ${route}`));
     });

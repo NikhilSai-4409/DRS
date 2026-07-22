@@ -255,12 +255,14 @@ class DRSBackend:
             "reason": None if available else "no audio captured inside the requested window",
         }
 
-    def export_broadcast_clip(self, camera_id: int | None = None) -> dict:
+    def export_broadcast_clip(self, camera_id: int | None = None,
+                              out_path: str | None = None) -> dict:
         """Render the active review's UltraEdge broadcast MP4 for the operator's
         streaming rig (their YouTube application plays finished files — it cannot
         capture our windows). Clip = ±18 replay frames around the strongest edge
         event, waveform panel composited in-frame, verdict tail when decided.
-        Honest failures raise ValueError (route maps them to 409)."""
+        out_path (from the app's save dialog) wins; otherwise the default export
+        folder. Honest failures raise ValueError (route maps them to 409)."""
         if self.active_replay is None or self.active_replay.total_frames == 0:
             raise ValueError("no frozen replay buffer — request a review first")
         window = self.replay_state()
@@ -314,10 +316,16 @@ class DRSBackend:
                  for m in (review_result.get("measurements") or [])[:4]]
         from core.broadcast_clip import render_ultraedge_clip, resolve_export_dir
 
-        out_dir = resolve_export_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
         review_type = str(decision.get("review_type") or "review")
-        path = out_dir / f"broadcast_{review_type}_{int(time.time())}.mp4"
+        if out_path:
+            path = Path(out_path)
+            if path.suffix.lower() != ".mp4":
+                path = path.with_suffix(".mp4")
+            path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir = resolve_export_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"broadcast_{review_type}_{int(time.time())}.mp4"
         render_ultraedge_clip(
             frames, buckets, spikes, impact, path,
             review_label=review_type.upper().replace("_", " "),
@@ -1647,9 +1655,11 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
         """Render the current review's broadcast MP4 (UltraEdge scene + verdict
         tail) into the export folder the operator's streaming app reads."""
         camera_id = payload.get("camera_id")
+        out_path = payload.get("out_path")
         try:
             return backend.export_broadcast_clip(
-                int(camera_id) if camera_id is not None else None)
+                int(camera_id) if camera_id is not None else None,
+                str(out_path) if out_path else None)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 
