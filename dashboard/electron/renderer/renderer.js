@@ -264,7 +264,6 @@ const els = {
   openReplay: document.getElementById("open-replay"),
   exportReview: document.getElementById("export-review"),
   resetReview: document.getElementById("reset-review"),
-  replaySave: document.getElementById("replay-save"),
   calibrationButton: document.getElementById("calibration-button"),
   replayTrajectory: document.getElementById("replay-trajectory"),
   resetCamera: document.getElementById("reset-camera"),
@@ -728,6 +727,10 @@ function renderLiveFrames(frames) {
 }
 
 async function refreshDecision() {
+  // Suppress the poll during the confirm→reset handoff and the staged reveal, so
+  // a GET dispatched just before the reset can't resolve late and resurrect the
+  // verdict (re-firing the whole reveal). The explicit renders drive those phases.
+  if (state.confirmHold || state.revealing) return;
   try {
     const decision = await jsonFetch("/api/decision/current");
     renderDecision(decision);
@@ -745,9 +748,6 @@ function renderDecision(decision) {
     state.reviewElapsed = state.reviewStartMs ? (Date.now() - state.reviewStartMs) / 1000 : null;
   }
   state.lastStatus = status;
-  // A fresh appeal freezes the replay buffer + attaches edge_analysis — the TV
-  // Output window starts showing the review to the live audience immediately.
-  if (justResolved) sendReviewToProgram();
   if (justResolved && !state.revealing) {
     playDecisionReveal(status, decision);
   } else if (!state.revealing) {
@@ -884,12 +884,6 @@ function syncCanonicalSurfaces() {
   const ready = Boolean(c && c.results && (c.results.exports || {}).replay_players);
   document.getElementById("lbw-observed-btn")?.classList.toggle("ready", ready);
   document.getElementById("lbw-clean-btn")?.classList.toggle("ready", ready && Boolean((c.results.exports || {}).replay_review));
-  // Ball-tracking replay finished mid-review -> play it once on the TV Output.
-  if (ready && programOut.open && state.activeAppeal && c.jobId !== programOut.lastReplayJob
-      && (c.results.exports || {}).replay_review) {
-    programOut.lastReplayJob = c.jobId;
-    programCmd({ type: "replay-video", url: `${API_BASE}/api/testing/jobs/${c.jobId}/exports/replay_review` });
-  }
   if (c && c.results) {
     setCanonicalChip(ready ? "DRS replay ready ✓ — view" : "Analysis done — no replay (see DRS Replay tab)", ready);
   } else if (!c) {
@@ -901,6 +895,8 @@ function syncCanonicalSurfaces() {
     if (showInReplay) renderCanonicalReview(replayHost, c.jobId, c.results);
     else replayHost.innerHTML = "";
   }
+  // The Ball-Tracking step of the protocol strip depends on the async gates.
+  if (state.decision) updateProtocolStrip(state.decision);
 }
 
 function renderCanonicalReview(host, jobId, results, which = "both") {
@@ -1011,8 +1007,73 @@ function renderConfidence(decision) {
   `).join("");
 }
 
+// LBW 3-step protocol strip: Front Foot (No Ball) → UltraEdge → Ball Tracking.
+// Every value read straight off the live decision object, except Ball Tracking
+// which comes from the async canonical job (gates) — so this is also called from
+// syncCanonicalSurfaces when that lands. Each step is a small titled chip with a
+// clear status + colour (green ok / red concern / amber pending or inconclusive).
+function protocolStep(title, status, tone, detail) {
+  return `<div class="ps-step ps-${tone}">
+    <span class="ps-title">${title}</span>
+    <span class="ps-status">${status}</span>
+    ${detail ? `<span class="ps-detail">${detail}</span>` : ""}
+  </div>`;
+}
+
+function updateProtocolStrip(decision) {
+  const strips = [document.getElementById("protocol-strip"),
+                  document.getElementById("rm-protocol-strip")].filter(Boolean);
+  if (!strips.length) return;
+  const status = decision.status || state.lastStatus;
+  const show = state.reviewType === "lbw" && status && status !== "WAITING";
+  if (!show) { strips.forEach((s) => { s.hidden = true; s.innerHTML = ""; }); return; }
+
+  // 1) FRONT FOOT (No Ball) — a no-ball makes the LBW dead, so it leads.
+  const nb = decision.no_ball_analysis || decision.noball || {};
+  let ff;
+  if (nb.is_no_ball === true) ff = protocolStep("1 · Front Foot", "NO BALL", "red", "delivery is illegal");
+  else if (nb.is_no_ball === false) {
+    const by = nb.distance_past_cm != null ? `${Math.abs(nb.distance_past_cm).toFixed(1)} cm behind` : "foot behind line";
+    ff = protocolStep("1 · Front Foot", "LEGAL", "green", by);
+  } else ff = protocolStep("1 · Front Foot", "NOT CHECKED", "amber", nb.reason || "no front-foot camera");
+
+  // 2) ULTRAEDGE — spike near impact means bat involved (inside edge → not out).
+  const edge = decision.edge_analysis || {};
+  let ue;
+  if (edge.available === false || edge.inconclusive) {
+    ue = protocolStep("2 · UltraEdge", "NO AUDIO", "amber", edge.reason || "stump mic not synced");
+  } else {
+    const events = edge.events || [];
+    const bat = events.some((e) => e.is_bat) || Number(edge.edge_probability || 0) >= 0.5;
+    ue = bat
+      ? protocolStep("2 · UltraEdge", "SPIKE", "amber", "possible bat contact")
+      : protocolStep("2 · UltraEdge", "NO SPIKE", "green", "no bat sound");
+  }
+
+  // 3) BALL TRACKING — the "is it hitting?" answer, from the canonical gates.
+  const gates = state.canonical?.results?.reconstruction?.gates;
+  let bt;
+  if (gates) {
+    const w = String(gates.wickets || "").toUpperCase();
+    const v = String(gates.verdict || "").toUpperCase();
+    const tone = w.includes("HIT") ? "red" : w.includes("MISS") ? "green" : "amber";
+    bt = protocolStep("3 · Ball Tracking", w || v || "—", tone,
+      `Pitch ${gates.pitching || "—"} · Impact ${gates.impact || "—"}`);
+  } else if (state.canonical && !state.canonical.results) {
+    bt = protocolStep("3 · Ball Tracking", "TRACKING…", "amber", "rendering the trajectory");
+  } else if (state.activeAppeal || status === "PROCESSING") {
+    bt = protocolStep("3 · Ball Tracking", "TRACKING…", "amber", "analysing the delivery");
+  } else {
+    bt = protocolStep("3 · Ball Tracking", "NO REPLAY", "amber", "trajectory not available");
+  }
+
+  const html = ff + ue + bt;
+  strips.forEach((s) => { s.hidden = false; s.innerHTML = html; });
+}
+
 // Review summary shown on result (commercial-style record)
 function renderReviewSummary(decision) {
+  updateProtocolStrip(decision);
   const status = decision.status || state.lastStatus;
   const resolved = status === "OUT" || status === "NOT_OUT";
   const mod = REVIEW_MODULES[state.reviewType] || {};
@@ -1605,8 +1666,6 @@ async function confirmDecision(outcome) {
   if (entry) { entry.status = "Completed"; entry.verdict = displayStatus(outcome); }
   renderQueue();
   showToast(`Confirmed: ${displayStatus(outcome)}`, statusClass(outcome));
-  // TV Output: verdict banner for the audience, then it returns to live itself.
-  programCmd({ type: "decision", outcome });
   // RESULT → IDLE: clear the active review and reset the backend to WAITING so
   // nothing from the verdict lingers (and the 5s poll can't snap it back)...
   finishActiveReview();
@@ -1954,21 +2013,35 @@ function resizeThree() {
 }
 
 function resetThreeCamera() {
+  if (!state.scene?.camera || !state.scene?.controls) return;
   state.scene.camera.position.set(8, 7, 12);
   state.scene.controls.target.set(0, 0, 0.55);
   state.scene.controls.update();
 }
 
-function replayTrajectory() {
-  if (state.lbwView === "broadcast" && state.broadcastReview) state.broadcastReview.play();
-  clearInterval(state.replayTimer);
-  state.replayFrame = 0;
-  state.replayTimer = setInterval(() => {
-    state.replayFrame = Math.min(100, state.replayFrame + 4);
-    els.frameTimeline.value = String(state.replayFrame);
-    els.frameLabel.textContent = `Frame ${state.replayFrame}`;
-    if (state.replayFrame >= 100) clearInterval(state.replayTimer);
-  }, 90);
+// Open the Replay workspace on the frozen buffer and start playback. Shared by
+// every "Replay" button (Review State panel + LBW analysis card). Gives honest
+// feedback when there is nothing buffered instead of a silent blank stage.
+async function openReplayWorkspace() {
+  // Review Mode is a fullscreen overlay that re-asserts on every poll — leaving it
+  // up would hide the replay workspace we're switching to (the "Replay button does
+  // nothing" bug). Exit it first so the workspace is actually visible.
+  if (ReviewMode.active) ReviewMode.exit();
+  setView("replay");
+  try {
+    let st = await jsonFetch("/api/replay/state");
+    if (!st || !st.total_frames) {
+      st = await jsonFetch("/api/replay/create", { method: "POST" });
+    }
+    if (!st || !st.total_frames) {
+      showToast("No buffered frames to replay yet", "out");
+      return;
+    }
+    await replayControl("seek", { frame_index: 0 });
+    await replayControl("play", { speed: Number(els.replaySpeed?.value || 1) });
+  } catch {
+    showToast("Replay unavailable — backend not reachable", "out");
+  }
 }
 
 async function replayControl(action, extra = {}) {
@@ -2019,7 +2092,7 @@ async function armReplayWorkspace() {
 
 // Broadcast-style UltraEdge panel over the Replay stage: the frozen window's
 // real waveform revealed to the cursor, spike frames cyan, markers for every
-// detected transient — the same visual language as the TV Output scene.
+// detected transient, in sync with the frozen-buffer playback.
 const replayUe = { key: null, buckets: [], events: [], available: false, pending: false };
 
 function replayUeEvents() {
@@ -2827,19 +2900,14 @@ function trackingHealthLabel(cameras) {
   return "low";
 }
 
-/* ===================== event wiring ===================== */
-els.requestReview.addEventListener("click", requestReview);
-els.confirmOut.addEventListener("click", () => confirmDecision("OUT"));
-els.confirmNotOut.addEventListener("click", () => confirmDecision("NOT_OUT"));
-els.resetReview.addEventListener("click", resetReview);
-els.openReplay?.addEventListener("click", async () => {
-  // Replay on a review = open the workspace ON the frozen buffer and play it.
-  setView("replay");
-  try {
-    await replayControl("seek", { frame_index: 0 });
-    await replayControl("play", { speed: Number(els.replaySpeed?.value || 1) });
-  } catch {}
-});
+/* ===================== event wiring =====================
+   All listeners use optional chaining: a single missing element id must never
+   throw here and abort the rest of startup (view init, websockets, timers). */
+els.requestReview?.addEventListener("click", requestReview);
+els.confirmOut?.addEventListener("click", () => confirmDecision("OUT"));
+els.confirmNotOut?.addEventListener("click", () => confirmDecision("NOT_OUT"));
+els.resetReview?.addEventListener("click", resetReview);
+els.openReplay?.addEventListener("click", openReplayWorkspace);
 els.exportReview?.addEventListener("click", async () => {
   // ONE export, browser-download style: a save dialog asks WHERE, the backend
   // renders the broadcast review clip (UltraEdge scene + verdict) to that path.
@@ -2934,20 +3002,16 @@ document.getElementById("rm-canonical-status")?.addEventListener("click", () => 
   setView("dashboard");
   document.getElementById("lbw-observed-btn")?.click();
 });
-els.replaySave?.addEventListener("click", () => showToast("Review saved", "not-out"));
-els.modeToggle.addEventListener("click", toggleMode);
-els.replayTrajectory.addEventListener("click", replayTrajectory);
-els.resetCamera.addEventListener("click", resetThreeCamera);
-els.replayPlay.addEventListener("click", () => replayControl("play", { speed: Number(els.replaySpeed.value) }));
-els.replayPause.addEventListener("click", () => replayControl("pause"));
-els.replayBack.addEventListener("click", () => replayControl("step_back"));
-els.replayForward.addEventListener("click", () => replayControl("step_forward"));
-els.replaySpeed.addEventListener("change", () => replayControl("speed", { speed: Number(els.replaySpeed.value) }));
-els.replayExport.addEventListener("click", () => {
-  if (state.animationSequencer?.results) state.animationSequencer.exportMP4();
-  else exportReplay();
-});
-els.frameTimeline.addEventListener("input", () => replayControl("seek", { frame_index: Number(els.frameTimeline.value) }));
+els.modeToggle?.addEventListener("click", toggleMode);
+els.replayTrajectory?.addEventListener("click", openReplayWorkspace);
+els.resetCamera?.addEventListener("click", resetThreeCamera);
+els.replayPlay?.addEventListener("click", () => replayControl("play", { speed: Number(els.replaySpeed.value) }));
+els.replayPause?.addEventListener("click", () => replayControl("pause"));
+els.replayBack?.addEventListener("click", () => replayControl("step_back"));
+els.replayForward?.addEventListener("click", () => replayControl("step_forward"));
+els.replaySpeed?.addEventListener("change", () => replayControl("speed", { speed: Number(els.replaySpeed.value) }));
+els.replayExport?.addEventListener("click", exportReplay);
+els.frameTimeline?.addEventListener("input", () => replayControl("seek", { frame_index: Number(els.frameTimeline.value) }));
 
 // Replay mode-driven controls (which of these EXIST is decided by the module contract).
 els.replayLayers?.addEventListener("change", (event) => {
@@ -3046,8 +3110,12 @@ document.querySelectorAll("[data-open-development-folder]").forEach((button) => 
       : `Open folder failed: ${result.message || "unknown error"}`;
   });
 });
-// view router (covers sidebar nav + inline back buttons)
-document.querySelectorAll("[data-view]").forEach((item) => {
+// View router: sidebar nav + inline back buttons only. Crucially EXCLUDE the
+// `<section class="view" data-view="...">` containers — binding navigation to
+// them meant any click inside a view (e.g. the LBW "Replay" button) bubbled up
+// and instantly setView'd back to that section, silently undoing the button's
+// own navigation. That was the "dashboard Replay button does nothing" bug.
+document.querySelectorAll("[data-view]:not(.view)").forEach((item) => {
   item.addEventListener("click", () => setView(item.dataset.view));
 });
 
@@ -3099,51 +3167,24 @@ window.addEventListener("resize", resizeThree);
 window.addEventListener("keydown", (event) => {
   if (event.target.matches("input, textarea")) return;
   const key = event.key.toLowerCase();
-  if (key === "r" && !state.activeAppeal) requestReview();
+  // "R" only requests from the dashboard while genuinely idle — mirror the button's
+  // own guards (hidden/disabled) so a double-press during the in-flight POST or a
+  // press from another view can't fire a second appeal.
+  if (key === "r" && !state.activeAppeal && state.view === "dashboard"
+      && els.requestReview && !els.requestReview.disabled && !els.requestReview.hidden) {
+    requestReview();
+  }
   if (key === "o" && state.activeAppeal) confirmDecision("OUT");
   if (key === "n" && state.activeAppeal) confirmDecision("NOT_OUT");
 });
 
 window.drs?.onStartupStatus?.((status) => {
+  // Optional dev-tool status — log it; never hijack the Decision card's explanation
+  // line with "install the React testing platform" text during a match.
   if (status?.testingPlatform?.status === "unavailable") {
-    els.explanation.textContent = status.testingPlatform.message;
+    console.info("[DRS] Testing platform:", status.testingPlatform.message);
   }
 });
-
-// ---- TV Output (clean review screen the streaming application captures) -----
-// One button, zero operator overhead during a review: the flow is automatic.
-// Appeal in -> UltraEdge scene plays on the TV window; pipeline replay ready ->
-// it plays once; operator confirms -> verdict banner -> back to live.
-const programOut = { open: false, lastReplayJob: null };
-
-function programCmd(cmd) {
-  if (!programOut.open) return;
-  window.drs?.sendProgramCommand?.(cmd);
-}
-
-async function sendReviewToProgram() {
-  if (!programOut.open || !state.decision) return;
-  let replayWindow = null;
-  try { replayWindow = await jsonFetch("/api/replay/state"); } catch {}
-  programCmd({
-    type: "load",
-    decision: state.decision,
-    window: replayWindow,
-    cameraId: getPrimaryCameraId(),
-  });
-}
-
-async function openProgramOutput() {
-  if (!window.drs?.openProgramOutput) return;
-  await window.drs.openProgramOutput();
-  programOut.open = true;
-  programCmd({ type: "live-config", cameraId: getPrimaryCameraId() });
-  if (state.activeAppeal) sendReviewToProgram();
-  showToast("TV Output open — add a Window Capture of “DRS TV Output” in your streaming app", "");
-}
-
-document.getElementById("open-program")?.addEventListener("click", openProgramOutput);
-window.drs?.onProgramOutputClosed?.(() => { programOut.open = false; });
 
 // initial UI state from persisted preferences
 applySidebarState();

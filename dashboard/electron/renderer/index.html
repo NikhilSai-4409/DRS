@@ -53,7 +53,6 @@
               <button id="mode-engineer" class="op-mode" type="button">Engineer Mode</button>
             </div>
             <button id="mode-toggle" type="button" title="Switch visible/demo thermal mode">Mode</button>
-            <button id="open-program" type="button" title="Clean review screen for the live stream — add a Window Capture of “DRS TV Output” in your streaming app">📺 TV Output</button>
             <button id="open-settings" type="button" title="Settings">⚙</button>
             <!-- Session identity: shows the operator once a session starts; click for
                  the full session card (teams, venue, model, calibration, started). -->
@@ -124,8 +123,8 @@
               <header class="card-h">
                 <div><strong id="detail-title">LBW Review</strong><small id="detail-sub">Ball-tracking trajectory</small></div>
                 <div class="scene-tools" id="lbw-tools">
-                  <button id="replay-trajectory" type="button">Replay</button>
-                  <button id="reset-camera" type="button">Reset View</button>
+                  <button id="replay-trajectory" type="button" title="Open the replay workspace and play the tracked delivery">▶ Replay</button>
+                  <button id="reset-camera" type="button" class="engineer-only" title="Engineer: reset the 3D camera view">Reset View</button>
                 </div>
               </header>
 
@@ -281,6 +280,10 @@
 
               <section id="review-summary" class="review-summary">
                 <strong class="rs-h">Review Summary</strong>
+                <!-- LBW 3-step protocol at a glance: Front Foot → UltraEdge → Ball
+                     Tracking, each green/red/amber. Built by updateProtocolStrip;
+                     shown only for LBW once a review is in progress. -->
+                <div class="protocol-strip" id="protocol-strip" hidden></div>
                 <!-- Rows are built per review type from the module's capability contract
                      (decision_card) + its typed summary.measurements — an Edge review
                      shows Spike/HotSpot, a Wide shows Guideline/Margin, never a shared
@@ -391,8 +394,7 @@
               <span id="frame-label">Frame 0</span>
               <button id="replay-jump-decision" type="button" hidden title="Seek to the frame the module decided on">Decision frame</button>
               <button id="replay-zoom" type="button" hidden title="2× magnifier on the stage">Zoom</button>
-              <button id="replay-export" type="button">Export MP4</button>
-              <button id="replay-save" type="button">Save Review</button>
+              <button id="replay-export" type="button" title="Export the buffered replay as an MP4">Export MP4</button>
             </div>
           </article>
         </section>
@@ -628,6 +630,9 @@
         <div class="rm-bar-sec rm-decision-sec">
           <span class="rm-label" id="rm-type">LBW</span>
           <div id="rm-verdict" class="rm-verdict reviewing">REVIEWING</div>
+          <!-- LBW 3-step protocol, mirrored from the dashboard strip so the operator
+               sees Front Foot → UltraEdge → Ball Tracking during the live review. -->
+          <div class="protocol-strip rm-protocol" id="rm-protocol-strip" hidden></div>
         </div>
         <div class="rm-bar-sec">
           <span class="rm-label">Replay Controls</span>

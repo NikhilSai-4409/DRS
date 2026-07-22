@@ -23,9 +23,4 @@ contextBridge.exposeInMainWorld("drs", {
   command: (name) => ipcRenderer.invoke("operator-command", name),
   // Save-dialog-first broadcast export: main asks where, backend renders there.
   exportBroadcast: (opts) => ipcRenderer.invoke("export-broadcast", opts),
-  // TV Output window (clean review screen for the live stream) + its relay.
-  openProgramOutput: () => ipcRenderer.invoke("open-program-output"),
-  sendProgramCommand: (cmd) => ipcRenderer.invoke("program-command", cmd),
-  onProgramCommand: (cb) => ipcRenderer.on("program-command", (_event, cmd) => cb(cmd)),
-  onProgramOutputClosed: (cb) => ipcRenderer.on("program-output-closed", () => cb()),
 });
