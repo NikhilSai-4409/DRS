@@ -2646,6 +2646,12 @@ function paintReviews() {
 // review experience: reopening feels like the original session, not a replay jump.
 async function openReviewFromHistory(reviewId) {
   if (!reviewId) return;
+  // Never let a read-only restore collide with a LIVE review in flight — that left
+  // the two fighting over Review Mode. One review experience: finish first.
+  if (ReviewMode.active && !ReviewMode.restored) {
+    showToast("Finish or cancel the current review first", "out");
+    return;
+  }
   let decision;
   try {
     decision = await jsonFetch(`/api/reviews/${encodeURIComponent(reviewId)}/full`);
