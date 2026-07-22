@@ -31,6 +31,7 @@ if (!app.isPackaged) {
 let engineProcess = null;
 let testingPlatformProcess = null;
 let mainWindow = null;
+let programWindow = null;
 
 const startupState = {
   engine: { status: "pending", message: "Starting backend..." },
@@ -67,6 +68,39 @@ function createWindow() {
   loadLoadingScreen(startupState.engine.message);
   mainWindow.on("closed", () => {
     mainWindow = null;
+  });
+}
+
+// TV Output — the clean review screen for the live stream. The operator's
+// streaming application adds a Window Capture of "DRS TV Output" and cuts to it
+// during reviews; the flow inside is fully automatic (driven by the dashboard
+// over the program-command relay), so the audience never sees operator UI.
+function createProgramWindow() {
+  if (programWindow) {
+    programWindow.focus();
+    return;
+  }
+  programWindow = new BrowserWindow({
+    width: 1280,
+    height: 720,
+    useContentSize: true,
+    backgroundColor: "#000000",
+    autoHideMenuBar: true,
+    title: "DRS TV Output",
+    show: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  const file = path.join(__dirname, "renderer", "program-output.html");
+  programWindow.loadURL(pathToFileURL(file).toString()).catch((error) => {
+    logError("TV Output load failed:", error.message);
+  });
+  programWindow.on("closed", () => {
+    programWindow = null;
+    mainWindow?.webContents.send("program-output-closed");
   });
 }
 
@@ -462,6 +496,15 @@ ipcMain.handle("get-startup-status", async () => startupState);
 ipcMain.handle("get-ai-development-status", async () => runDevelopmentJson(["status"]));
 ipcMain.handle("run-ai-development-command", async (_event, name) => runDevelopmentCommand(name));
 ipcMain.handle("open-vision-studio", async (_event, opts = {}) => openVisionStudio(opts));
+ipcMain.handle("open-program-output", async () => {
+  createProgramWindow();
+  return { open: true };
+});
+ipcMain.handle("program-command", async (_event, command) => {
+  if (!programWindow) return { delivered: false };
+  programWindow.webContents.send("program-command", command);
+  return { delivered: true };
+});
 // Export the review's broadcast MP4: ask WHERE first (native save dialog, like
 // a browser download), then have the backend render straight to that path, then
 // reveal the file for drag-into-the-streaming-app.

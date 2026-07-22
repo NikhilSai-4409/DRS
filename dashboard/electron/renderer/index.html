@@ -53,6 +53,7 @@
               <button id="mode-engineer" class="op-mode" type="button">Engineer Mode</button>
             </div>
             <button id="mode-toggle" type="button" title="Switch visible/demo thermal mode">Mode</button>
+            <button id="open-program" type="button" title="Clean review screen for the live stream — add a Window Capture of “DRS TV Output” in your streaming app">📺 TV Output</button>
             <button id="open-settings" type="button" title="Settings">⚙</button>
             <!-- Session identity: shows the operator once a session starts; click for
                  the full session card (teams, venue, model, calibration, started). -->
@@ -357,6 +358,13 @@
                   <text id="rp-crease-label" x="16" y="436" class="rp-guide-text">Popping crease (schematic — calibrate to measure)</text>
                 </g>
               </svg>
+              <!-- Broadcast-style UltraEdge panel over the video: real waveform
+                   revealed to the cursor, spike frames highlighted, in sync with
+                   the frozen buffer playback. Hidden when no audio and no events. -->
+              <div id="replay-ue-panel" class="replay-ue-panel" hidden>
+                <span class="ruep-tab">ULTRA EDGE</span>
+                <canvas id="replay-ue-canvas" width="1178" height="150"></canvas>
+              </div>
             </div>
             <!-- Audio/spike timeline (Edge reviews): spike markers when UltraEdge events
                  exist; otherwise the module's honest reason (e.g. "no stump-mic audio"). -->

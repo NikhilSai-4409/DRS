@@ -745,6 +745,9 @@ function renderDecision(decision) {
     state.reviewElapsed = state.reviewStartMs ? (Date.now() - state.reviewStartMs) / 1000 : null;
   }
   state.lastStatus = status;
+  // A fresh appeal freezes the replay buffer + attaches edge_analysis — the TV
+  // Output window starts showing the review to the live audience immediately.
+  if (justResolved) sendReviewToProgram();
   if (justResolved && !state.revealing) {
     playDecisionReveal(status, decision);
   } else if (!state.revealing) {
@@ -881,6 +884,12 @@ function syncCanonicalSurfaces() {
   const ready = Boolean(c && c.results && (c.results.exports || {}).replay_players);
   document.getElementById("lbw-observed-btn")?.classList.toggle("ready", ready);
   document.getElementById("lbw-clean-btn")?.classList.toggle("ready", ready && Boolean((c.results.exports || {}).replay_review));
+  // Ball-tracking replay finished mid-review -> play it once on the TV Output.
+  if (ready && programOut.open && state.activeAppeal && c.jobId !== programOut.lastReplayJob
+      && (c.results.exports || {}).replay_review) {
+    programOut.lastReplayJob = c.jobId;
+    programCmd({ type: "replay-video", url: `${API_BASE}/api/testing/jobs/${c.jobId}/exports/replay_review` });
+  }
   if (c && c.results) {
     setCanonicalChip(ready ? "DRS replay ready ✓ — view" : "Analysis done — no replay (see DRS Replay tab)", ready);
   } else if (!c) {
@@ -1596,6 +1605,8 @@ async function confirmDecision(outcome) {
   if (entry) { entry.status = "Completed"; entry.verdict = displayStatus(outcome); }
   renderQueue();
   showToast(`Confirmed: ${displayStatus(outcome)}`, statusClass(outcome));
+  // TV Output: verdict banner for the audience, then it returns to live itself.
+  programCmd({ type: "decision", outcome });
   // RESULT → IDLE: clear the active review and reset the backend to WAITING so
   // nothing from the verdict lingers (and the 5s poll can't snap it back)...
   finishActiveReview();
@@ -1986,6 +1997,8 @@ function showReplayBufferFrame(payload) {
   const cams = payload.camera_ids || [];
   if (!payload.total_frames || !cams.length) {
     state.replayArmed = false;
+    const uePanel = document.getElementById("replay-ue-panel");
+    if (uePanel) uePanel.hidden = true;
     return;
   }
   state.replayArmed = true;
@@ -1994,12 +2007,87 @@ function showReplayBufferFrame(payload) {
   if (els.replayFeed) {
     els.replayFeed.src = `${API_BASE}/api/replay/${cam}.jpg?frame_index=${Number(payload.cursor || 0)}&t=${Date.now()}`;
   }
+  armReplayUePanel(payload);
+  drawReplayUePanel(payload);
 }
 
 // Entering the Replay view (or clicking Replay on a review) attaches to the
 // existing frozen buffer via GET state — read-only, never clobbers the snapshot.
 async function armReplayWorkspace() {
   try { renderReplayState(await jsonFetch("/api/replay/state")); } catch {}
+}
+
+// Broadcast-style UltraEdge panel over the Replay stage: the frozen window's
+// real waveform revealed to the cursor, spike frames cyan, markers for every
+// detected transient — the same visual language as the TV Output scene.
+const replayUe = { key: null, buckets: [], events: [], available: false, pending: false };
+
+function replayUeEvents() {
+  return (state.decision?.edge_analysis?.events || [])
+    .map((e) => Number(e.frame_id ?? e.frame))
+    .filter((f) => Number.isFinite(f));
+}
+
+async function armReplayUePanel(payload) {
+  const key = `${payload.start_timestamp_ms}|${payload.end_timestamp_ms}|${payload.total_frames}`;
+  if (replayUe.key === key || replayUe.pending) return;
+  replayUe.pending = true;
+  replayUe.key = key;
+  replayUe.buckets = [];
+  replayUe.available = false;
+  try {
+    const buckets = Math.max(240, Math.min(3600, Number(payload.total_frames || 0) * 3));
+    const wf = await jsonFetch(`/api/audio/waveform?start_ms=${payload.start_timestamp_ms}&end_ms=${payload.end_timestamp_ms}&buckets=${buckets}`);
+    if (wf.available) { replayUe.buckets = wf.buckets; replayUe.available = true; }
+  } catch {}
+  replayUe.pending = false;
+  drawReplayUePanel(payload);
+}
+
+function drawReplayUePanel(payload) {
+  const host = document.getElementById("replay-ue-panel");
+  const canvas = document.getElementById("replay-ue-canvas");
+  if (!host || !canvas) return;
+  replayUe.events = replayUeEvents();
+  const total = Number(payload.total_frames || 0);
+  const show = Boolean(state.replayArmed && total > 0 && (replayUe.available || replayUe.events.length));
+  host.hidden = !show;
+  if (!show) return;
+  const ctx2 = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height, PADX = 20;
+  const plotW = W - PADX * 2, mid = H / 2, amp = H * 0.4;
+  const cursor = Number(payload.cursor || 0);
+  ctx2.clearRect(0, 0, W, H);
+  ctx2.strokeStyle = "rgba(140,175,195,0.3)";
+  ctx2.lineWidth = 1;
+  ctx2.beginPath(); ctx2.moveTo(PADX, mid); ctx2.lineTo(W - PADX, mid); ctx2.stroke();
+  const nb = replayUe.buckets.length;
+  if (nb) {
+    const revealed = Math.floor(((cursor + 1) / total) * nb);
+    const bw = Math.max(1, (plotW / nb) * 0.6);
+    for (let b = 0; b < revealed && b < nb; b++) {
+      const frame = Math.floor((b / nb) * total);
+      const spike = replayUe.events.some((f) => Math.abs(f - frame) <= 1);
+      const x = PADX + (plotW * (b + 0.5)) / nb;
+      ctx2.strokeStyle = spike ? "#7df0ff" : "rgba(238,248,252,0.9)";
+      ctx2.lineWidth = bw;
+      ctx2.beginPath();
+      ctx2.moveTo(x, mid - replayUe.buckets[b][1] * amp - 0.5);
+      ctx2.lineTo(x, mid - replayUe.buckets[b][0] * amp + 0.5);
+      ctx2.stroke();
+    }
+  }
+  ctx2.fillStyle = "#ff5252";
+  replayUe.events.forEach((f) => {
+    const x = PADX + (plotW * (f + 0.5)) / total;
+    ctx2.beginPath();
+    ctx2.moveTo(x, H - 16); ctx2.lineTo(x - 5, H - 6); ctx2.lineTo(x + 5, H - 6);
+    ctx2.closePath(); ctx2.fill();
+  });
+  const cxp = PADX + plotW * Math.min(1, (cursor + 1) / total);
+  ctx2.strokeStyle = "#ffffff";
+  ctx2.lineWidth = 2;
+  ctx2.beginPath(); ctx2.moveTo(cxp, 4); ctx2.lineTo(cxp, H - 4); ctx2.stroke();
 }
 
 // While the backend replay is playing its cursor advances server-side; poll the
@@ -3021,6 +3109,41 @@ window.drs?.onStartupStatus?.((status) => {
     els.explanation.textContent = status.testingPlatform.message;
   }
 });
+
+// ---- TV Output (clean review screen the streaming application captures) -----
+// One button, zero operator overhead during a review: the flow is automatic.
+// Appeal in -> UltraEdge scene plays on the TV window; pipeline replay ready ->
+// it plays once; operator confirms -> verdict banner -> back to live.
+const programOut = { open: false, lastReplayJob: null };
+
+function programCmd(cmd) {
+  if (!programOut.open) return;
+  window.drs?.sendProgramCommand?.(cmd);
+}
+
+async function sendReviewToProgram() {
+  if (!programOut.open || !state.decision) return;
+  let replayWindow = null;
+  try { replayWindow = await jsonFetch("/api/replay/state"); } catch {}
+  programCmd({
+    type: "load",
+    decision: state.decision,
+    window: replayWindow,
+    cameraId: getPrimaryCameraId(),
+  });
+}
+
+async function openProgramOutput() {
+  if (!window.drs?.openProgramOutput) return;
+  await window.drs.openProgramOutput();
+  programOut.open = true;
+  programCmd({ type: "live-config", cameraId: getPrimaryCameraId() });
+  if (state.activeAppeal) sendReviewToProgram();
+  showToast("TV Output open — add a Window Capture of “DRS TV Output” in your streaming app", "");
+}
+
+document.getElementById("open-program")?.addEventListener("click", openProgramOutput);
+window.drs?.onProgramOutputClosed?.(() => { programOut.open = false; });
 
 // initial UI state from persisted preferences
 applySidebarState();
