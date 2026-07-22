@@ -185,9 +185,17 @@ class DRSBackend:
         if self.active_replay is None:
             meta = self.create_replay()
         else:
+            # Same shape as create_replay()'s meta (incl. the capture-time window) so
+            # readers can attach to the EXISTING frozen snapshot — e.g. Sync Replay
+            # reuses the review's timeline instead of clobbering it with a new one.
+            timestamps = []
+            for buffer in self.active_replay.buffers.values():
+                timestamps.extend(item.timestamp_ms for item in buffer)
             meta = {
                 "total_frames": self.active_replay.total_frames,
                 "camera_ids": sorted(self.active_replay.buffers.keys()),
+                "start_timestamp_ms": min(timestamps) if timestamps else None,
+                "end_timestamp_ms": max(timestamps) if timestamps else None,
             }
         assert self.active_replay is not None
         self.active_replay.tick()

@@ -2058,18 +2058,27 @@ function drawReplayAudio(decision) {
    frames independently, so index N is a different moment per camera). */
 const SyncReplay = {
   meta: null, cams: [], t: 0, speed: 1, timer: null,
-  // View entry: load once. (Clicks INSIDE the view bubble to the data-view router and
-  // re-enter here — reloading then would re-snapshot the buffer and rebuild the panes
-  // mid-playback. The "Load replay buffer" button is the explicit refresh.)
-  async ensure() { if (!this.meta) await this.load(); },
-  async load() {
+  // View entry ATTACHES to the existing frozen snapshot (GET state — no side effect),
+  // so after any review this page shows the SAME timeline the review captured. The
+  // "Capture fresh buffer" button is the only thing that takes a new snapshot.
+  async ensure() { await this.load(false); },
+  async load(fresh) {
     try {
-      const meta = await jsonFetch("/api/replay/create", { method: "POST" });
-      this.meta = meta;
+      const meta = fresh
+        ? await jsonFetch("/api/replay/create", { method: "POST" })
+        : await jsonFetch("/api/replay/state");
+      // Same frozen window as before → keep playback position and panes untouched
+      // (view-router re-entry fires this on every internal click).
+      const same = this.meta
+        && meta.start_timestamp_ms === this.meta.start_timestamp_ms
+        && meta.end_timestamp_ms === this.meta.end_timestamp_ms;
+      this.meta = { ...this.meta, ...meta };
       const available = meta.camera_ids || [];
       if (!this.cams.length) this.cams = available.slice(0, 2);
       this.cams = this.cams.filter((id) => available.includes(id));
       this.renderPills(available);
+      if (same) return;
+      this.pause();
       this.renderPanes();
       if (meta.start_timestamp_ms != null) {
         this.show(meta.start_timestamp_ms);
@@ -2729,7 +2738,8 @@ document.addEventListener("click", (event) => {
 });
 
 // Sync Replay: one master timeline drives every selected camera pane.
-document.getElementById("syncrep-load")?.addEventListener("click", () => SyncReplay.load());
+// The button is the ONLY fresh snapshot; view entry attaches to the existing one.
+document.getElementById("syncrep-load")?.addEventListener("click", () => SyncReplay.load(true));
 document.getElementById("syncrep-play")?.addEventListener("click", () => SyncReplay.play());
 document.getElementById("syncrep-pause")?.addEventListener("click", () => SyncReplay.pause());
 document.getElementById("syncrep-back")?.addEventListener("click", () => SyncReplay.step(-1));
