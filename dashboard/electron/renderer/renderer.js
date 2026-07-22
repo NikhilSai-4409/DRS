@@ -807,9 +807,14 @@ function watchCanonicalReview(decision) {
   const jobId = decision?.canonical_job_id;
   if (!jobId) {
     // honesty rule: name the reason, never fabricate a replay
-    setCanonicalNotes(decision?.canonical_skip_reason
-      ? `<div class="cr-note">No DRS replay — ${decision.canonical_skip_reason}</div>`
-      : `<div class="cr-note quiet">No pipeline replay for this review type.</div>`);
+    const why = decision?.canonical_skip_reason
+      ? `No DRS replay — ${decision.canonical_skip_reason}`
+      : "No pipeline replay for this review type.";
+    setCanonicalNotes(`<div class="cr-note quiet">${why}</div>`);
+    if (ReviewMode.active) {
+      ["rm-observed", "rm-broadcast"].forEach((id) => { const b = document.getElementById(id); if (b) b.innerHTML = `<div class="rm2-noreplay">${why}</div>`; });
+      ReviewMode.setStep("bt", "failed");
+    }
     return;
   }
   _canonicalJobWatching = jobId;
@@ -834,6 +839,7 @@ function watchCanonicalReview(decision) {
             const step = st.current_step || st.step || "processing";
             setCanonicalNotes(`<div class="cr-note">DRS analysis ${pct ? `${pct}% — ` : "running… "}${step}</div>`);
             setCanonicalChip(`Replay rendering ${pct ? `${pct}%` : "…"}`, false);
+            if (ReviewMode.active) ReviewMode.renderPending(`Rendering replay… ${pct ? pct + "%" : ""}`);
           }
         } catch { /* status endpoint unavailable — keep the previous note */ }
         setTimeout(poll, 3000); return;
@@ -842,6 +848,7 @@ function watchCanonicalReview(decision) {
       state.canonical = { jobId, results };
       if (hosts.observed) renderCanonicalReview(hosts.observed, jobId, results, "players");
       if (hosts.clean) renderCanonicalReview(hosts.clean, jobId, results, "review");
+      if (ReviewMode.active) ReviewMode.setCanonical(jobId, results);   // the single review workspace
       syncCanonicalSurfaces();                             // badge the tabs + mirror into Replay
     } catch { setTimeout(poll, 3000); }
   };
@@ -1714,172 +1721,110 @@ function finishActiveReview() {
 }
 
 /* ============================ REVIEW MODE ============================ */
-// One immersive review environment for every review type. It only consumes
-// decision.overlay (the shared OverlayPayload) through ReviewPlayer, so the centre
-// canvas adapts to the review type while the surrounding chrome stays identical.
+// The single review workspace: one screen from Request Review to Decision.
+// Top = protocol progress (① Front Foot ② UltraEdge ③ Ball Tracking), middle =
+// both pipeline replays always visible, bottom = gates + verdict + decision.
+// No separate replay page, no tabs, no hidden evidence.
 const ReviewMode = {
-  player: null, el: null, active: false, feedTimer: null,
-  // Captured-video replay: when the ANIMATION has no data (no tracked ball), the
-  // controls drive the backend replay buffer — the actual captured delivery footage —
-  // so the scrubber and speeds always work on a real review.
-  videoReplay: { armed: false, total: 0, frame: 0, speed: 1, timer: null, camId: 0 },
+  el: null, active: false, jobId: null,
   ensure() {
-    if (this.player) return this.player;
+    if (this.el) return;
     this.el = document.getElementById("review-mode");
-    this.player = new ReviewPlayer(document.getElementById("review-canvas"));
-    this.player.onProgress = (p) => this.onProgress(p);
-    document.getElementById("rm-back").addEventListener("click", () => this.exit());
-    document.getElementById("rm-replay").addEventListener("click", () => {
-      if (this.player.hasReplayData()) this.player.restart();
-      else if (this.videoReplay.armed) this.playVideoReplay(true);
-    });
-    document.getElementById("rm-scrub").addEventListener("input", (e) => {
-      if (this.player.hasReplayData()) { this.player.pause(); this.player.seek(Number(e.target.value) / 100); }
-      else if (this.videoReplay.armed) { this.stopVideoReplay(); this.showReplayFrame(Number(e.target.value)); }
-    });
-    // Slow-motion presets (0.1x–2x): set the rate and immediately replay at it.
-    document.querySelectorAll("#review-mode .rm-speed").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const speed = Number(btn.dataset.speed) || 1;
-        this.player.setSpeed(speed);
-        this.videoReplay.speed = speed;
-        document.querySelectorAll("#review-mode .rm-speed").forEach((b) => b.classList.toggle("active", b === btn));
-        if (this.player.hasReplayData()) this.player.restart();
-        else if (this.videoReplay.armed && this.videoReplay.timer) this.playVideoReplay(false);
-      });
-    });
+    // Back to Dashboard = cancel this review cleanly (reset the backend to WAITING),
+    // never leave a zombie review running that blocks the next Request Review.
+    document.getElementById("rm-back").addEventListener("click", () => { if (this.active) resetReview(); });
     document.getElementById("rm-confirm-out").addEventListener("click", () => confirmDecision("OUT"));
     document.getElementById("rm-confirm-not-out").addEventListener("click", () => confirmDecision("NOT_OUT"));
-    return this.player;
   },
-
-  // ---- captured-video replay (backend replay buffer) ----
-  async armVideoReplay() {
-    try {
-      const st = await jsonFetch("/api/replay/state");
-      const total = Number(st.total_frames || 0);
-      if (!total) return false;
-      const vr = this.videoReplay;
-      vr.total = total; vr.frame = 0; vr.armed = true;
-      vr.camId = getPrimaryCameraId() ?? 0;
-      const scrub = document.getElementById("rm-scrub");
-      if (scrub && !this.player.hasReplayData()) { scrub.max = String(Math.max(1, total - 1)); scrub.value = "0"; }
-      this.syncReplayControls();
-      return true;
-    } catch { return false; }
+  setStep(key, cls) {
+    const el = this.el && this.el.querySelector(`#rm-steps .rm2-step[data-step="${key}"]`);
+    if (el) el.className = `rm2-step ${cls}`;
   },
-  showReplayFrame(index) {
-    const vr = this.videoReplay;
-    vr.frame = Math.max(0, Math.min(vr.total - 1, Math.round(index)));
-    clearInterval(this.feedTimer);          // leave LIVE view the moment the operator scrubs
-    const img = new Image();
-    img.onload = () => this.player.setFeedImage(img);
-    img.src = `${API_BASE}/api/replay/${vr.camId}.jpg?frame_index=${vr.frame}&t=${Date.now()}`;
-    const scrub = document.getElementById("rm-scrub");
-    if (scrub) scrub.value = String(vr.frame);
+  renderPending(text) {
+    if (!this.el) return;
+    const html = `<div class="rm2-rendering"><span>${text || "Rendering replay…"}</span><div class="rm2-bar"><i></i></div></div>`;
+    ["rm-observed", "rm-broadcast"].forEach((id) => { const b = document.getElementById(id); if (b && !b.querySelector("video")) b.innerHTML = html; });
   },
-  playVideoReplay(fromStart) {
-    const vr = this.videoReplay;
-    if (!vr.armed) return;
-    clearInterval(vr.timer);
-    if (fromStart) vr.frame = 0;
-    // Client-side playback clock: one buffered frame per tick, tick rate = 30fps × speed.
-    vr.timer = setInterval(() => {
-      if (vr.frame >= vr.total - 1) { clearInterval(vr.timer); vr.timer = null; return; }
-      this.showReplayFrame(vr.frame + 1);
-    }, Math.max(16, Math.round(1000 / (30 * vr.speed))));
+  renderVideo(boxId, jobId, results, key) {
+    const box = document.getElementById(boxId);
+    if (!box) return;
+    const ex = results.exports || {};
+    if (!ex[key]) {
+      const t = results.trajectory || {};
+      const why = t.valid === false
+        ? `trajectory rejected: ${(t.reasons || []).join("; ") || t.observed?.end_reason || "invalid"}`
+        : "replay not available for this delivery";
+      box.innerHTML = `<div class="rm2-noreplay">No replay — ${why}</div>`;
+      return;
+    }
+    box.innerHTML = `<video muted playsinline controls autoplay loop src="${API_BASE}/api/testing/jobs/${jobId}/exports/${key}"></video>`;
   },
-  stopVideoReplay() {
-    clearInterval(this.videoReplay.timer);
-    this.videoReplay.timer = null;
-  },
-  syncReplayControls() {
-    const hasAnim = this.player.hasReplayData();
-    const hasVideo = this.videoReplay.armed;
-    const usable = hasAnim || hasVideo;
-    const replayBtn = document.getElementById("rm-replay");
-    replayBtn.disabled = !usable;
-    replayBtn.textContent = hasAnim ? "⟲ Replay" : hasVideo ? "⟲ Replay captured" : "No replay data";
-    document.getElementById("rm-scrub").disabled = !usable;
-    document.querySelectorAll("#review-mode .rm-speed").forEach((b) => { b.disabled = !usable; });
-    if (hasAnim) { const s = document.getElementById("rm-scrub"); s.max = "100"; }
+  // Called when the canonical job's results land (from watchCanonicalReview).
+  setCanonical(jobId, results) {
+    if (!this.active || !results) return;
+    this.renderVideo("rm-observed", jobId, results, "replay_players");
+    this.renderVideo("rm-broadcast", jobId, results, "replay_review");
+    const g = results.reconstruction && results.reconstruction.gates;
+    document.getElementById("rm-gate-pitching").textContent = (g && g.pitching) || "—";
+    document.getElementById("rm-gate-impact").textContent = (g && g.impact) || "—";
+    document.getElementById("rm-gate-wickets").textContent = (g && g.wickets) || "—";
+    this.setStep("bt", g ? "complete" : "failed");
   },
   enter(decision) {
     this.ensure();
     this.active = true;
-    this._lastP = 0;   // start hidden; the director reveals everything progressively
-    // Fresh appeal → fresh replay buffer: re-arm the captured-video controls.
-    this.stopVideoReplay();
-    this.videoReplay.armed = false;
+    this.jobId = null;
     document.body.classList.add("review-active");
     this.el.classList.add("open");
     this.el.setAttribute("aria-hidden", "false");
     const mod = REVIEW_MODULES[decision.review_type || state.reviewType];
-    document.getElementById("rm-type").textContent = (mod && mod.label) || "Review";
-    this.loadFeed();
+    document.getElementById("rm-type").textContent = `${(mod && mod.label) || "Review"} REVIEW`.toUpperCase();
+    ["ff", "ue", "bt"].forEach((k) => this.setStep(k, "processing"));
+    document.getElementById("rm-gate-pitching").textContent = "—";
+    document.getElementById("rm-gate-impact").textContent = "—";
+    document.getElementById("rm-gate-wickets").textContent = "—";
+    this.renderPending("Rendering replay…");
     this.update(decision);
-    this.player.restart();
   },
-  // Re-play the animation once the real decision (overlay + verdict) has arrived.
-  play(decision) {
-    if (!this.active) return this.enter(decision);
-    this._lastP = 0;
-    document.getElementById("rm-verdict").classList.remove("revealed");
-    this.update(decision);
-    this.player.restart();
-  },
+  // Kept for call-site compatibility (requestReview): real decision arrived.
+  play(decision) { if (!this.active) return this.enter(decision); this.update(decision); },
   update(decision) {
     if (!this.active) return;
-    const rr = decision.review_result || {};
-    this.player.setPayload(decision.overlay || { review_type: decision.review_type, verdict: rr.verdict, confidence: rr.confidence, measurements: rr.measurements });
-    // Controls always work on SOMETHING real: the animation when a trajectory
-    // exists, else the captured delivery footage from the backend replay buffer
-    // (armed asynchronously — syncReplayControls re-runs when it lands).
-    this.syncReplayControls();
-    if (!this.player.hasReplayData() && !this.videoReplay.armed) this.armVideoReplay();
     const status = decision.status || "PROCESSING";
+    const processing = status === "PROCESSING";
+    // ① Front Foot
+    const nb = decision.no_ball_analysis || decision.noball || {};
+    if (nb.is_no_ball === true || nb.is_no_ball === false) this.setStep("ff", "complete");
+    else if (nb.reason && /no .*camera|not available|unavailable/i.test(nb.reason)) this.setStep("ff", "failed");
+    else this.setStep("ff", processing ? "processing" : "waiting");
+    // ② UltraEdge
+    const edge = decision.edge_analysis || {};
+    if (edge.available === false) this.setStep("ue", "failed");
+    else if (edge.edge_probability != null || (edge.events && edge.events.length) || edge.inconclusive != null) this.setStep("ue", "complete");
+    else this.setStep("ue", processing ? "processing" : "waiting");
+    // ③ Ball Tracking — canonical drives complete/failed; here set the interim state
+    if (decision.canonical_skip_reason) this.setStep("bt", "failed");
+    else if (state.canonical && state.canonical.results) this.setCanonical(state.canonical.jobId, state.canonical.results);
+    else this.setStep("bt", processing ? "processing" : "waiting");
+    // Verdict + actions
+    const rr = decision.review_result || {};
     const resolved = status === "OUT" || status === "NOT_OUT";
     const v = document.getElementById("rm-verdict");
-    const wasRevealed = v.classList.contains("revealed");
-    v.className = "rm-verdict " + (status === "OUT" ? "out" : status === "NOT_OUT" ? "not-out" : "reviewing") + (wasRevealed ? " revealed" : "");
+    v.className = "rm-verdict " + (status === "OUT" ? "out" : status === "NOT_OUT" ? "not-out" : "reviewing");
     v.textContent = resolved ? displayStatus(status) : (rr.verdict && rr.verdict !== "AWAITING" ? rr.verdict : "REVIEWING");
     document.getElementById("rm-confirm-out").hidden = resolved;
     document.getElementById("rm-confirm-not-out").hidden = resolved;
-    this.applyProgress(this._lastP == null ? 1 : this._lastP);
-  },
-  // Progressive reveal: the timeline lights up and the verdict appears in step with
-  // the AnimationDirector's pacing on the canvas — never all at once.
-  applyProgress(p) {
-    const completeBy = [0.05, 0.45, 0.64, 0.99];   // appeal / tracking / prediction / decision
-    const activeFrom = [0.0, 0.18, 0.47, 0.88];
-    document.querySelectorAll("#rm-timeline .rm-step").forEach((step, i) => {
-      step.className = "rm-step " + (p >= completeBy[i] ? "complete" : p >= activeFrom[i] ? "active" : "");
-    });
-    document.getElementById("rm-verdict").classList.toggle("revealed", p >= 0.9);
-  },
-  onProgress(p) {
-    this._lastP = p;
-    const bar = document.getElementById("rm-progress-bar");
-    if (bar) bar.style.width = Math.round(p * 100) + "%";
-    const scrub = document.getElementById("rm-scrub");
-    if (scrub && this.player.playing) scrub.value = Math.round(p * 100);
-    this.applyProgress(p);
-  },
-  loadFeed() {
-    const camId = getPrimaryCameraId();
-    if (camId == null) return;
-    const draw = () => { const img = new Image(); img.onload = () => this.player.setFeedImage(img); img.src = `${API_BASE}/api/live/${camId}.jpg?t=${Date.now()}`; };
-    draw();
-    clearInterval(this.feedTimer);
-    this.feedTimer = setInterval(draw, 200);
   },
   exit() {
     this.active = false;
-    if (this.player) this.player.pause();
-    clearInterval(this.feedTimer);
-    this.stopVideoReplay();
+    this.jobId = null;
     document.body.classList.remove("review-active");
-    if (this.el) { this.el.classList.remove("open"); this.el.setAttribute("aria-hidden", "true"); }
+    if (this.el) {
+      this.el.classList.remove("open");
+      this.el.setAttribute("aria-hidden", "true");
+      // Release any playing <video> so decoders/timers don't linger after close.
+      this.el.querySelectorAll("video").forEach((v) => { try { v.pause(); v.removeAttribute("src"); v.load(); } catch {} });
+    }
   },
 };
 window.__reviewMode = ReviewMode;
@@ -3005,12 +2950,6 @@ document.getElementById("syncrep-cams")?.addEventListener("click", (e) => {
   SyncReplay.renderPills(SyncReplay.meta?.camera_ids || []);
   SyncReplay.renderPanes();
   SyncReplay.show(SyncReplay.t);
-});
-// Review Mode chip → exit the overlay and land on the Observed Trajectory replay.
-document.getElementById("rm-canonical-status")?.addEventListener("click", () => {
-  document.getElementById("rm-back")?.click();
-  setView("dashboard");
-  document.getElementById("lbw-observed-btn")?.click();
 });
 els.modeToggle?.addEventListener("click", toggleMode);
 els.replayTrajectory?.addEventListener("click", openReplayWorkspace);

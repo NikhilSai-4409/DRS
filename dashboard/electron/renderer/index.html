@@ -615,53 +615,46 @@
       </main>
     </div>
 
-    <!-- ============================ REVIEW MODE (immersive appeal environment) ============================ -->
+    <!-- ============================ REVIEW MODE (the single review workspace) ============================
+         One screen from Request Review to Decision — no jumping to a separate replay
+         page. Three zones: top = protocol progress, middle = both replays, bottom =
+         gates + verdict. All evidence visible together; no tabs, no hidden overlays. -->
     <div id="review-mode" class="review-mode" aria-hidden="true">
-      <div class="rm-stage">
-        <canvas id="review-canvas" width="1280" height="720"></canvas>
-      </div>
-      <div class="rm-bar">
-        <div class="rm-bar-sec">
-          <span class="rm-label">Timeline</span>
-          <div id="rm-timeline" class="rm-timeline">
-            <div class="rm-step" data-step="appeal"><i></i><span>Appeal</span></div>
-            <div class="rm-step" data-step="tracking"><i></i><span>Tracking</span></div>
-            <div class="rm-step" data-step="prediction"><i></i><span>Prediction</span></div>
-            <div class="rm-step" data-step="decision"><i></i><span>Decision</span></div>
+      <div class="rm2">
+        <!-- TOP: protocol progress (colour = state: waiting/processing/complete/failed) -->
+        <div class="rm2-top">
+          <span class="rm2-title" id="rm-type">LBW REVIEW</span>
+          <div class="rm2-steps" id="rm-steps">
+            <div class="rm2-step waiting" data-step="ff"><span class="rm2-num">1</span><span class="rm2-lbl">Front Foot</span></div>
+            <div class="rm2-step waiting" data-step="ue"><span class="rm2-num">2</span><span class="rm2-lbl">UltraEdge</span></div>
+            <div class="rm2-step waiting" data-step="bt"><span class="rm2-num">3</span><span class="rm2-lbl">Ball Tracking</span></div>
           </div>
         </div>
-        <div class="rm-bar-sec rm-decision-sec">
-          <span class="rm-label" id="rm-type">LBW</span>
-          <div id="rm-verdict" class="rm-verdict reviewing">REVIEWING</div>
-          <!-- LBW 3-step protocol, mirrored from the dashboard strip so the operator
-               sees Front Foot → UltraEdge → Ball Tracking during the live review. -->
-          <div class="protocol-strip rm-protocol" id="rm-protocol-strip" hidden></div>
-        </div>
-        <div class="rm-bar-sec">
-          <span class="rm-label">Replay Controls</span>
-          <div class="rm-controls">
-            <button id="rm-replay" type="button">⟲ Replay</button>
-            <input id="rm-scrub" type="range" min="0" max="100" value="100" aria-label="Scrub review" />
+        <!-- MIDDLE: both replays, always visible together -->
+        <div class="rm2-mid">
+          <div class="rm2-vid">
+            <span class="rm2-vlabel">Observed Trajectory</span>
+            <div class="rm2-vbox" id="rm-observed"></div>
           </div>
-          <div class="rm-speeds" role="group" aria-label="Replay speed">
-            <button type="button" class="rm-speed" data-speed="0.1">0.1x</button>
-            <button type="button" class="rm-speed" data-speed="0.25">0.25x</button>
-            <button type="button" class="rm-speed" data-speed="0.5">0.5x</button>
-            <button type="button" class="rm-speed active" data-speed="1">1x</button>
-            <button type="button" class="rm-speed" data-speed="2">2x</button>
-          </div>
-          <div class="rm-decision-actions">
-            <button id="rm-confirm-out" type="button" class="danger">OUT</button>
-            <button id="rm-confirm-not-out" type="button" class="success">NOT OUT</button>
+          <div class="rm2-vid">
+            <span class="rm2-vlabel">Broadcast Replay</span>
+            <div class="rm2-vbox" id="rm-broadcast"></div>
           </div>
         </div>
-        <div class="rm-bar-sec">
-          <span class="rm-label">Review Progress</span>
-          <div class="rm-progress"><i id="rm-progress-bar"></i></div>
-          <!-- Replay-rendering status lives INSIDE Review Mode so the operator never
-               has to exit to discover the DRS replay finished. Click when ready → jump
-               straight to the videos view. -->
-          <button id="rm-canonical-status" class="rm-canonical" type="button" hidden></button>
+        <!-- BOTTOM: ball-tracking gates + verdict + decision actions -->
+        <div class="rm2-bottom">
+          <div class="rm2-gates">
+            <div class="rm2-gate"><span>Pitching</span><strong id="rm-gate-pitching">—</strong></div>
+            <div class="rm2-gate"><span>Impact</span><strong id="rm-gate-impact">—</strong></div>
+            <div class="rm2-gate"><span>Wickets</span><strong id="rm-gate-wickets">—</strong></div>
+          </div>
+          <div class="rm2-decision">
+            <div id="rm-verdict" class="rm-verdict reviewing">REVIEWING</div>
+            <div class="rm2-actions">
+              <button id="rm-confirm-out" type="button" class="danger">OUT</button>
+              <button id="rm-confirm-not-out" type="button" class="success">NOT OUT</button>
+            </div>
+          </div>
           <button id="rm-back" class="rm-back" type="button">← Back to Dashboard</button>
         </div>
       </div>
