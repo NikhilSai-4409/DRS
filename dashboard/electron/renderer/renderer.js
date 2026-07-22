@@ -1012,11 +1012,14 @@ function renderConfidence(decision) {
 // which comes from the async canonical job (gates) — so this is also called from
 // syncCanonicalSurfaces when that lands. Each step is a small titled chip with a
 // clear status + colour (green ok / red concern / amber pending or inconclusive).
-function protocolStep(title, status, tone, detail) {
+function protocolStep(num, title, status, tone, detail) {
   return `<div class="ps-step ps-${tone}">
-    <span class="ps-title">${title}</span>
-    <span class="ps-status">${status}</span>
-    ${detail ? `<span class="ps-detail">${detail}</span>` : ""}
+    <span class="ps-num">${num}</span>
+    <div class="ps-text">
+      <span class="ps-title">${title}</span>
+      <span class="ps-status">${status}</span>
+      ${detail ? `<span class="ps-detail">${detail}</span>` : ""}
+    </div>
   </div>`;
 }
 
@@ -1031,23 +1034,23 @@ function updateProtocolStrip(decision) {
   // 1) FRONT FOOT (No Ball) — a no-ball makes the LBW dead, so it leads.
   const nb = decision.no_ball_analysis || decision.noball || {};
   let ff;
-  if (nb.is_no_ball === true) ff = protocolStep("1 · Front Foot", "NO BALL", "red", "delivery is illegal");
+  if (nb.is_no_ball === true) ff = protocolStep(1, "Front Foot", "NO BALL", "red", "delivery is illegal");
   else if (nb.is_no_ball === false) {
     const by = nb.distance_past_cm != null ? `${Math.abs(nb.distance_past_cm).toFixed(1)} cm behind` : "foot behind line";
-    ff = protocolStep("1 · Front Foot", "LEGAL", "green", by);
-  } else ff = protocolStep("1 · Front Foot", "NOT CHECKED", "amber", nb.reason || "no front-foot camera");
+    ff = protocolStep(1, "Front Foot", "LEGAL", "green", by);
+  } else ff = protocolStep(1, "Front Foot", "NOT CHECKED", "amber", nb.reason || "no front-foot camera");
 
   // 2) ULTRAEDGE — spike near impact means bat involved (inside edge → not out).
   const edge = decision.edge_analysis || {};
   let ue;
   if (edge.available === false || edge.inconclusive) {
-    ue = protocolStep("2 · UltraEdge", "NO AUDIO", "amber", edge.reason || "stump mic not synced");
+    ue = protocolStep(2, "UltraEdge", "NO AUDIO", "amber", edge.reason || "stump mic not synced");
   } else {
     const events = edge.events || [];
     const bat = events.some((e) => e.is_bat) || Number(edge.edge_probability || 0) >= 0.5;
     ue = bat
-      ? protocolStep("2 · UltraEdge", "SPIKE", "amber", "possible bat contact")
-      : protocolStep("2 · UltraEdge", "NO SPIKE", "green", "no bat sound");
+      ? protocolStep(2, "UltraEdge", "SPIKE", "amber", "possible bat contact")
+      : protocolStep(2, "UltraEdge", "NO SPIKE", "green", "no bat sound");
   }
 
   // 3) BALL TRACKING — the "is it hitting?" answer, from the canonical gates.
@@ -1057,17 +1060,18 @@ function updateProtocolStrip(decision) {
     const w = String(gates.wickets || "").toUpperCase();
     const v = String(gates.verdict || "").toUpperCase();
     const tone = w.includes("HIT") ? "red" : w.includes("MISS") ? "green" : "amber";
-    bt = protocolStep("3 · Ball Tracking", w || v || "—", tone,
+    bt = protocolStep(3, "Ball Tracking", w || v || "—", tone,
       `Pitch ${gates.pitching || "—"} · Impact ${gates.impact || "—"}`);
   } else if (state.canonical && !state.canonical.results) {
-    bt = protocolStep("3 · Ball Tracking", "TRACKING…", "amber", "rendering the trajectory");
+    bt = protocolStep(3, "Ball Tracking", "TRACKING…", "amber", "rendering the trajectory");
   } else if (state.activeAppeal || status === "PROCESSING") {
-    bt = protocolStep("3 · Ball Tracking", "TRACKING…", "amber", "analysing the delivery");
+    bt = protocolStep(3, "Ball Tracking", "TRACKING…", "amber", "analysing the delivery");
   } else {
-    bt = protocolStep("3 · Ball Tracking", "NO REPLAY", "amber", "trajectory not available");
+    bt = protocolStep(3, "Ball Tracking", "NO REPLAY", "amber", "trajectory not available");
   }
 
-  const html = ff + ue + bt;
+  const arrow = `<span class="ps-arrow" aria-hidden="true">→</span>`;
+  const html = ff + arrow + ue + arrow + bt;
   strips.forEach((s) => { s.hidden = false; s.innerHTML = html; });
 }
 
