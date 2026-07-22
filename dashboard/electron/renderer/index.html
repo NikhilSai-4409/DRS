@@ -296,7 +296,10 @@
                 </div>
               </section>
 
-              <div id="confidence-breakdown" class="confidence-breakdown"></div>
+              <!-- Diagnostic confidence gauges (ball/tracking/calibration/prediction/
+                   model) are engineering detail, not something an umpire acts on —
+                   Engineer Mode only. -->
+              <div id="confidence-breakdown" class="confidence-breakdown engineer-only"></div>
               <div class="decision-actions" id="decision-actions">
                 <button id="confirm-out" type="button" class="danger" title="Shortcut: O" hidden>Confirm OUT</button>
                 <button id="confirm-not-out" type="button" class="success" title="Shortcut: N" hidden>Confirm NOT OUT</button>
