@@ -14,6 +14,7 @@ Saving is best-effort: a logging failure must never break a live review.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,6 +43,25 @@ class ReviewLogger:
         review_dir = self.root / f"Review_{(max(numbers) + 1) if numbers else 1:03d}"
         review_dir.mkdir(parents=True, exist_ok=True)
         return review_dir
+
+    def update_decision(self, review_id: str, decision: dict) -> None:
+        """Re-save review.json with the now-complete decision. The initial log()
+        runs mid-assembly (before edge_analysis and canonical_job_id are attached);
+        this rewrites the record so History can reopen the FULL review. Best-effort."""
+        try:
+            path = self.root / str(review_id) / "review.json"
+            if not path.is_file():
+                return
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["decision"] = decision
+            if decision.get("review_result") is not None:
+                record["review_result"] = decision["review_result"]
+            record["status"] = decision.get("status", record.get("status"))
+            save_json(record, path)
+            if decision.get("edge_analysis") is not None:
+                save_json(decision["edge_analysis"], self.root / str(review_id) / "ultraedge.json")
+        except Exception as exc:  # never break a live review
+            log.warning("ReviewLogger.update_decision failed: {}", exc)
 
     def log(
         self,

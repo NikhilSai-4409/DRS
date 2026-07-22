@@ -1053,11 +1053,14 @@ function computeProtocol(decision) {
   // ③ Ball Tracking — the async trajectory/replay pipeline (canonical job)
   let ballTracking;
   const canon = state.canonical;
+  const restored = reviewLive && ReviewMode.restored;
   if (decision.canonical_skip_reason) ballTracking = "failed";
   else if (canon && canon.results) {
     const g = canon.results.reconstruction && canon.results.reconstruction.gates;
     const hasReplay = Boolean((canon.results.exports || {}).replay_players);
     ballTracking = (g || hasReplay) ? "passed" : "failed";
+  } else if (restored) {
+    ballTracking = "failed";         // historical review: results would be loaded if still on disk
   } else if (decision.canonical_job_id || (canon && !canon.results)) {
     ballTracking = "processing";     // job created / trajectory rendering
   } else ballTracking = pending;
@@ -1716,13 +1719,17 @@ function finishActiveReview() {
 // both pipeline replays always visible, bottom = gates + verdict + decision.
 // No separate replay page, no tabs, no hidden evidence.
 const ReviewMode = {
-  el: null, active: false, jobId: null,
+  el: null, active: false, jobId: null, restored: false,
   ensure() {
     if (this.el) return;
     this.el = document.getElementById("review-mode");
-    // Back to Dashboard = cancel this review cleanly (reset the backend to WAITING),
-    // never leave a zombie review running that blocks the next Request Review.
-    document.getElementById("rm-back").addEventListener("click", () => { if (this.active) resetReview(); });
+    // Back to Dashboard: a RESTORED (read-only, from History) review just closes;
+    // a LIVE review is cancelled cleanly (reset the backend to WAITING) so no zombie
+    // review lingers to block the next Request Review.
+    document.getElementById("rm-back").addEventListener("click", () => {
+      if (this.restored) this.exit();
+      else if (this.active) resetReview();
+    });
     document.getElementById("rm-confirm-out").addEventListener("click", () => confirmDecision("OUT"));
     document.getElementById("rm-confirm-not-out").addEventListener("click", () => confirmDecision("NOT_OUT"));
   },
@@ -1770,17 +1777,18 @@ const ReviewMode = {
     document.getElementById("rm-gate-wickets").textContent = (g && g.wickets) || "—";
     this.renderProtocol();   // ball-tracking stage → passed/failed per the state machine
   },
-  enter(decision) {
+  // Shared open: overlay + title + LBW-only step/gate visibility + reset gates.
+  _open(decision) {
     this.ensure();
     this.active = true;
     this.jobId = null;
     document.body.classList.add("review-active");
     this.el.classList.add("open");
     this.el.setAttribute("aria-hidden", "false");
-    const mod = REVIEW_MODULES[decision.review_type || state.reviewType];
+    const type = decision.review_type || state.reviewType;
+    const mod = REVIEW_MODULES[type];
     document.getElementById("rm-type").textContent = `${(mod && mod.label) || "Review"} REVIEW`.toUpperCase();
-    // Protocol steps + ball-tracking gates are LBW-only; hide them for other types.
-    const isLbw = (decision.review_type || state.reviewType) === "lbw";
+    const isLbw = type === "lbw";
     const steps = this.el.querySelector("#rm-steps");
     const gates = this.el.querySelector(".rm2-gates");
     if (steps) steps.hidden = !isLbw;
@@ -1788,7 +1796,19 @@ const ReviewMode = {
     document.getElementById("rm-gate-pitching").textContent = "—";
     document.getElementById("rm-gate-impact").textContent = "—";
     document.getElementById("rm-gate-wickets").textContent = "—";
+  },
+  enter(decision) {
+    this.restored = false;
+    this._open(decision);
     this.renderPending("Rendering replay…");
+    this.update(decision);
+  },
+  // Reopen a PAST review from History — read-only: recorded verdict, no confirm,
+  // Back just closes. Videos/gates re-load from its canonical job (openReviewFromHistory).
+  enterRestored(decision) {
+    this.restored = true;
+    this._open(decision);
+    this.renderPending("Loading replay…");
     this.update(decision);
   },
   // Kept for call-site compatibility (requestReview): real decision arrived.
@@ -1800,13 +1820,19 @@ const ReviewMode = {
     const rr = decision.review_result || {};
     const resolved = status === "OUT" || status === "NOT_OUT";
     const v = document.getElementById("rm-verdict");
-    v.className = "rm-verdict " + (status === "OUT" ? "out" : status === "NOT_OUT" ? "not-out" : "reviewing");
-    v.textContent = resolved ? displayStatus(status) : (rr.verdict && rr.verdict !== "AWAITING" ? rr.verdict : "REVIEWING");
-    document.getElementById("rm-confirm-out").hidden = resolved;
-    document.getElementById("rm-confirm-not-out").hidden = resolved;
+    const cls = status === "OUT" ? "out" : status === "NOT_OUT" ? "not-out"
+      : /not out/i.test(rr.verdict || "") ? "not-out" : /(^|[^t] )out|hitting/i.test(rr.verdict || "") ? "out"
+      : this.restored ? "" : "reviewing";
+    v.className = "rm-verdict " + cls;
+    v.textContent = resolved ? displayStatus(status) : (rr.verdict && rr.verdict !== "AWAITING" ? rr.verdict : (this.restored ? "—" : "REVIEWING"));
+    // Restored reviews are read-only — never offer to confirm an already-decided review.
+    const hideConfirm = this.restored || resolved;
+    document.getElementById("rm-confirm-out").hidden = hideConfirm;
+    document.getElementById("rm-confirm-not-out").hidden = hideConfirm;
   },
   exit() {
     this.active = false;
+    this.restored = false;
     this.jobId = null;
     document.body.classList.remove("review-active");
     if (this.el) {
@@ -2591,7 +2617,7 @@ function paintReviews() {
   }
   els.reviewsList.innerHTML = `
     <table class="rev-table">
-      <thead><tr><th>ID</th><th>Type</th><th>Decision</th><th>Confidence</th><th>Model</th><th>Replay</th><th>Time</th><th></th></tr></thead>
+      <thead><tr><th></th><th>Type</th><th>Decision</th><th class="engineer-only">Confidence</th><th class="engineer-only">Model</th><th>Time</th><th class="engineer-only"></th></tr></thead>
       <tbody>
         ${rows.map((review) => {
           const decision = String(review.decision || "--");
@@ -2599,21 +2625,52 @@ function paintReviews() {
           const conf = review.confidence != null ? `${Math.round(Number(review.confidence) * 100)}%` : "--";
           const type = String(review.review_type || review.type || "—").toUpperCase();
           const model = (review.provenance && review.provenance.model) || "—";
-          const hasReplay = review.review_id ? "✓" : "—";
           const time = review.time ? new Date(Number(review.time)).toLocaleTimeString() : "--";
+          const rid = review.review_id || "";
           return `<tr>
-            <td>${review.id || "--"}</td>
+            <td><button type="button" class="rev-open" data-open-review="${rid}"${rid ? "" : " disabled"}>▶ Open Review</button></td>
             <td>${type}</td>
             <td><span class="rev-dec ${cls}">${decision}</span></td>
-            <td>${conf}</td>
-            <td class="rev-model">${model}</td>
-            <td>${hasReplay}</td>
+            <td class="engineer-only">${conf}</td>
+            <td class="engineer-only rev-model">${model}</td>
             <td>${time}</td>
-            <td><button type="button" class="rev-export" data-export-review="${review.id || ""}">Export</button></td>
+            <td class="engineer-only"><button type="button" class="rev-export" data-export-review="${review.id || ""}">Export</button></td>
           </tr>`;
         }).join("")}
       </tbody>
     </table>`;
+}
+
+// History "Open Review": reconstruct a PAST review in Review Mode (read-only) —
+// protocol states, gates, verdict, and both replays from its canonical job. One
+// review experience: reopening feels like the original session, not a replay jump.
+async function openReviewFromHistory(reviewId) {
+  if (!reviewId) return;
+  let decision;
+  try {
+    decision = await jsonFetch(`/api/reviews/${encodeURIComponent(reviewId)}/full`);
+  } catch {
+    showToast("This review has no stored detail to reopen", "out");
+    return;
+  }
+  els.historyDialog?.close?.();
+  state.reviewType = decision.review_type || state.reviewType;   // gate protocol/gates correctly
+  state.decision = decision;
+  state.canonical = null;
+  ReviewMode.enterRestored(decision);
+  const jobId = decision.canonical_job_id;
+  if (!jobId) {
+    ["rm-observed", "rm-broadcast"].forEach((id) => { const b = document.getElementById(id); if (b) b.innerHTML = `<div class="rm2-noreplay">No stored replay for this review</div>`; });
+    return;
+  }
+  try {
+    const results = await jsonFetch(`/api/analyze/${jobId}/results`);
+    state.canonical = { jobId, results };
+    ReviewMode.setCanonical(jobId, results);
+    ReviewMode.renderProtocol();
+  } catch {
+    ["rm-observed", "rm-broadcast"].forEach((id) => { const b = document.getElementById(id); if (b) b.innerHTML = `<div class="rm2-noreplay">Replay files for this review are no longer available</div>`; });
+  }
 }
 
 async function renderReviews() {
@@ -2874,6 +2931,8 @@ els.revSearch?.addEventListener("input", () => {
   paintReviews();
 });
 els.reviewsList?.addEventListener("click", (event) => {
+  const open = event.target.closest("[data-open-review]");
+  if (open) { openReviewFromHistory(open.dataset.openReview); return; }
   const btn = event.target.closest("[data-export-review]");
   if (btn) exportReviewJson(btn.dataset.exportReview);
 });

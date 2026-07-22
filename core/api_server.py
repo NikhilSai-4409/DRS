@@ -886,6 +886,10 @@ class DRSBackend:
             "provenance": self._provenance(),
         }
         self.reviews.insert(0, review)
+        # Stamp the CONFIRMED outcome onto the persisted review.json so History →
+        # Open Review restores the umpire's final verdict, not the mid-review state.
+        if review.get("review_id"):
+            self.review_logger.update_decision(review["review_id"], decision)
         self._save_session()
         activity_log.record(
             "decision_confirmed",
@@ -1424,6 +1428,23 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
                 return review
         raise HTTPException(status_code=404, detail="Unknown review")
 
+    @app.get("/api/reviews/{review_id}/full")
+    def review_full(review_id: str) -> dict:
+        """The complete stored decision for a past review (from the review logger's
+        review.json) — enough to reopen it in Review Mode: protocol fields, verdict,
+        canonical_job_id. Honest 404 when no detail was persisted."""
+        from config.settings import REVIEWS_DIR
+
+        safe = "".join(ch for ch in str(review_id) if ch.isalnum() or ch in "_-")
+        path = Path(REVIEWS_DIR) / safe / "review.json"
+        if not safe or not path.is_file():
+            raise HTTPException(status_code=404, detail="No stored detail for this review")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Corrupt review record: {exc}")
+        return data.get("decision") or data
+
     @app.get("/api/match/current")
     def match_current() -> dict:
         return backend.current_match()
@@ -1519,6 +1540,11 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
                 # honesty rule: never fabricate — say exactly why there is no replay
                 decision["canonical_job_id"] = None
                 decision["canonical_skip_reason"] = "no live replay clip captured for this appeal"
+        # Persist the COMPLETE decision (edge + canonical_job_id are attached after the
+        # initial mid-assembly log) so History → Open Review can reopen the full review.
+        review_id = (decision.get("log") or {}).get("review_id")
+        if review_id:
+            backend.review_logger.update_decision(review_id, decision)
         return result
 
     @app.get("/api/animation/trajectory")
