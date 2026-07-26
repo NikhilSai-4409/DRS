@@ -101,12 +101,13 @@ def test_pose_save_writes_dedicated_file_with_metadata(cal_dir: Path) -> None:
     calibrator = ManualPitchCalibrator()
     profile = calibrator.save_profile(1, SAMPLE_MARKERS, (1280, 720))
 
-    assert (cal_dir / "pose_1.json").exists()
+    assert (cal_dir / "homography_1.json").exists()
+    assert not (cal_dir / "pose_1.json").exists()          # pose_ is reserved for the solvePnP pose
     assert not (cal_dir / "calibration_1.json").exists()
-    assert profile.type == "pose"
+    assert profile.type == "homography"
 
-    data = json.loads((cal_dir / "pose_1.json").read_text(encoding="utf-8"))
-    assert data["type"] == "pose"
+    data = json.loads((cal_dir / "homography_1.json").read_text(encoding="utf-8"))
+    assert data["type"] == "homography"
     assert data["camera_id"] == 1
     assert data["method"] == "manual_pitch_markers"
 
@@ -117,7 +118,7 @@ def test_pose_load_round_trips(cal_dir: Path) -> None:
     loaded = calibrator.load_profile(1)
     assert loaded is not None
     assert loaded.markers == SAMPLE_MARKERS
-    assert loaded.type == "pose"
+    assert loaded.type == "homography"
 
 
 def test_pose_records_intrinsics_source(cal_dir: Path) -> None:
@@ -187,17 +188,17 @@ def test_intrinsics_and_pose_coexist_without_overwrite(cal_dir: Path) -> None:
     ManualPitchCalibrator().save_profile(0, SAMPLE_MARKERS, (1280, 720))
 
     assert (cal_dir / "intrinsics_0.json").exists()
-    assert (cal_dir / "pose_0.json").exists()
+    assert (cal_dir / "homography_0.json").exists()
 
-    # Intrinsics survive the pose save intact (the old shared-file bug).
+    # Intrinsics survive the homography save intact (the old shared-file bug).
     intr = MultiCameraCalibrator().load_per_camera(0)
     assert intr.camera_matrix[0][0] == 1500.0
-    pose = ManualPitchCalibrator().load_profile(0)
-    assert pose is not None and pose.markers == SAMPLE_MARKERS
+    homography = ManualPitchCalibrator().load_profile(0)
+    assert homography is not None and homography.markers == SAMPLE_MARKERS
 
-    # Deleting the pose leaves the intrinsics alone.
+    # Deleting the homography leaves the intrinsics alone.
     assert ManualPitchCalibrator().delete_profile(0) is True
-    assert not (cal_dir / "pose_0.json").exists()
+    assert not (cal_dir / "homography_0.json").exists()
     assert (cal_dir / "intrinsics_0.json").exists()
 
 
@@ -276,14 +277,14 @@ def test_pose_state_only_legacy(cal_dir: Path, capsys) -> None:
     loaded = ManualPitchCalibrator().load_profile(21)
     assert loaded is not None and loaded.markers == SAMPLE_MARKERS
     assert "migration" in capsys.readouterr().out.lower()
-    # Next save migrates to pose_<id>.json.
+    # Next save migrates to homography_<id>.json.
     ManualPitchCalibrator().save_profile(21, SAMPLE_MARKERS, (1280, 720))
-    assert (cal_dir / "pose_21.json").exists()
+    assert (cal_dir / "homography_21.json").exists()
 
 
 def test_pose_state_only_new(cal_dir: Path) -> None:
     ManualPitchCalibrator().save_profile(22, SAMPLE_MARKERS, (1280, 720))
-    assert (cal_dir / "pose_22.json").exists()
+    assert (cal_dir / "homography_22.json").exists()
     assert not (cal_dir / "calibration_22.json").exists()
     assert ManualPitchCalibrator().load_profile(22) is not None
 

@@ -25,9 +25,14 @@ from core import activity_log
 from core.camera_manager import CameraManager, ReplayController, VideoFrame
 from core.camera_roles import normalize_roles
 from core.frame_buffer import FrameBuffer
+from core.frame_ref import FrameRef
 from core.integration import DRSPipeline, PipelineState
+from core.intrinsics_calibration import IntrinsicsCalibrationService
 from core.overlay_builder import build_overlay_payload
+from core.calibration import PITCH_POINT_LABELS, PITCH_WORLD_POINTS
 from core.pitch_calibration import calibration_status_payload
+from core.pose_calibration import N_POINTS as POSE_N_POINTS
+from core.pose_calibration import PoseCalibrationService
 from core.review_logger import ReviewLogger
 from core.review_modules import ReviewContext, build_review_result, run_review
 from core.review_engine import ReviewEngine
@@ -196,10 +201,17 @@ class DRSBackend:
             r = analyzer.detect_edge_at(t)
             if r.has_edge:
                 if not events or abs(r.edge_timestamp_ms - events[-1]["timestamp_ms"]) > 120.0:
+                    clip_index = int(max(0, min(total_frames - 1,
+                                                (r.edge_timestamp_ms - start_ms) / span * total_frames)))
                     event = {
                         "timestamp_ms": round(r.edge_timestamp_ms, 1),
-                        "frame_id": int(max(0, min(total_frames - 1,
-                                                   (r.edge_timestamp_ms - start_ms) / span * total_frames))),
+                        "frame_id": clip_index,
+                        # This index is REPLAY-CLIP space (0..total-1), derived by
+                        # interpolating the audio timestamp across the frozen window.
+                        # It is NOT a camera capture counter, so it must never be
+                        # compared with landing_frame_id / frame_number. The frame
+                        # object makes that explicit; timestamp_ms is the safe join.
+                        "frame": FrameRef.clip(clip_index, r.edge_timestamp_ms).to_dict(),
                         "confidence": round(float(r.edge_confidence), 3),
                     }
                     if classifier is not None:
@@ -254,6 +266,33 @@ class DRSBackend:
             "buckets": data["buckets"],
             "reason": None if available else "no audio captured inside the requested window",
         }
+
+    def audio_clip_for_window(self, start_ms: float, end_ms: float) -> Optional[bytes]:
+        """The window's REAL captured audio as a WAV (mono 16-bit at the mic's
+        rate), for the UltraEdge review tool's Play Audio. Samples come straight
+        from the ring (wrap-safe: sorted by capture time), normalised to a 0.9
+        playback peak — never synthesised. None when nothing was captured."""
+        import io
+        import wave
+
+        analyzer = self.audio_pipeline.analyzer
+        ts = np.asarray(analyzer.timestamps_ms)
+        mask = (ts >= start_ms) & (ts <= end_ms)
+        if not np.any(mask):
+            return None
+        order = np.argsort(ts[mask], kind="stable")
+        window = np.asarray(analyzer.samples[mask], dtype=np.float32)[order]
+        peak = float(np.max(np.abs(window)))
+        if peak > 1e-6:
+            window = window * (0.9 / peak)
+        pcm = (np.clip(window, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(int(analyzer.sample_rate))
+            wav.writeframes(pcm)
+        return buf.getvalue()
 
     def export_broadcast_clip(self, camera_id: int | None = None,
                               out_path: str | None = None) -> dict:
@@ -774,7 +813,15 @@ class DRSBackend:
         decision["review_result"] = build_review_result(review_type, decision, replay=replay)
         # Project the analytical geometry into the render-ready overlay payload that
         # both the replay video and the live dashboard draw through OverlayRenderer.
-        decision["overlay"] = build_overlay_payload(decision, calibrators=self.pipeline.calibrators)
+        # Pose projectors are passed so resolve_projection() can PREFER the 9-point
+        # solvePnP geometry. Omitting them (the previous behaviour) silently pinned
+        # every live review to the ground homography, whose 5-marker set cannot
+        # determine a projection at all.
+        decision["overlay"] = build_overlay_payload(
+            decision,
+            calibrators=self.pipeline.calibrators,
+            pose_projectors=getattr(self.pipeline, "pose_projectors", None),
+        )
 
         # Auto-save the whole review (json + replay + key frames) to data/reviews/.
         primary_cam = max(snap.frames, key=lambda cid: len(snap.frames[cid]), default=None)
@@ -864,11 +911,17 @@ class DRSBackend:
         # UI follows this with /api/decision/reset once the verdict is acknowledged.
         # The confirmed payload IS the real analysis produced by request_review —
         # the operator's verdict is stamped onto it, never regenerated.
-        status = "OUT" if outcome == "OUT" else "NOT_OUT"
+        # The operator confirms in the review type's OWN vocabulary (OUT / WIDE /
+        # NO BALL / LEGAL / NOT WIDE …). The recorded outcome keeps that word;
+        # internally the state machine stays binary — "appeal upheld" words map to
+        # the OUT status, everything else to NOT_OUT.
+        word = str(outcome or "").replace("_", " ").strip().upper() or "NOT OUT"
+        upheld = word in {"OUT", "WIDE", "NO BALL", "EDGE", "STUMPED"}
+        status = "OUT" if upheld else "NOT_OUT"
         decision = dict(self.current_decision or {})
         system_recommendation = decision.get("outcome")
         decision["status"] = status
-        decision["outcome"] = "OUT" if status == "OUT" else "NOT OUT"
+        decision["outcome"] = word
         decision["confirmed_at_ms"] = time.time() * 1000.0
         for step in decision.get("timeline") or []:
             if step.get("status") == "active":
@@ -1207,15 +1260,18 @@ class DRSBackend:
             "ball_speed_kmh": None,
             "trajectory": [],
             "predicted_extension": [],
+            # Every stage NEUTRAL until real analysis lands (only the appeal
+            # itself has actually happened). NO fabricated analysis blocks: the
+            # old seeded edge_analysis {probability: 0.0} read as a real
+            # "NO EDGE" finding on every surface — a placeholder must be ABSENT,
+            # not a fake negative result.
             "timeline": [
                 {"label": "Appeal", "status": "complete"},
                 {"label": "Ball detected", "status": "pending"},
                 {"label": "Bounce detected", "status": "pending"},
                 {"label": "Impact detected", "status": "pending"},
-                {"label": "Decision generated", "status": "active"},
+                {"label": "Decision generated", "status": "pending"},
             ],
-            "edge_analysis": {"edge_probability": 0.0, "events": []},
-            "hotspot_analysis": {"contact_detected": False, "reason": "No contact heatmap for LBW review."},
             "explanation": "Analyzing the captured replay buffer…",
         }
 
@@ -1405,6 +1461,156 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
             "note": "Proposed positions — drag each numbered marker onto the real stump base or crease line.",
         }
 
+    # ---- ChArUco intrinsics (Slice 2): capture → coverage → compute → save ----
+    # The service holds all logic; these routes are the thin layer, and only
+    # /capture touches the live feed (via backend.latest_frame).
+    intrinsics_service = IntrinsicsCalibrationService()
+    app.state.intrinsics_service = intrinsics_service
+
+    @app.get("/api/calibration/intrinsics/{camera_id}/status")
+    async def intrinsics_status(camera_id: int) -> dict:
+        return intrinsics_service.status(camera_id)
+
+    @app.post("/api/calibration/intrinsics/{camera_id}/capture")
+    async def intrinsics_capture(camera_id: int) -> dict:
+        """Grab the current live frame for a camera and add it as an intrinsics view."""
+        try:
+            frame = backend.latest_frame(camera_id).frame
+        except KeyError:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Camera {camera_id} has no live frame — check it is connected and streaming.",
+            )
+        return intrinsics_service.add_capture(camera_id, frame)
+
+    @app.post("/api/calibration/intrinsics/{camera_id}/compute")
+    async def intrinsics_compute(camera_id: int) -> dict:
+        try:
+            result = intrinsics_service.compute(camera_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        activity_log.record(
+            "intrinsics_saved",
+            f"Intrinsics calibrated for camera {camera_id}",
+            camera_id=camera_id,
+            rms_error=result["rms_error"],
+        )
+        return result
+
+    @app.post("/api/calibration/intrinsics/{camera_id}/clear")
+    async def intrinsics_clear(camera_id: int) -> dict:
+        return {"cleared": intrinsics_service.clear_captures(camera_id), "camera_id": camera_id}
+
+    @app.get("/api/calibration/intrinsics/{camera_id}")
+    async def intrinsics_inspect(camera_id: int) -> dict:
+        data = intrinsics_service.load_saved(camera_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"No intrinsics calibration for camera {camera_id}")
+        return data
+
+    # ---------------- pose calibration (the production projection path) -------------
+    # The 9-point solvePnP pose supersedes the ground homography, whose 5-marker set
+    # is geometrically degenerate (three collinear points → the mapping is
+    # undetermined; see assess_marker_geometry). resolve_projection() prefers pose.
+    pose_service = PoseCalibrationService()
+    app.state.pose_service = pose_service
+
+    def _reload_pose_projectors() -> None:
+        """Apply a saved/cleared pose without restarting the engine, so the operator
+        can calibrate and immediately review."""
+        pipeline = getattr(backend, "pipeline", None)
+        if pipeline is None or not hasattr(pipeline, "pose_projectors"):
+            return
+        for cam_id in list(pipeline.camera_manager.camera_ids):
+            projector = None
+            try:
+                projector = pose_service.projector(cam_id)
+            except Exception:
+                projector = None
+            if projector is None:
+                pipeline.pose_projectors.pop(cam_id, None)
+            else:
+                pipeline.pose_projectors[cam_id] = projector
+
+    @app.get("/api/calibration/pose/target")
+    def pose_target() -> dict:
+        """The 9 world points the operator must click, in order, with labels. The UI
+        asks for these rather than hard-coding its own copy."""
+        return {
+            "point_count": int(POSE_N_POINTS),
+            "labels": list(PITCH_POINT_LABELS),
+            "world_points_m": np.asarray(PITCH_WORLD_POINTS, dtype=float).tolist(),
+            "frame": {
+                "x": "lateral, 0 on the centre line",
+                "y": "along-pitch, 0 at the bowling crease, +Y toward the striker",
+                "z": "height above the ground",
+            },
+            "requires_intrinsics": "Strongly recommended: without a ChArUco intrinsics "
+                                   "calibration the pose is solved with an estimated "
+                                   "pinhole and will usually fail its plausibility gate.",
+        }
+
+    @app.get("/api/calibration/pose/{camera_id}")
+    def pose_status(camera_id: int) -> dict:
+        status = pose_service.status(camera_id)
+        status["projection_source"] = backend.pipeline.projection_sources().get(camera_id, "none") \
+            if hasattr(backend.pipeline, "projection_sources") else None
+        return status
+
+    @app.post("/api/calibration/pose/{camera_id}")
+    def pose_save(camera_id: int, payload: dict = Body(default_factory=dict)) -> dict:
+        """Solve and persist a camera pose from 9 clicked image points.
+
+        Rejects rather than stores a pose that fails its plausibility gate: an
+        implausible solve would silently become the production geometry, which is
+        worse than falling back to a projection we already know to distrust.
+        """
+        points = payload.get("image_points")
+        if not isinstance(points, list) or len(points) != POSE_N_POINTS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"image_points must be a list of {POSE_N_POINTS} [x, y] pairs "
+                       f"in the order given by /api/calibration/pose/target",
+            )
+        size = payload.get("image_size")
+        if not size:
+            try:
+                frame = backend.latest_frame(camera_id).frame
+                size = (int(frame.shape[1]), int(frame.shape[0]))
+            except KeyError:
+                raise HTTPException(status_code=409,
+                                    detail=f"Camera {camera_id} has no live frame; pass image_size explicitly.")
+        try:
+            result = pose_service.compute_pose(camera_id, points, (int(size[0]), int(size[1])))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        _reload_pose_projectors()
+        result["projection_source"] = backend.pipeline.projection_sources().get(camera_id, "none") \
+            if hasattr(backend.pipeline, "projection_sources") else None
+        activity_log.record(
+            "pose_saved",
+            f"Pose calibration for camera {camera_id} "
+            f"({'accepted' if result.get('acceptable') else 'REJECTED — not used'})",
+            camera_id=camera_id,
+            reproj_error_px=result.get("reproj_error_px"),
+        )
+        return result
+
+    @app.delete("/api/calibration/pose/{camera_id}")
+    def pose_clear(camera_id: int) -> dict:
+        removed = pose_service.clear(camera_id)
+        _reload_pose_projectors()
+        return {"camera_id": camera_id, "cleared": removed,
+                "projection_source": backend.pipeline.projection_sources().get(camera_id, "none")
+                if hasattr(backend.pipeline, "projection_sources") else None}
+
+    @app.get("/api/calibration/projection-sources")
+    def projection_sources() -> dict:
+        """Which projection backend each camera will actually use for a review."""
+        sources = backend.pipeline.projection_sources() \
+            if hasattr(backend.pipeline, "projection_sources") else {}
+        return {"sources": {str(k): v for k, v in sources.items()}}
+
     @app.get("/api/decision/current")
     def decision_current() -> dict:
         return backend.current_decision
@@ -1518,28 +1724,34 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
         # the same /api/analyze/{id}/results and plays the same replay exports.
         decision = result.get("decision") or {}
         if review_type == "lbw":
-            clip = ((decision.get("review_result") or {}).get("replay") or {}).get("path")
-            if clip and Path(clip).is_file():
-                import threading
-                import uuid as _uuid
-
-                from core.testing_api import _run_job, db as testing_db
-                from core.testing_pipeline import AnalysisOptions
-
-                job_id = _uuid.uuid4().hex[:12]
-                testing_db.create_job(job_id, "1_camera", {"source": "live_appeal"}, str(clip), None)
-                threading.Thread(
-                    target=_run_job,
-                    # DRS protocol: an LBW review always includes the UltraEdge trace —
-                    # the umpire checks bat involvement BEFORE reading ball-tracking.
-                    args=(job_id, [Path(clip)], AnalysisOptions(use_calibration=False, edge_detection=True)),
-                    daemon=True,
-                ).start()
-                decision["canonical_job_id"] = job_id
-            else:
-                # honesty rule: never fabricate — say exactly why there is no replay
+            # TV-umpiring short-circuit: a front-foot NO BALL ended the review at
+            # step 1 — no ball tracking, no trajectory replay is ever rendered.
+            if decision.get("review_ended") == "no_ball":
                 decision["canonical_job_id"] = None
-                decision["canonical_skip_reason"] = "no live replay clip captured for this appeal"
+                decision["canonical_skip_reason"] = "front-foot no ball — the review ended before ball tracking"
+            else:
+                clip = ((decision.get("review_result") or {}).get("replay") or {}).get("path")
+                if clip and Path(clip).is_file():
+                    import threading
+                    import uuid as _uuid
+
+                    from core.testing_api import _run_job, db as testing_db
+                    from core.testing_pipeline import AnalysisOptions
+
+                    job_id = _uuid.uuid4().hex[:12]
+                    testing_db.create_job(job_id, "1_camera", {"source": "live_appeal"}, str(clip), None)
+                    threading.Thread(
+                        target=_run_job,
+                        # DRS protocol: an LBW review always includes the UltraEdge trace —
+                        # the umpire checks bat involvement BEFORE reading ball-tracking.
+                        args=(job_id, [Path(clip)], AnalysisOptions(use_calibration=False, edge_detection=True)),
+                        daemon=True,
+                    ).start()
+                    decision["canonical_job_id"] = job_id
+                else:
+                    # honesty rule: never fabricate — say exactly why there is no replay
+                    decision["canonical_job_id"] = None
+                    decision["canonical_skip_reason"] = "no live replay clip captured for this appeal"
         # Persist the COMPLETE decision (edge + canonical_job_id are attached after the
         # initial mid-assembly log) so History → Open Review can reopen the full review.
         review_id = (decision.get("log") or {}).get("review_id")
@@ -1675,6 +1887,26 @@ def create_app(camera_ids: list[int], record: bool = False) -> FastAPI:
             return {"available": False, "buckets": [],
                     "reason": "no replay window — create a replay or pass start_ms/end_ms"}
         return backend.audio_waveform_for_window(float(start_ms), float(end_ms), int(buckets))
+
+    @app.get("/api/audio/clip.wav")
+    def audio_clip(
+        start_ms: float | None = Query(default=None),
+        end_ms: float | None = Query(default=None),
+    ) -> Response:
+        """The frozen window's real captured audio as WAV — the UltraEdge review
+        tool's Play Audio. Honest 404s when no mic or nothing captured."""
+        if getattr(backend, "audio_pipeline", None) is None:
+            raise HTTPException(status_code=404, detail="no microphone — audio capture not running")
+        if (start_ms is None or end_ms is None) and backend.active_replay is not None:
+            window = backend.replay_state()
+            start_ms = window.get("start_timestamp_ms") if start_ms is None else start_ms
+            end_ms = window.get("end_timestamp_ms") if end_ms is None else end_ms
+        if start_ms is None or end_ms is None or float(end_ms) <= float(start_ms):
+            raise HTTPException(status_code=404, detail="no replay window — create a replay or pass start_ms/end_ms")
+        data = backend.audio_clip_for_window(float(start_ms), float(end_ms))
+        if data is None:
+            raise HTTPException(status_code=404, detail="no audio captured inside the requested window")
+        return Response(content=data, media_type="audio/wav")
 
     @app.post("/api/broadcast/export")
     def broadcast_export(payload: dict = Body(default_factory=dict)) -> dict:

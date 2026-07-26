@@ -17,8 +17,11 @@ from config.settings import (
     PITCH_WIDTH_M,
     STUMP_WIDTH_M,
 )
-from core.calibration_paths import get_intrinsics_path, get_legacy_path, get_pose_path
+from core.calibration_paths import get_homography_path, get_intrinsics_path, get_legacy_path, get_pose_path
 from utils.helpers import load_json, save_json
+from utils.logger import get_logger
+
+log = get_logger(__name__)
 
 MARKER_KEYS = (
     "off_stump",
@@ -30,19 +33,20 @@ MARKER_KEYS = (
 
 READINESS_PATH = CALIBRATION_DIR / "readiness.json"
 
-# The manual pitch profile used to share ``calibration_<id>.json`` with camera
-# intrinsics, so the two overwrote each other. It now writes ``pose_<id>.json``;
-# ``calibration_<id>.json`` is read only for backward compatibility.
+# The homography profile now writes ``homography_<id>.json`` (its own artifact, so it
+# never collides with the solvePnP pose in ``pose_<id>.json`` or the intrinsics). The
+# older ``pose_<id>.json`` (Slice 1) and ``calibration_<id>.json`` (pre-Slice-1)
+# locations are read only for backward compatibility, with a one-time migration notice.
 _POSE_MIGRATION_NOTIFIED: set[str] = set()
 
 
-def _notify_pose_migration(camera_id: int, legacy: Path, new: Path) -> None:
+def _notify_homography_migration(camera_id: int, legacy: Path, new: Path) -> None:
     key = str(camera_id)
     if key in _POSE_MIGRATION_NOTIFIED:
         return
     _POSE_MIGRATION_NOTIFIED.add(key)
     print(
-        f"MIGRATION: camera {camera_id} pitch calibration loaded from legacy {legacy.name}; "
+        f"MIGRATION: camera {camera_id} homography loaded from legacy {legacy.name}; "
         f"it will move to {new.name} on the next save."
     )
 
@@ -65,7 +69,7 @@ class ICCPitchDimensions:
 @dataclass(slots=True)
 class PitchCalibrationProfile:
     camera_id: int
-    type: str = "pose"
+    type: str = "homography"
     schema_version: int = 1
     method: str = "manual_pitch_markers"
     image_size: tuple[int, int] = (0, 0)
@@ -73,6 +77,10 @@ class PitchCalibrationProfile:
     world_dimensions: dict[str, float] = field(default_factory=ICCPitchDimensions().to_dict)
     homography: list[list[float]] | None = None
     homography_error_cm: float | None = None
+    # Whether the marker configuration can determine a projection at all. A low
+    # `homography_error_cm` with `geometry_assessment.ok == False` means the solver
+    # fit the clicks perfectly and the mapping is still arbitrary off them.
+    geometry_assessment: dict[str, Any] | None = None
     intrinsics_source: str | None = None
     created_at: str = ""
     updated_at: str = ""
@@ -141,11 +149,99 @@ def _marker_pixels(markers: dict[str, dict[str, float]]) -> np.ndarray:
     )
 
 
+def assess_marker_geometry(
+    image_points: np.ndarray,
+    world_points: np.ndarray,
+    min_area_ratio: float = 0.02,
+) -> dict:
+    """Can these correspondences determine a homography at all?
+
+    A homography is UNDETERMINED when three of its four points are collinear: the
+    solver returns a mapping that fits the clicked markers exactly while being
+    arbitrary everywhere else. Reprojection error cannot detect this — it is ~0 on
+    the degenerate set — so RMS alone must never be treated as a quality signal.
+
+    Measured against a known camera, the five-marker set below (three stump bases
+    plus a bowling-crease point, all on the line y=0) put the projected wide line
+    250-660 px from its true position while reporting RMS 0.000 cm.
+
+    Returns a structured verdict rather than raising, so callers can persist the
+    reason and tell the operator what to re-click.
+    """
+    reasons: list[str] = []
+
+    def _distinct(points: np.ndarray, tol: float) -> np.ndarray:
+        keep: list[np.ndarray] = []
+        for point in points:
+            if not any(np.linalg.norm(point - other) <= tol for other in keep):
+                keep.append(point)
+        return np.array(keep, dtype=np.float64)
+
+    world = _distinct(np.asarray(world_points, dtype=np.float64), tol=1e-6)
+    image = _distinct(np.asarray(image_points, dtype=np.float64), tol=1e-3)
+    if len(world) < len(world_points):
+        reasons.append(
+            f"{len(world_points) - len(world)} marker(s) map to a world position another "
+            "marker already occupies, so they add no information")
+    if len(world) < 4:
+        reasons.append(f"only {len(world)} distinct world points; a homography needs 4")
+
+    # The condition is that NO THREE points are collinear — not merely that the set
+    # as a whole spans an area. Three stump bases on the stump line plus one crease
+    # point still span a healthy triangle, yet the mapping is undetermined. So score
+    # the WEAKEST triple, not the strongest.
+    def _min_triangle_ratio(points: np.ndarray) -> float:
+        if len(points) < 3:
+            return 0.0
+        extent = float(np.max(points.max(axis=0) - points.min(axis=0)))
+        if extent <= 0:
+            return 0.0
+        worst = float("inf")
+        for i in range(len(points)):
+            for j in range(i + 1, len(points)):
+                for k in range(j + 1, len(points)):
+                    a, b, c = points[i], points[j], points[k]
+                    # 2-D cross product; np.cross on 2-vectors is deprecated.
+                    area = abs((b[0] - a[0]) * (c[1] - a[1])
+                               - (b[1] - a[1]) * (c[0] - a[0])) / 2.0
+                    worst = min(worst, area)
+        return worst / (extent * extent)
+
+    world_ratio = _min_triangle_ratio(world)
+    image_ratio = _min_triangle_ratio(image)
+    if len(world) >= 3 and world_ratio < min_area_ratio:
+        reasons.append(
+            "three or more reference points are collinear — a homography is undetermined "
+            "unless no three of its four points lie on one line; spread the markers "
+            "across the pitch in two directions")
+    if len(image) >= 3 and image_ratio < min_area_ratio:
+        reasons.append("three or more of the clicked points are collinear in the image")
+
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "distinct_world_points": int(len(world)),
+        "world_spread_ratio": round(float(world_ratio), 5),
+        "image_spread_ratio": round(float(image_ratio), 5),
+        # Stated explicitly so nothing downstream reads a low RMS as "good".
+        "rms_is_meaningful": not reasons,
+    }
+
+
 class ManualPitchCalibrator:
     """Build homography from manual stump/crease clicks and persist per camera."""
 
     def __init__(self, dimensions: ICCPitchDimensions | None = None) -> None:
         self.dimensions = dimensions or ICCPitchDimensions()
+
+    def assess_markers(self, markers: dict[str, dict[str, float]]) -> dict:
+        """Whether these clicks can determine a projection. Independent of how well
+        the solver fits them — see :func:`assess_marker_geometry`."""
+        world_map = _world_points_for_markers(self.dimensions)
+        return assess_marker_geometry(
+            _marker_pixels(markers),
+            np.array([world_map[key] for key in MARKER_KEYS], dtype=np.float32),
+        )
 
     def compute_homography(self, markers: dict[str, dict[str, float]]) -> tuple[list[list[float]], float]:
         image_points = _marker_pixels(markers)
@@ -194,6 +290,16 @@ class ManualPitchCalibrator:
         image_size: tuple[int, int],
     ) -> PitchCalibrationProfile:
         homography, error_cm = self.compute_homography(markers)
+        # Persisted with the profile so a bad configuration cannot be quietly
+        # inherited: anything reading this profile can see that the fit is exact on
+        # the markers and still meaningless away from them.
+        geometry = self.assess_markers(markers)
+        if not geometry["ok"]:
+            log.warning(
+                "Camera {} calibration saved with UNUSABLE geometry (RMS {:.3f} cm is "
+                "not a quality signal here): {}",
+                camera_id, error_cm, "; ".join(geometry["reasons"]),
+            )
         now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         profile = PitchCalibrationProfile(
             camera_id=camera_id,
@@ -202,37 +308,42 @@ class ManualPitchCalibrator:
             world_dimensions=self.dimensions.to_dict(),
             homography=homography,
             homography_error_cm=error_cm,
+            geometry_assessment=geometry,
             intrinsics_source=self._intrinsics_source(camera_id),
             created_at=now,
             updated_at=now,
         )
-        path = self.pose_path(camera_id)
+        path = self.homography_path(camera_id)
         save_json(profile.to_dict(), path)
         refresh_readiness_from_profiles()
         return profile
 
     def load_profile(self, camera_id: int) -> PitchCalibrationProfile | None:
-        path = self.pose_path(camera_id)
+        path = self.homography_path(camera_id)
         if path.exists():
             data = load_json(path)
             if data.get("method") != "manual_pitch_markers":
                 return None
             return _profile_from_dict(data)
-        legacy = self.legacy_path(camera_id)
-        if legacy.exists():
+        # Legacy read-through: the homography used to share pose_<id>.json (Slice 1) and
+        # before that calibration_<id>.json. Read either, and it migrates on next save.
+        for legacy in (self.pose_path(camera_id), self.legacy_path(camera_id)):
+            if not legacy.exists():
+                continue
             try:
                 data = load_json(legacy)
             except Exception:
-                return None
+                continue
             if data.get("method") == "manual_pitch_markers":
-                _notify_pose_migration(camera_id, legacy, path)
+                _notify_homography_migration(camera_id, legacy, path)
                 return _profile_from_dict(data)
         return None
 
     def list_profiles(self) -> list[PitchCalibrationProfile]:
-        # Glob legacy first so a migrated pose_<id>.json takes precedence per camera.
+        # Glob legacy patterns first so a migrated homography_<id>.json takes precedence.
+        # Only manual_pitch_markers records count — a pitch_pose_solvepnp pose_<id>.json is skipped.
         by_camera: dict[Any, PitchCalibrationProfile] = {}
-        for pattern in ("calibration_*.json", "pose_*.json"):
+        for pattern in ("calibration_*.json", "pose_*.json", "homography_*.json"):
             for path in sorted(CALIBRATION_DIR.glob(pattern)):
                 if path.name == "readiness.json":
                     continue
@@ -246,14 +357,14 @@ class ManualPitchCalibrator:
         return list(by_camera.values())
 
     def delete_profile(self, camera_id: int) -> bool:
-        """Remove the saved manual pitch calibration for a camera (new + legacy files)."""
+        """Remove the saved homography for a camera (new + legacy files)."""
         removed = False
-        pose = self.pose_path(camera_id)
-        if pose.exists():
-            pose.unlink()
+        if self.homography_path(camera_id).exists():
+            self.homography_path(camera_id).unlink()
             removed = True
-        legacy = self.legacy_path(camera_id)
-        if legacy.exists():
+        for legacy in (self.pose_path(camera_id), self.legacy_path(camera_id)):
+            if not legacy.exists():
+                continue
             try:
                 is_manual = load_json(legacy).get("method") == "manual_pitch_markers"
             except Exception:
@@ -281,16 +392,20 @@ class ManualPitchCalibrator:
         return None
 
     @staticmethod
-    def pose_path(camera_id: int) -> Path:
+    def homography_path(camera_id: int) -> Path:
+        return get_homography_path(camera_id, CALIBRATION_DIR)
+
+    @staticmethod
+    def pose_path(camera_id: int) -> Path:   # legacy read location (Slice 1)
         return get_pose_path(camera_id, CALIBRATION_DIR)
 
     @staticmethod
-    def legacy_path(camera_id: int) -> Path:
+    def legacy_path(camera_id: int) -> Path:   # pre-Slice-1 read location
         return get_legacy_path(camera_id, CALIBRATION_DIR)
 
     @staticmethod
     def profile_path(camera_id: int) -> Path:  # backward-compatible alias
-        return ManualPitchCalibrator.pose_path(camera_id)
+        return ManualPitchCalibrator.homography_path(camera_id)
 
 
 def refresh_readiness_from_profiles() -> Path:

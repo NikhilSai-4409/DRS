@@ -55,8 +55,9 @@ def test_save_and_load_profile_per_camera(tmp_path: Path, monkeypatch: pytest.Mo
     loaded = calibrator.load_profile(1)
     assert loaded is not None
     assert loaded.markers == sample_markers
-    assert (tmp_path / "pose_1.json").exists()
-    assert not (tmp_path / "calibration_1.json").exists()  # no longer collides with intrinsics
+    assert (tmp_path / "homography_1.json").exists()       # its own artifact (not pose_, not intrinsics_)
+    assert not (tmp_path / "pose_1.json").exists()
+    assert not (tmp_path / "calibration_1.json").exists()
 
 
 def test_refresh_readiness_from_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sample_markers: dict) -> None:

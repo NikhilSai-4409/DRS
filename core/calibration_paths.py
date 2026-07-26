@@ -26,6 +26,10 @@ def pose_filename(camera_id: int | str) -> str:
     return f"pose_{camera_id}.json"
 
 
+def homography_filename(camera_id: int | str) -> str:
+    return f"homography_{camera_id}.json"
+
+
 def legacy_filename(camera_id: int | str) -> str:
     return f"calibration_{camera_id}.json"
 
@@ -38,5 +42,14 @@ def get_pose_path(camera_id: int | str, base: Path | None = None) -> Path:
     return (base or CALIBRATION_DIR) / pose_filename(camera_id)
 
 
+def get_homography_path(camera_id: int | str, base: Path | None = None) -> Path:
+    return (base or CALIBRATION_DIR) / homography_filename(camera_id)
+
+
 def get_legacy_path(camera_id: int | str, base: Path | None = None) -> Path:
     return (base or CALIBRATION_DIR) / legacy_filename(camera_id)
+
+
+def get_intrinsics_captures_dir(camera_id: int | str, base: Path | None = None) -> Path:
+    """Directory holding the ChArUco capture frames for one camera's intrinsics run."""
+    return (base or CALIBRATION_DIR) / "intrinsics_captures" / f"cam_{camera_id}"

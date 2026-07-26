@@ -46,15 +46,58 @@ class DRSPipeline:
         self.sync_verifier = SyncVerifier()
         self.running = False
         self.calibrators: dict[int, ManualPitchCalibrator] = {}
+        # Pose (solvePnP) projectors — preferred over the ground homography by
+        # resolve_projection(). Empty until a camera has a saved pose calibration.
+        self.pose_projectors: dict[int, object] = {}
         self.trajectory_predictor = TrajectoryPredictor()
         self._load_calibration_profiles()
 
     def _load_calibration_profiles(self) -> None:
+        """Load both projection backends. Pose is the intended production path (a
+        non-degenerate 9-point solvePnP); the ground homography remains as an
+        explicit, logged fallback — its 5-marker set cannot determine a projection
+        (see assess_marker_geometry), so a review running on it is measuring
+        against geometry the system cannot justify."""
+        from core.pose_calibration import PoseCalibrationService
+
+        pose_service = PoseCalibrationService()
         for cam_id in self.camera_manager.camera_ids:
             calibrator = ManualPitchCalibrator()
-            if calibrator.load_profile(cam_id):
+            profile = calibrator.load_profile(cam_id)
+            if profile:
                 self.calibrators[cam_id] = calibrator
-                log.info("Loaded calibration profile for camera {}", cam_id)
+            projector = None
+            try:
+                projector = pose_service.projector(cam_id)
+            except Exception as exc:                       # never block startup
+                log.debug("Pose calibration unavailable for camera {}: {}", cam_id, exc)
+            if projector is not None:
+                self.pose_projectors[cam_id] = projector
+                log.info("Camera {} projection source: POSE calibration", cam_id)
+            elif profile:
+                geometry = (profile.geometry_assessment or {})
+                if geometry.get("ok") is False:
+                    log.warning(
+                        "Camera {} projection source: HOMOGRAPHY FALLBACK — no pose "
+                        "calibration, and the saved marker geometry is unusable ({}). "
+                        "Measurements from this camera are not trustworthy.",
+                        cam_id, "; ".join(geometry.get("reasons") or []))
+                else:
+                    log.info("Camera {} projection source: homography fallback "
+                             "(no pose calibration found)", cam_id)
+
+    def projection_sources(self) -> dict[int, str]:
+        """Which backend each camera will actually use — surfaced to the operator so
+        nobody has to guess which projection produced a given review."""
+        sources: dict[int, str] = {}
+        for cam_id in self.camera_manager.camera_ids:
+            if self.pose_projectors.get(cam_id) is not None:
+                sources[cam_id] = "pose"
+            elif cam_id in self.calibrators:
+                sources[cam_id] = "homography"
+            else:
+                sources[cam_id] = "none"
+        return sources
 
     def start(self) -> None:
         self.camera_manager.start()

@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Optional, Protocol
 
 from config.settings import STUMP_WIDTH_M
+from core.calibration import STRIKER_STUMPS_ALONG_M
 from utils.logger import get_logger
 
 log = get_logger("projection")
@@ -97,10 +98,25 @@ class PoseProjection:
         if self.pose_projector is None:
             return None
         try:
-            # Pitch frame → pose world frame (metres). Axis mapping mirrors how the
-            # ground homography defines pitch coordinates: x = lateral, y = along.
-            world_x = (lateral_mm / 1000.0) + (STUMP_WIDTH_M / 2.0)
-            world_y = along_mm / 1000.0
+            # Pitch frame → pose world frame (metres). These are DIFFERENT frames and
+            # the conversion is not a no-op:
+            #
+            #   pitch frame (what callers pass): lateral 0 at the middle stump,
+            #     along 0 at the STRIKER'S stumps, negative toward the bowler
+            #     (so the striker's popping crease is at along = -1220 mm).
+            #   pose frame (PITCH_WORLD_POINTS): X 0 on the centre line, Y 0 at the
+            #     BOWLING crease with +Y toward the striker, striker's stumps at
+            #     Y = STRIKER_STUMPS_ALONG_M (20.12 m).
+            #
+            # Two earlier errors here would have moved every measurement:
+            #   * adding STUMP_WIDTH_M/2 to X — that offset belongs to the homography's
+            #     own frame (off stump at x=0); the pose frame is already centred, so
+            #     it shifted the world 11.4 cm sideways, which is larger than most
+            #     wide/no-ball decision margins;
+            #   * leaving Y unshifted — putting along=0 at the bowler's end instead of
+            #     the striker's, i.e. 20 m down the wrong end of the pitch.
+            world_x = lateral_mm / 1000.0
+            world_y = (along_mm / 1000.0) + STRIKER_STUMPS_ALONG_M
             world_z = height_mm / 1000.0
             px, py = self.pose_projector.world_to_pixel(world_x, world_y, world_z)
             return float(px), float(py)
