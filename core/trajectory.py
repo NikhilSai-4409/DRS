@@ -74,12 +74,19 @@ class TrajectoryPrediction:
     bounce_index: int | None
     wicket_collision: bool
     wicket_point: TrajectoryPoint | None
+    # Whether the wicket test was actually PERFORMED. Without this,
+    # `wicket_collision is False` is ambiguous: it could mean "tested, the ball
+    # missed" or "never tested because no wicket position was supplied". Callers
+    # were reading the second case as the first — i.e. reporting "not hitting"
+    # about a delivery nobody had checked.
+    wicket_evaluated: bool = False
 
     def to_dict(self) -> dict:
         return {
             "points": [asdict(point) for point in self.points],
             "bounce_index": self.bounce_index,
             "wicket_collision": self.wicket_collision,
+            "wicket_evaluated": self.wicket_evaluated,
             "wicket_point": asdict(self.wicket_point) if self.wicket_point else None,
         }
 
@@ -128,7 +135,8 @@ class TrajectoryPredictor:
             points.append(TrajectoryPoint(float(solution.t[idx]), float(x), float(y), max(0.0, float(z)), float(vx), float(vy), float(vz)))
 
         wicket_point = self._find_wicket_collision(points, wicket_x_m, stump_half_width_m, stump_height_m)
-        return TrajectoryPrediction(points, bounce_index, wicket_point is not None, wicket_point)
+        return TrajectoryPrediction(points, bounce_index, wicket_point is not None, wicket_point,
+                                    wicket_evaluated=wicket_x_m is not None)
 
     def approximate_world_from_track(
         self,

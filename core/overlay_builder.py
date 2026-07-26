@@ -12,6 +12,8 @@ here draws — that is :mod:`core.overlay_renderer`.
 from __future__ import annotations
 
 from config.settings import STUMP_HEIGHT_M
+from core.observation import BailsState, Observation
+from core.overlay_contract import check_overlay_payload
 from core.projection import STUMP_HALF_WIDTH_MM, resolve_projection
 
 STUMP_HEIGHT_MM = STUMP_HEIGHT_M * 1000.0
@@ -34,13 +36,21 @@ def build_overlay_payload(decision: dict, calibrators: dict | None = None, pose_
         payload.update(_lbw_payload(geometry, calibrators, pose_projectors))
     elif kind == "runout":
         payload.update(_runout_payload(geometry, calibrators, pose_projectors))
+    elif kind == "wide":
+        payload.update(_wide_payload(geometry, calibrators, pose_projectors))
     else:
         payload.update(_marker_payload(decision))
+    # Validate at the boundary — warn, never raise. A contract violation must not
+    # cost an operator their review; it is logged loudly and asserted in tests.
+    check_overlay_payload(payload, context=str(review_type or "unknown"))
     return payload
 
 
 def _runout_payload(geometry: dict, calibrators, pose_projectors) -> dict:
     camera_id = geometry.get("camera_id")
+    # coerce, so a legacy None payload becomes NOT_OBSERVED rather than silently
+    # falling through a truthiness test somewhere downstream.
+    bails = BailsState.coerce(geometry.get("bails_status"))
     projection = resolve_projection(camera_id, calibrators or {}, pose_projectors)
     crease_px: list[list[float]] = []
     stumps_px: list[dict] = []
@@ -61,9 +71,49 @@ def _runout_payload(geometry: dict, calibrators, pose_projectors) -> dict:
         "bat_px": geometry.get("bat_px") or [],
         "stumps_px": stumps_px,
         "bails_px": bails_px,
-        "bails_status": geometry.get("bails_status"),
+        "bails_status": bails.value,
         "frame_number": geometry.get("frame_number"),
-        "hitting": geometry.get("bails_status") == "dislodged",
+        # Tri-state, not a boolean. UNKNOWN stays None: False would claim the wicket
+        # was NOT broken, which is just as unmeasured as claiming it was.
+        "hitting": bails.wicket_broken,
+    }
+
+
+# How far down the pitch the wide line is drawn, from the stump line toward the
+# bowler. Long enough to read as a line running down the pitch rather than a tick.
+_WIDE_LINE_FROM_MM = 200.0
+_WIDE_LINE_TO_MM = -4200.0
+_WIDE_LINE_STEPS = 12
+
+
+def _wide_payload(geometry: dict, calibrators, pose_projectors) -> dict:
+    """Wide review geometry. The wide line is projected from world coordinates into
+    frame pixels, which is what lets it be drawn as MEASURED (solid, carries a
+    number) rather than as a schematic guide. Without a projection it can only be a
+    dashed guess, and a guess may not carry a measurement."""
+    camera_id = geometry.get("camera_id")
+    projection = resolve_projection(camera_id, calibrators or {}, pose_projectors)
+
+    lateral_mm = geometry.get("wide_line_lateral_mm")
+    wide_line_px: list[list[float]] = []
+    if projection is not None and lateral_mm is not None:
+        for step in range(_WIDE_LINE_STEPS + 1):
+            along = _WIDE_LINE_FROM_MM + (_WIDE_LINE_TO_MM - _WIDE_LINE_FROM_MM) * step / _WIDE_LINE_STEPS
+            point = projection.world_to_pixel(float(lateral_mm), along, 0.0)
+            if point is not None:
+                wide_line_px.append([round(point[0], 1), round(point[1], 1)])
+
+    ball = geometry.get("ball_px")
+    return {
+        "projection": getattr(projection, "kind", None),
+        # Empty when uncalibrated — the renderer then falls back to the schematic
+        # tier and says so, rather than drawing this line somewhere plausible.
+        "wide_line_px": wide_line_px,
+        "ball_centre": {"x": ball[0], "y": ball[1]} if ball else None,
+        "ball_radius_px": geometry.get("ball_radius_px"),
+        "distance_cm": geometry.get("distance_cm"),
+        "is_wide": geometry.get("is_wide"),
+        "frame": geometry.get("frame"),
     }
 
 
@@ -110,7 +160,18 @@ def _lbw_payload(geometry: dict, calibrators, pose_projectors) -> dict:
         "bounce_px": bounce_px,
         "impact_px": impact_px,
         "stumps_px": stumps_px,
-        "hitting": geometry.get("hitting"),
+        # Frame-keyed track: each point carries the capture frame it was seen on, so
+        # an overlay can FOLLOW the ball as the umpire steps rather than being pinned
+        # to one decision frame. `ball_path` / `measured_px` stay as flat polylines
+        # for the animation, which is time-driven and needs no frame keys.
+        "track": geometry.get("track") or [],
+        # Render flag, deliberately Optional[bool] and NOT the raw tri-state string:
+        # renderers test `hitting` for truthiness, and any non-empty string is truthy,
+        # so an "not_observed" literal here would light the stumps red. None and False
+        # both render idle — which is correct, because "missing" and "never checked"
+        # look the same on the stumps. The epistemic difference is carried by the
+        # WICKETS decision card, which is where an umpire reads it.
+        "hitting": Observation.coerce(geometry.get("hitting")).as_optional_bool(),
         "ball_path": ball_path,
     }
 
@@ -137,9 +198,12 @@ def _stump_pixels(projection) -> list[dict]:
     return points
 
 
-def _fmt(value) -> str:
+def _fmt(value, absent: str = "—") -> str:
+    """Render a card value. `absent` lets a field say WHY it is empty — an
+    unmeasured check reads "NOT OBSERVED", not a bare dash that looks like a
+    rendering glitch."""
     if value is None or value == "" or value == "--":
-        return "—"
+        return absent
     return str(value).upper()
 
 
@@ -154,7 +218,7 @@ def decision_cards_for(review_type: str, decision: dict) -> list[dict]:
             {"label": "DECISION", "value": "OUT" if is_out else "NOT OUT" if is_out is False else "—",
              "status": "out" if is_out else "not-out" if is_out is False else "info"},
             {"label": "BAT TO CREASE", "value": f"{abs(distance):.1f} cm" if distance is not None else "—", "status": "info"},
-            {"label": "BAILS", "value": _fmt(run_out.get("bails_status")), "status": "info"},
+            {"label": "BAILS", "value": BailsState.coerce(run_out.get("bails_status")).label().upper(), "status": "info"},
             {"label": "FRAME", "value": str(run_out.get("frame_number")) if run_out.get("frame_number") is not None else "—", "status": "info"},
         ]
     if review_type != "lbw":
@@ -164,10 +228,15 @@ def decision_cards_for(review_type: str, decision: dict) -> list[dict]:
     outcome_upper = str(outcome or "").upper()
     outcome_status = "not-out" if "NOT OUT" in outcome_upper else \
         "out" if "OUT" in outcome_upper else "info"
+    # The three DRS gates are NOT computed by the live pipeline: nothing sets
+    # `pitching_zone` / `impact_zone`, and `wicket_zone_status` is seeded "--" and
+    # never written. They render as NOT OBSERVED rather than an em dash — a dash
+    # reads as a rendering glitch, while the whole point is to tell the umpire this
+    # check did not run so they judge it themselves.
     return [
         {"label": "ORIGINAL DECISION", "value": _fmt(outcome), "status": outcome_status},
-        {"label": "PITCHING", "value": _fmt(decision.get("pitching_zone")), "status": "info"},
-        {"label": "IMPACT", "value": _fmt(decision.get("impact_zone")), "status": "info"},
-        {"label": "WICKETS", "value": _fmt(wicket),
+        {"label": "PITCHING", "value": _fmt(decision.get("pitching_zone"), absent="NOT OBSERVED"), "status": "info"},
+        {"label": "IMPACT", "value": _fmt(decision.get("impact_zone"), absent="NOT OBSERVED"), "status": "info"},
+        {"label": "WICKETS", "value": _fmt(wicket, absent="NOT OBSERVED"),
          "status": "out" if wicket == "HITTING" else "not-out" if wicket == "MISSING" else "info"},
     ]

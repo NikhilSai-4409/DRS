@@ -1,0 +1,103 @@
+{
+  "contract_version": 1,
+  "_comment": "CANONICAL SOURCE for the DRS overlay visual language. Python reads this file directly (core/overlay_tokens.py); the JavaScript twin (dashboard/electron/renderer/overlay/tokens.js) embeds the same values and tests/test_overlay_tokens.py fails if the two diverge. Renderers request a ROLE, never a colour: the role carries meaning, and the meaning is what must not drift.",
+
+  "roles": {
+    "path.measured": {
+      "means": "Positions the cameras actually observed.",
+      "color": "#ff4fa3",
+      "width": 4,
+      "cap": "round"
+    },
+    "path.predicted": {
+      "means": "Positions the model inferred. Never drawn in the measured colour.",
+      "color": "#46aaeb",
+      "width": 4,
+      "cap": "round",
+      "alpha_base": 0.6,
+      "alpha_confidence": 0.4
+    },
+    "path.transition": {
+      "means": "Where observation stops and inference begins. DERIVED from the last measured point, never stored — a stored copy drifts away from the path it labels.",
+      "disc_color": "#0d0f12",
+      "disc_radius": 9,
+      "ring_color": "#ffffff",
+      "ring_radius": 6.5,
+      "core_role": "path.measured",
+      "core_radius": 3
+    },
+    "mark.detected": {
+      "means": "A real image-space detection with no calibrated measurement behind it. Outlined, never filled: a fill hides the pixels the umpire is judging.",
+      "color": "#5ce65a",
+      "width": 2,
+      "fill": "none"
+    },
+    "guide.schematic": {
+      "means": "Assumed geometry, not an observation. Always accompanied by the words 'calibrate to measure'.",
+      "color": "#f2b134",
+      "width": 3,
+      "dash": [14, 8]
+    },
+    "geometry.reference": {
+      "means": "Real pitch geometry projected from a calibrated camera (crease, stump line).",
+      "color": "#ffffff",
+      "width": 3
+    },
+    "state.unobserved": {
+      "means": "The system could not look. Neutral grey — never the adverse colour, never the safe colour.",
+      "color": "#7d8b99",
+      "width": 3
+    },
+    "status.adverse": {
+      "means": "A resolved outcome against the batter.",
+      "color": "#eb3c3c"
+    },
+    "status.safe": {
+      "means": "A resolved outcome in the batter's favour.",
+      "color": "#5ec86e"
+    },
+    "casing": {
+      "means": "Dark stroke under every overlay line. MANDATORY: measured on real footage, no candidate colour reaches 3:1 luminance contrast against sunlit grass, so the casing carries luminance and the hue carries identity.",
+      "color": "rgba(0,0,0,0.55)",
+      "width_delta": 3
+    },
+    "label": {
+      "means": "Names a drawn element on the frame.",
+      "size": 12,
+      "weight": 700,
+      "transform": "uppercase",
+      "tracking": "0.08em",
+      "knockout_width": 4,
+      "knockout_color": "rgba(0,0,0,0.7)",
+      "color": "#ffffff"
+    },
+    "qualifier": {
+      "means": "Prose that explains a state ('schematic — calibrate to measure'). The only non-uppercase text on a frame, because it is read as a sentence.",
+      "size": 11,
+      "weight": 600,
+      "transform": "none",
+      "color": "#ffffff"
+    },
+    "measurement": {
+      "means": "A calibrated number. Value and unit together, never a bare number. White by default; tinted by outcome only when it resolves the decision.",
+      "size": 17,
+      "weight": 800,
+      "numeric": "tabular-nums",
+      "color": "#ffffff"
+    },
+    "frame.counter": {
+      "means": "Which frame is on screen. Same corner on every review type.",
+      "size": 13,
+      "weight": 700,
+      "family": "mono",
+      "position": "top-left",
+      "format": "FRAME {index}",
+      "color": "#ffffff"
+    },
+    "legend": {
+      "means": "The standing three-symbol key (measured / guide / detected). Same corner on every review type, so the vocabulary teaches itself.",
+      "position": "bottom-left",
+      "entries": ["path.measured", "guide.schematic", "mark.detected"]
+    }
+  }
+}

@@ -4,6 +4,9 @@
 // one visual language. Timing lives in AnimationDirector; drawing in OverlayRenderer;
 // colours in THEMES. Nothing here knows how a review was computed.
 
+import { BailsState, bailsLabel, bailsState } from "./observation.js";
+import { token } from "./tokens.js";
+
 function clamp(v) { return Math.max(0, Math.min(1, v)); }
 function ease(v) { v = clamp(v); return v * v * (3 - 2 * v); }
 
@@ -171,15 +174,25 @@ export class OverlayRenderer {
     ctx.restore();
   }
 
+  // Three states, never two. Absent status means UNKNOWN — it must not fall back
+  // to "INTACT", which would assert the wicket was unbroken just as falsely as the
+  // old hard-coded "DISLODGED" asserted the opposite. Twin of _draw_bails in
+  // core/overlay_renderer.py; both switch on the same wire literals.
   _bails(ctx, bails, status, reveal) {
     if (reveal <= 0) return;
-    const dislodged = String(status || "").toLowerCase() === "dislodged";
-    const color = dislodged ? this.theme.impact : "#ffffff";
+    const state = bailsState(status);
+    const dislodged = state === BailsState.DISLODGED;
+    // Colours come from the Evidence Contract roles, not literals typed here —
+    // hand-typed hexes at draw sites are how the two renderers drifted apart.
+    const color = dislodged ? this.theme.impact
+      : state === BailsState.INTACT ? token("geometry.reference").color
+      : token("state.unobserved").color;
+    const caption = `BAILS ${bailsLabel(state).toUpperCase()}`;
     for (const b of bails) {
       if (dislodged) { ctx.save(); ctx.globalAlpha = 0.32 * reveal; ctx.fillStyle = color; ctx.beginPath(); ctx.arc(b.x, b.y, 12 * reveal + 3, 0, 7); ctx.fill(); ctx.restore(); }
       ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = Math.max(2, 3 * reveal); ctx.beginPath(); ctx.moveTo(b.x - 7, b.y); ctx.lineTo(b.x + 7, b.y); ctx.stroke(); ctx.restore();
     }
-    if (reveal > 0.5 && bails.length) { ctx.save(); ctx.fillStyle = color; ctx.font = "12px system-ui"; ctx.fillText("BAILS " + (dislodged ? "DISLODGED" : "INTACT"), bails[0].x + 14, bails[0].y - 6); ctx.restore(); }
+    if (reveal > 0.5 && bails.length) { ctx.save(); ctx.fillStyle = color; ctx.font = "12px system-ui"; ctx.fillText(caption, bails[0].x + 14, bails[0].y - 6); ctx.restore(); }
   }
 
   _framestep(ctx, frameNumber) {

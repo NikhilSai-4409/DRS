@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 
 from core.animation_director import AnimationDirector
+from core.observation import BailsState
 from core.renderer_theme import BROADCAST_THEME, RendererTheme, theme_for
 from core.timelines import timeline_for
 
@@ -192,10 +193,19 @@ class OverlayRenderer:
             cv2.putText(frame, label, (cx - 12, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     def _draw_bails(self, frame, bails, status, reveal):
+        """Three states, never two. Absent status means UNKNOWN — it must not fall
+        back to "INTACT", which would assert the wicket was unbroken just as falsely
+        as the old hard-coded "DISLODGED" asserted the opposite."""
         if reveal <= 0:
             return
-        dislodged = str(status or "").lower() == "dislodged"
-        color = (60, 60, 235) if dislodged else (255, 255, 255)
+        state = BailsState.coerce(status)
+        dislodged = state is BailsState.DISLODGED
+        if dislodged:
+            color, caption = (60, 60, 235), "BAILS DISLODGED"
+        elif state is BailsState.INTACT:
+            color, caption = (255, 255, 255), "BAILS INTACT"
+        else:
+            color, caption = (153, 139, 125), "BAILS NOT OBSERVED"   # neutral grey
         for bail in bails:
             x, y = int(bail["x"]), int(bail["y"])
             if dislodged:
@@ -204,7 +214,7 @@ class OverlayRenderer:
                 cv2.addWeighted(glow, 0.3 * reveal, frame, 1 - 0.3 * reveal, 0, frame)
             cv2.line(frame, (x - 7, y), (x + 7, y), color, max(2, int(3 * reveal)), cv2.LINE_AA)
         if reveal > 0.5 and bails:
-            cv2.putText(frame, "BAILS " + ("DISLODGED" if dislodged else "INTACT"),
+            cv2.putText(frame, caption,
                         (int(bails[0]["x"]) + 14, int(bails[0]["y"]) - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
