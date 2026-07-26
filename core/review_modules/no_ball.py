@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 
 from config.settings import NO_BALL_CREASE_MARGIN_MM
+from core.frame_ref import FrameRef
 from core.review_modules.base import ReviewContext, ReviewModule
 from utils.logger import get_logger
 
@@ -31,7 +32,9 @@ class FootLocation:
     toe_px: tuple[float, float]
     heel_px: tuple[float, float]
     confidence: float
-    landing_frame_id: int
+    landing_frame_id: int              # capture index — per-camera, not a clip index
+    # The only value comparable across surfaces (replay clip, waveform, overlay).
+    landing_timestamp_ms: float | None = None
 
 
 class FootLocator:
@@ -50,23 +53,24 @@ class FootLocator:
             frame = getattr(vf, "frame", None)
             if frame is None:
                 continue
-            grays.append((vf.frame_id, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+            grays.append((vf.frame_id, getattr(vf, "timestamp_ms", None),
+                          cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
         if len(grays) < 3:
             return None
 
-        height = grays[0][1].shape[0]
+        height = grays[0][2].shape[0]
         roi_top = int(height * self.roi_top_ratio)
 
-        best = None  # (motion, frame_id, diff_roi)
-        for (_, prev), (fid, cur) in zip(grays, grays[1:]):
+        best = None  # (motion, frame_id, timestamp_ms, diff_roi)
+        for (_, _, prev), (fid, ts, cur) in zip(grays, grays[1:]):
             diff = cv2.absdiff(cur, prev)[roi_top:, :]
             motion = float(diff.sum())
             if best is None or motion > best[0]:
-                best = (motion, fid, diff)
+                best = (motion, fid, ts, diff)
         if best is None or best[0] <= 0:
             return None
 
-        _, landing_frame_id, diff_roi = best
+        _, landing_frame_id, landing_timestamp_ms, diff_roi = best
         blurred = cv2.GaussianBlur(diff_roi, (5, 5), 0)
         _, mask = cv2.threshold(blurred, self.motion_threshold, 255, cv2.THRESH_BINARY)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
@@ -96,6 +100,7 @@ class FootLocator:
             heel_px=(float(heel[0]), float(heel[1])),
             confidence=round(confidence, 3),
             landing_frame_id=int(landing_frame_id),
+            landing_timestamp_ms=None if landing_timestamp_ms is None else float(landing_timestamp_ms),
         )
 
 
@@ -108,6 +113,8 @@ class NoBallReviewModule(ReviewModule):
                 "foot_polygon", "contact_area", "overstep_percent", "replay")
     replay_mode = "freeze_frame"
     decision_card = ("Front foot", "Margin", "Decision")
+    # Operator workflow: front-foot check only, then decide.
+    protocol = (("front_foot", "Front Foot"), ("decision", "Decision"))
     supports = {"crease": True, "freeze_frame": True, "zoom": True,
                 "frame_step": True, "measurement": True}
 
@@ -163,6 +170,11 @@ class NoBallReviewModule(ReviewModule):
             "toe_px": {"x": round(foot.toe_px[0], 1), "y": round(foot.toe_px[1], 1)},
             "heel_px": {"x": round(foot.heel_px[0], 1), "y": round(foot.heel_px[1], 1)},
             "landing_frame_id": foot.landing_frame_id,
+            # Frame identity carrying its space and camera. `landing_frame_id` alone
+            # is a per-camera capture counter — not comparable with the replay-clip
+            # indices UltraEdge events use, nor with another camera's counter.
+            "frame": FrameRef.capture(foot.landing_frame_id, foot.landing_timestamp_ms,
+                                      camera_id).to_dict(),
             "camera_id": camera_id,
             "foot_detected": True,
             "requires_calibration": False,

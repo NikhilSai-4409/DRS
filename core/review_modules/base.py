@@ -85,6 +85,19 @@ class ReviewModule:
     replay_mode: str = "generic"                 # trajectory | wide_line | freeze_frame | frame_stepping | audio_sync | generic
     decision_card: tuple[str, ...] = ("Decision",)
     export_format: str = "review_json"
+    # The OPERATOR PROTOCOL: the ordered workflow stages the umpire walks through
+    # for this review type. This is what the review workspace renders — a Wide
+    # review's UI is built from Wide's protocol and never learns another type's
+    # stages. (timeline above is the BALL-EVENT sequence; protocol is the REVIEW
+    # workflow — they are different things.)
+    protocol: tuple[tuple[str, str], ...] = (("analysis", "Analysis"), ("decision", "Decision"))
+    # How the decision is reached, mirroring broadcast DRS:
+    #   automatic — the system produces a measurement-backed reading (front-foot
+    #               overstep, wide-line margin, LBW trajectory gates)
+    #   assisted  — the system provides evidence tools (slow motion, waveform,
+    #               frame stepping); any system reading is ADVISORY and the
+    #               umpire makes the call
+    decision_mode: str = "automatic"
     # Which replay/UI capabilities this review type uses. The dashboard enables or
     # disables whole UI sections from this map (replay overlays, layer toggles, jump
     # actions) instead of scattering per-type conditionals through the frontend.
@@ -110,6 +123,8 @@ class ReviewModule:
             "replay_mode": self.replay_mode,
             "decision_card": list(self.decision_card),
             "export_format": self.export_format,
+            "protocol": [{"key": key, "label": label} for key, label in self.protocol],
+            "decision_mode": self.decision_mode,
             "supports": {**ReviewModule.supports, **self.supports},
         }
 
@@ -169,10 +184,11 @@ class ReviewModule:
 
     # ----- result scaffolding -----
     def timeline_payload(self, complete: bool) -> list[dict]:
-        status = "complete" if complete else "active"
-        rows = [{"label": label, "status": "complete"} for label in self.timeline[:-1]]
-        rows.append({"label": self.timeline[-1], "status": status})
-        return rows
+        """Honest timeline: stages are "complete" only when the analysis actually
+        finished. An awaiting/partial review keeps every stage NEUTRAL — progress
+        that didn't happen is never painted (green means verified, nothing else)."""
+        status = "complete" if complete else "pending"
+        return [{"label": label, "status": status} for label in self.timeline]
 
     def base_result(self, explanation: str, confidence: float | None = None) -> dict:
         """A clean decision overlay that clears LBW-only fields for non-LBW reviews."""
@@ -295,6 +311,13 @@ def _verdict_for(review_type: str, decision: dict) -> str:
         if edge.get("inconclusive"):
             return "INCONCLUSIVE"
         hotspot = decision.get("hotspot_analysis") or {}
+        # NO EDGE is a real finding — it requires audio/heatmap to actually have
+        # been analysed. With nothing measured the only honest answer is AWAITING.
+        analyzed = (edge.get("edge_probability") is not None
+                    or bool(edge.get("events"))
+                    or hotspot.get("contact_detected") is not None)
+        if not analyzed:
+            return "AWAITING"
         if (edge.get("edge_probability") or 0.0) >= 0.5 or hotspot.get("contact_detected"):
             return "EDGE"
         return "NO EDGE"

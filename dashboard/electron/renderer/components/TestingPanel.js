@@ -51,6 +51,7 @@ export class TestingPanel {
           <span class="chip-quiet">Engineer tool</span>
         </header>
         <div class="tw-body">
+          <div class="tw-config">
           <section class="tw-step">
             <div class="tw-step-h"><span class="tw-num">1</span><strong>Upload Delivery</strong></div>
             <label class="drop-zone">
@@ -108,6 +109,7 @@ export class TestingPanel {
             <div class="analysis-progress"><i style="width:0%"></i></div>
             <span class="analysis-status" id="tw-status">Upload a delivery to begin</span>
           </section>
+          </div>
 
           <section class="tw-step tw-results-step">
             <div class="tw-step-h"><span class="tw-num">✓</span><strong>Results</strong></div>

@@ -153,11 +153,9 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 .view { display: none; flex-direction: column; gap: 14px; min-height: 0; }
 .view.active { display: flex; flex: 1 1 auto; min-height: 0; animation: cardin 220ms var(--ease) both; }
 .view > .card { flex: 1 1 auto; min-height: 0; }
-.view-testing.active,
 .view-validation.active,
 .view-models.active,
 .view[data-view="development"].active { overflow: visible; }
-.view-testing > .testing-root,
 .view-validation > .validation-root,
 .view-models > .models-root,
 .view[data-view="development"] > .development-card { flex: 0 0 auto; min-height: auto; }
@@ -165,6 +163,15 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 /* ---------- review type sub-header (item 2) ---------- */
 .review-type-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex: none; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; }
 .rt-label { font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); margin-right: 6px; }
+/* Request Review is the dashboard's ONE action, but it is a button, not a banner:
+   without `flex: none` it stretched to the full row width (1146x54) and wrapped
+   onto its own line — the "large cyan bar" that dominated the page. */
+.rt-request {
+  flex: 0 0 auto; padding: 8px 18px; font-size: 13px; font-weight: 700;
+  border-radius: 9px; border: 1px solid rgba(59, 130, 246, 0.5);
+  background: rgba(59, 130, 246, 0.16); color: var(--accent2); cursor: pointer;
+}
+.rt-request:hover:not(:disabled) { background: rgba(59, 130, 246, 0.28); }
 .rt-btn { border-radius: 999px; background: transparent; border: 1px solid var(--border-2); color: var(--muted); }
 .rt-btn.active { background: rgba(59, 130, 246, 0.18); border-color: var(--blue); color: #fff; }
 
@@ -185,78 +192,98 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 .card-h strong { font-weight: 600; font-size: 14px; }
 .card-h small, .card-h span { color: var(--muted); font-size: 12px; }
 .card-h small { display: block; }
-.scene-tools { display: flex; gap: 8px; }
 .cam-head-right { display: flex; align-items: center; gap: 12px; }
 
-/* ---------- dashboard = state-driven review workspace (item 1) ---------- */
+/* ---------- dashboard = CONTROL ROOM ----------
+   Cameras, match, health, request a review. It does NOT review anything: no
+   evidence panels, no verdict, no confirm buttons. That was a second review
+   surface competing with the workspace and it is gone. Two cards only. */
 .dash-grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: "feed feed feed feed feed feed feed feed queue queue queue queue";
   gap: 14px; flex: 1 1 auto; min-height: 0;
 }
 /* Grid items must be allowed to shrink to their tracks (default min-height:auto lets
    one card's content inflate a whole row and force PAGE scroll — the compression bug).
    A card whose content genuinely exceeds its track scrolls internally instead. */
 .dash-grid > .card { min-height: 0; min-width: 0; }
-
-/* Evidence card: the stump graphic flex-shrinks so the verdict + tiles always fit
-   the card — the SVG letterboxes (preserveAspectRatio=meet) instead of forcing scroll. */
-.d-evidence .decision-evidence-host,
-.d-evidence .wip { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
-.d-evidence .wip-view { flex: 1 1 auto; min-height: 56px; }
-.d-evidence .wip-view svg { width: 100%; height: 100%; display: block; }
 .d-feed { grid-area: feed; }
-.d-detail { grid-area: detail; }
-.d-decision { grid-area: decision; }
-.d-timeline { grid-area: timeline; }
 .d-queue { grid-area: queue; }
-.d-evidence { grid-area: evidence; }
 
-/* WAITING — operator watches cameras: feed-dominant, analysis hidden */
-.dash-grid[data-state="waiting"] {
-  grid-template-rows: minmax(360px, 1.5fr) minmax(180px, 0.55fr);
-  grid-template-areas:
-    "feed feed feed feed feed feed feed feed decision decision decision decision"
-    "timeline timeline timeline timeline queue queue queue queue decision decision decision decision";
+/* ONE review presence, two mutually exclusive occupants (readiness while idle,
+   the running review's protocol panel while active). Deliberately quiet: the
+   control room MONITORS, it does not shout. Colour carries the state. */
+/* `contents` so the wrapper itself never occupies a flex slot — with both
+   occupants hidden the dashboard has no status line and no phantom gap. */
+.status-line { display: contents; }
+.review-strip, .readiness-strip {
+  flex: none; width: 100%;
+  padding: 7px 12px; border: 1px solid var(--border-2); border-radius: 10px;
+  background: var(--panel); font: inherit; text-align: left;
 }
-.dash-grid[data-state="waiting"] .d-detail { display: none; }
-.dash-grid[data-state="waiting"] .d-evidence { display: none; }
-
-/* PROCESSING + RESULT — the replay/analysis card is the primary evidence and gets
-   the most area (6 of 12 columns, the taller row); the live feed shrinks once the
-   event is captured, and history/timeline compress before the evidence does. */
-.dash-grid[data-state="processing"],
-.dash-grid[data-state="result"] {
-  grid-template-rows: minmax(300px, 1.45fr) minmax(170px, 0.55fr);
-  grid-template-areas:
-    "feed feed feed detail detail detail detail detail detail decision decision decision"
-    "timeline timeline queue queue queue evidence evidence evidence evidence decision decision decision";
+.readiness-strip { display: flex; align-items: center; gap: 10px; }
+/* Active review = a small PANEL: header line + evidence checklist + decision. */
+.review-strip { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+.rs-head { display: flex; align-items: center; gap: 10px; }
+.review-strip[hidden], .readiness-strip[hidden] { display: none; }
+.sl-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
+.review-strip strong, .readiness-strip strong { font-size: 13px; font-weight: 700; }
+.review-strip .rs-elapsed, .readiness-strip small {
+  color: var(--muted); font-size: 12px; margin-right: auto;
 }
-
-/* FOCUS MODE (result): the capture workspace becomes a DECISION workspace — the
-   live feed collapses to a corner, its thumbnail strip hides, timeline/history
-   drop to a slim row, and the replay takes 7 of 12 columns in a taller row.
-   Wickets and the decision column stay in view. */
-.dash-grid[data-state="result"] {
-  grid-template-rows: minmax(320px, 1.6fr) minmax(140px, 0.4fr);
-  grid-template-areas:
-    "feed feed detail detail detail detail detail detail detail decision decision decision"
-    "timeline timeline queue queue queue evidence evidence evidence evidence decision decision decision";
+.review-strip { border-color: rgba(96, 165, 250, 0.4); }
+.review-strip .sl-dot { background: var(--blue); animation: sldot 1.6s var(--ease) infinite; }
+.review-strip.result { border-color: rgba(34, 197, 94, 0.4); }
+.review-strip.result .sl-dot { background: var(--green); animation: none; }
+.rs-open {
+  border: 1px solid rgba(96, 165, 250, 0.5); background: rgba(59, 130, 246, 0.16);
+  color: var(--accent2); border-radius: 8px; padding: 6px 14px; font-size: 12px;
+  font-weight: 700; cursor: pointer;
 }
-.dash-grid[data-state="result"] .camera-thumbs { display: none; }
+.rs-open:hover { background: rgba(59, 130, 246, 0.28); }
+/* Evidence Checklist: the protocol mirrored on the dashboard, same tri-state
+   colours as the workspace rail (one visual language). Rows are DEEP LINKS —
+   clicking one opens the workspace on that stage's evidence. */
+.rs-evidence { display: flex; flex-direction: column; gap: 1px; border-top: 1px solid var(--border-2); padding-top: 5px; }
+.rs-evidence[hidden], .rs-decision[hidden] { display: none; }
+.rs-ev, .rs-decision {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 4px 8px;
+  border: 1px solid transparent; border-radius: 8px; background: none;
+  font: inherit; text-align: left; cursor: pointer; color: inherit;
+}
+.rs-ev:hover, .rs-decision:hover { background: var(--panel-3); border-color: var(--border-2); }
+.rs-ev-ico { width: 20px; flex: none; text-align: center; font-size: 12px; color: var(--muted); }
+.rs-ev.passed .rs-ev-ico { color: var(--green); }
+.rs-ev.processing .rs-ev-ico { color: var(--blue); animation: sldot 1.6s var(--ease) infinite; }
+.rs-ev.skipped .rs-ev-ico { color: var(--amber); }
+.rs-ev.failed .rs-ev-ico { color: var(--red); }
+.rs-ev-lbl { font-size: 12.5px; font-weight: 600; }
+.rs-ev-word { margin-left: auto; font-size: 12px; font-weight: 700; letter-spacing: 0.02em; color: var(--muted); }
+.rs-ev.passed .rs-ev-word { color: #d6e6df; }
+.rs-ev.skipped .rs-ev-word { color: var(--amber); }
+.rs-ev.failed .rs-ev-word { color: var(--red); }
+.rs-decision { border-top: 1px solid var(--border-2); border-radius: 0; margin-top: 2px; padding-top: 7px; }
+.rs-decision:hover { border-radius: 8px; }
+.rs-dec-text { margin-left: auto; font-size: 12px; color: var(--muted); }
+.rs-decision.ready .rs-dec-text { color: var(--green); font-weight: 700; }
+/* Readiness: green is silent, warn/fail earn the colour. */
+.readiness-strip { cursor: pointer; }
+.readiness-strip:hover { border-color: var(--border-2); background: var(--panel-3); }
+.readiness-strip.pass .sl-dot { background: var(--green); }
+.readiness-strip.warn .sl-dot { background: var(--amber); }
+.readiness-strip.fail .sl-dot { background: var(--red); }
+.readiness-strip.fail { border-color: rgba(239, 68, 68, 0.4); }
+@keyframes sldot { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
 
-/* Short laptop windows (≤920px tall): reclaim chrome so the analysis cards get the
-   height — the review content should compress last, not first. */
+/* Short laptop windows (≤920px tall): reclaim chrome so the cards get the height. */
 @media (max-height: 920px) {
   .main { gap: 10px; padding: 10px 12px; }
   .review-type-header { padding: 6px 10px; }
   .card-h { padding: 8px 12px; }
-  .rs-grid div { padding: 6px 8px; }
-  .decision-stages, .confidence-breakdown { padding: 8px 12px; }
   .system-alerts { padding: 6px 10px; font-size: 12px; }
   .dash-grid { gap: 10px; }
-  .dash-grid[data-state="processing"] { grid-template-rows: minmax(260px, 1.45fr) minmax(150px, 0.55fr); }
-  .dash-grid[data-state="result"] { grid-template-rows: minmax(280px, 1.6fr) minmax(130px, 0.4fr); }
 }
 
 /* 1366x768-class laptops: tightest tier — everything still visible, just denser. */
@@ -265,40 +292,16 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
   .card-h { padding: 6px 10px; }
   .card-h small { display: none; }
   .dash-grid { gap: 8px; }
-  .dash-grid[data-state="waiting"] { grid-template-rows: minmax(280px, 1.5fr) minmax(140px, 0.55fr); }
-  .dash-grid[data-state="processing"] { grid-template-rows: minmax(225px, 1.45fr) minmax(130px, 0.55fr); }
-  .dash-grid[data-state="result"] { grid-template-rows: minmax(240px, 1.6fr) minmax(115px, 0.4fr); }
-  .decision-stages { padding: 6px 10px; gap: 6px; }
   .camera-thumbs { padding: 6px 8px; }
   .cam-thumb { width: 118px; height: 70px; }
 }
 
-/* The broadcast replay must FIT its card, never hide behind an inner scrollbar:
-   size the stage from the panel's actual height (aspect 1.62 → width = 162cqh). */
-.review-panel { container-type: size; }
-.lbw-view[data-lbw-view="broadcast"] { overflow: hidden; }
-.lbw-view[data-lbw-view="broadcast"] .drsa-wrap { width: 100%; max-width: 148cqh; margin: 0 auto; }
-
-/* decision card content by state */
-#review-summary { display: none; }
-.dash-grid[data-state="result"] #review-summary { display: grid; }
-.dash-grid[data-state="result"] #decision-state,
-.dash-grid[data-state="result"] #decision-title,
-.dash-grid[data-state="result"] #decision-explanation { display: none; }
-.dash-grid[data-state="waiting"] #confidence-breakdown,
-.dash-grid[data-state="result"] #confidence-breakdown { display: none; }
-
-/* review summary panel (item: review summary) */
-.review-summary { padding: 10px 14px; gap: 10px; align-content: start; }
-.review-summary .rs-h { font-weight: 700; font-size: 14px; }
-
-.rs-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.rs-grid div { display: grid; gap: 3px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-3); }
-.rs-grid span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
-.rs-grid strong { font-weight: 600; }
-
 /* main feed */
 .live-stage { position: relative; flex: 1 1 auto; min-height: 0; background: #0b1018; overflow: hidden; }
+/* Overlay layer over a media stage. The dashboard's schematic wide/no-ball
+   overlays are gone (evidence belongs to the workspace); this still positions
+   the Replay workspace's REAL ball-path overlay (#replay-overlay). */
+.feed-overlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
 /* generic fullscreen control for any media stage (camera feeds, replay, upload video) */
 .fs-btn { position: absolute; top: 8px; right: 8px; z-index: 8; background: #0c1522cc; border: 1px solid #ffffff2a; color: #fff; border-radius: 8px; padding: 6px 10px; font-size: 14px; line-height: 1; cursor: pointer; backdrop-filter: blur(4px); }
 .fs-btn:hover { background: #16233acc; }
@@ -320,16 +323,7 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 .cam-thumb .t-live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
 
 /* feed overlays (wide line / crease + foot) */
-.feed-overlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
-.ov-line { stroke: var(--blue); stroke-width: 0.6; }
-.ov-path { stroke: rgba(255, 255, 255, 0.85); stroke-width: 0.5; }
-.ov-ball { fill: #fff; }
-.ov-foot { fill: rgba(34, 197, 94, 0.18); stroke: var(--green); stroke-width: 0.7; transition: fill 300ms var(--ease), stroke 300ms var(--ease); }
-.ov-foot.flagged { fill: rgba(239, 68, 68, 0.22); stroke: var(--red); animation: footflag 1.2s var(--ease) infinite; }
 @keyframes footflag { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
-.ov-toe { fill: var(--amber); }
-.ov-heel { fill: var(--blue); }
-.ov-text { fill: #cdd6df; font: 700 3px Inter, sans-serif; }
 
 /* replay workspace */
 .replay-stage { min-height: 280px; }
@@ -339,62 +333,17 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 #frame-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
 
 /* review detail panels */
-.review-panel { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow: auto; }
-.trajectory-scene { flex: 1 1 auto; min-height: 140px; width: 100%; background: radial-gradient(120% 120% at 50% 0, #11202e, #0a121a); }
-.trajectory-scene canvas { display: block; width: 100%; height: 100%; }
-.pitch-map-mini { width: calc(100% - 28px); height: 88px; margin: 10px 14px; border-radius: 10px; background: #080d0f; flex: none; }
-.decision-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 12px 14px; flex: none; }
 .live-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--border); }
-.decision-metrics div, .health-grid div, .metric-list div {
-  display: grid; gap: 4px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-3);
-}
-.decision-metrics strong, .health-grid strong, .metric-list strong { font-weight: 600; }
-.decision-metrics span, .health-grid span, .metric-list span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-.metric-list { padding: 12px 14px; display: grid; gap: 8px; flex: none; }
 
 /* wide top view */
-.topview-wrap { flex: 1 1 auto; min-height: 130px; display: grid; place-items: center; padding: 12px; border-bottom: 1px solid var(--border); }
-.topview { width: 100%; max-height: 230px; }
-.tv-pitch { fill: #16202c; stroke: var(--border-2); stroke-width: 1; }
-.tv-wide { stroke: var(--blue); stroke-width: 1.5; }
-.tv-crease { stroke: rgba(255, 255, 255, 0.5); stroke-width: 1; }
-.tv-stumps rect { fill: #f2e6bd; }
-.tv-dist { stroke: var(--amber); stroke-width: 1.5; }
-.tv-ball { fill: #fff; stroke: var(--blue); stroke-width: 1; }
-.tv-overlap { fill: rgba(239, 68, 68, 0.16); }
-.tv-label { fill: var(--muted); font: 700 7px Inter, sans-serif; }
-.tv-legend { display: flex; gap: 12px; flex-wrap: wrap; padding: 8px 0 0; font-size: 11px; color: var(--muted); }
-.tv-legend span { display: inline-flex; align-items: center; gap: 5px; }
-.tv-legend i { width: 10px; height: 10px; border-radius: 2px; }
-.tv-legend .lg-wide { background: var(--blue); }
-.tv-legend .lg-ball { background: #fff; border-radius: 50%; }
-.tv-legend .lg-overlap { background: rgba(239, 68, 68, 0.5); }
 
 /* wide feed overlap band */
-.ov-overlap { fill: rgba(239, 68, 68, 0.14); }
 
 /* verdict blocks (wide + no ball) */
-.verdict-block { padding: 16px 14px; display: grid; gap: 8px; justify-items: center; text-align: center; border-bottom: 1px solid var(--border); flex: none; }
-.big-verdict { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--border-2); background: var(--panel-3); font-size: 26px; font-weight: 800; letter-spacing: 1px; }
-.big-verdict.waiting { color: var(--muted); }
-.big-verdict.out { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.5); color: #fca5a5; }
-.big-verdict.not-out { background: rgba(34, 197, 94, 0.16); border-color: rgba(34, 197, 94, 0.5); color: #86efac; }
-.verdict-sub { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
-.verdict-figure { font-size: 24px; font-weight: 700; }
 
-.foot-meter { padding: 14px; display: grid; gap: 8px; border-bottom: 1px solid var(--border); flex: none; }
-.foot-meter-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
-.foot-meter-track { position: relative; height: 16px; border-radius: 999px; background: rgba(255, 255, 255, 0.07); overflow: hidden; }
-.foot-meter-track i { display: block; height: 100%; width: 0%; border-radius: 999px; background: var(--green); transition: width 500ms var(--ease), background 300ms var(--ease); }
-.foot-meter-track i.over { background: var(--red); }
 .foot-crease-mark { position: absolute; top: -3px; bottom: -3px; left: 50%; width: 2px; background: #fff; opacity: 0.7; }
 
 /* edge (item 5 — enlarged) */
-.ultraedge-canvas { width: calc(100% - 28px); height: 190px; margin: 14px; border-radius: 10px; background: #080d0f; flex: none; }
-.edge-mode { padding: 0 14px 12px; color: var(--muted); }
-.thermal-view { margin: 12px 14px; flex: 1 1 auto; min-height: 60px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 10px; background: radial-gradient(70% 90% at 50% 70%, #1a2230, #0c131c); color: var(--muted); text-align: center; padding: 10px; }
-.thermal-view.thermal { color: #fff5db; background: radial-gradient(circle at 62% 38%, rgba(255, 220, 70, 0.6), transparent 18%), radial-gradient(circle at 42% 58%, rgba(239, 68, 68, 0.45), transparent 24%), #15120e; }
-.thermal-view.active { border-color: rgba(245, 158, 11, 0.5); color: #fff; }
 
 /* ---------- decision state machine (item 5) ---------- */
 .badge { width: max-content; margin: 12px 14px 0; padding: 6px 12px; border-radius: 999px; background: rgba(59, 130, 246, 0.14); border: 1px solid rgba(59, 130, 246, 0.4); color: var(--accent2); font-weight: 700; font-size: 12px; letter-spacing: 0.4px; }
@@ -403,55 +352,18 @@ small, .muted, .camera-label, .camera-fps { color: var(--muted); }
 .badge.processing { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.45); color: #fcd34d; }
 /* Compact horizontal strip (✓ Waiting · ✓ Processing · ● Decision) — the state
    machine is status, not evidence, so it takes one slim row instead of a column. */
-.state-machine { padding: 8px 14px; display: flex; align-items: center; gap: 6px; flex: none; }
-.state-machine .state-arrow { display: none; }
-.state-node { display: flex; align-items: center; justify-content: center; gap: 9px; width: 100%; padding: 8px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-3); color: var(--muted); font-weight: 700; font-size: 12px; letter-spacing: 0.4px; }
-.state-node i { width: 9px; height: 9px; border-radius: 50%; border: 2px solid currentColor; flex: none; transition: all 200ms var(--ease); }
-.state-node.active { color: var(--accent2); border-color: rgba(59, 130, 246, 0.5); }
-.state-node.active i { background: var(--accent); border-color: var(--accent); }
-.state-node.done { color: var(--green); border-color: rgba(34, 197, 94, 0.4); }
-.state-node.done i { background: var(--green); border-color: var(--green); }
-.state-node.result.out { color: #fca5a5; border-color: rgba(239, 68, 68, 0.5); }
-.state-node.result.out i { background: var(--red); border-color: var(--red); }
-.state-node.result.not-out { color: #86efac; border-color: rgba(34, 197, 94, 0.5); }
-.state-node.result.not-out i { background: var(--green); border-color: var(--green); }
-.state-arrow { color: var(--muted); font-size: 12px; line-height: 1; }
 
-.broadcast-overlay { margin: 4px 14px; padding: 14px; border-radius: 12px; border: 1px solid var(--border-2); background: var(--panel-3); font-size: 30px; font-weight: 800; text-align: center; letter-spacing: 1px; flex: none; }
-.broadcast-overlay.out { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.5); color: #fca5a5; }
-.broadcast-overlay.not-out { background: rgba(34, 197, 94, 0.16); border-color: rgba(34, 197, 94, 0.5); color: #86efac; }
-.broadcast-overlay.processing { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.45); color: #fcd34d; }
-.decision-title-quiet { margin: 0; padding: 0 14px; font-size: 14px; font-weight: 600; color: var(--muted); flex: none; }
-.decision-explanation { margin: 0; padding: 8px 14px; color: #d7dde4; line-height: 1.5; font-size: 13px; flex: none; }
-.confidence-breakdown { flex: 1 1 auto; min-height: 0; padding: 8px 14px; display: grid; align-content: start; gap: 9px; overflow: auto; }
-.confidence-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 10px; }
-.confidence-row div { grid-column: 1 / -1; height: 7px; border-radius: 999px; overflow: hidden; background: rgba(255, 255, 255, 0.07); }
-.confidence-row i { display: block; height: 100%; border-radius: 999px; background: var(--accent); transition: width 600ms var(--ease); }
-.confidence-row span { color: var(--muted); }
-.confidence-row strong { font-weight: 600; }
-.decision-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--border); flex: none; }
-.decision-actions button { flex: 1 1 auto; }
-.decision-actions .danger { border-color: rgba(239, 68, 68, 0.5); background: rgba(239, 68, 68, 0.14); color: #fca5a5; }
-.decision-actions .success { border-color: rgba(34, 197, 94, 0.5); background: rgba(34, 197, 94, 0.14); color: #86efac; }
+/* Idle: a giant WAITING banner is noise, not information — hide it until a
+   review is actually running or decided. */
+/* Non-fraction readings (frames, statuses, distances) carry no meter — an empty
+   track would look like a 0% score that was never measured. */
 /* Request Review is the primary idle-state action — big, glowing, unmistakable. */
-#request-review {
-  flex: 1 1 100%; padding: 16px; font-size: 16px; font-weight: 800; letter-spacing: .5px;
-  border-radius: 12px; color: #041014; border: none; cursor: pointer;
-  background: linear-gradient(90deg, #38bdf8, #22d3ee);
-  box-shadow: 0 6px 22px rgba(56, 189, 248, .35);
-  animation: rr-pulse 2.2s ease-in-out infinite;
-}
-#request-review:hover { filter: brightness(1.08); }
-@keyframes rr-pulse { 0%, 100% { box-shadow: 0 6px 22px rgba(56, 189, 248, .35); } 50% { box-shadow: 0 6px 30px rgba(56, 189, 248, .6); } }
+/* Request Review is the dashboard's one action — clearly the primary button, but
+   still a button. It used to be `flex: 1 1 100%` with a pulsing cyan gradient and
+   a glow, which made it a full-width banner (1146x54) on its own wrapped line and
+   the loudest thing on a screen whose job is quiet monitoring. See .rt-request. */
 
 /* ---------- adaptive timeline (item 10) ---------- */
-.decision-stages { flex: 1 1 auto; min-height: 0; padding: 14px; display: flex; flex-wrap: wrap; gap: 10px; align-content: start; overflow: auto; }
-.timeline-row { display: inline-flex; align-items: center; gap: 8px; padding: 8px 13px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-3); color: var(--muted); font-size: 12px; font-weight: 600; }
-.timeline-row i { width: 9px; height: 9px; border-radius: 50%; border: 2px solid currentColor; flex: none; transition: all 200ms var(--ease); }
-.timeline-row.complete { color: var(--green); border-color: rgba(34, 197, 94, 0.45); }
-.timeline-row.complete i { background: var(--green); border-color: var(--green); }
-.timeline-row.active { color: var(--accent2); border-color: rgba(59, 130, 246, 0.5); }
-.timeline-row.active i { background: var(--accent); border-color: var(--accent); }
 
 /* ---------- review queue + session manager (item 8 + sessions) ---------- */
 .d-queue { display: flex; flex-direction: column; }
@@ -658,6 +570,8 @@ body.mode-match .engineer-only { display: none !important; }
 
 /* ---------- full-screen calibration workspace ---------- */
 .calibration-root { flex: 1 1 auto; min-height: 0; display: flex; }
+/* min-height 0 lets the workspace shrink to its flex track (tab host) instead of
+   inflating to sidebar content height and forcing the whole tab to scroll. */
 .cal-workspace { flex: 1 1 auto; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
 .cws-head { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
 .cws-title strong { font-size: 15px; } .cws-title small { display: block; color: var(--muted); font-size: 11px; }
@@ -680,6 +594,113 @@ body.mode-match .engineer-only { display: none !important; }
 .cp-q.ready { color: #86efac; } .cp-q.recapture { color: #fcd34d; } .cp-q.missing { color: #fca5a5; }
 .cal-live-status { font-weight: 700; margin-right: 6px; }
 .cal-live-status.warn { color: var(--amber); }
+
+/* ---------- calibration tabs (Slice 2 shell) ---------- */
+/* flex-grow: as a flex-row item of .calibration-root, the shell otherwise
+   shrinks to CONTENT width — with no live feed the broken <img> is tiny, and the
+   whole calibration page collapsed to ~810px with a dead strip on the right. */
+.cal-tabs { display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0; height: 100%; min-height: 0; }
+.cal-tabbar { display: flex; gap: 6px; padding: 10px 14px 0; border-bottom: 1px solid var(--border); background: var(--panel-2); flex: none; }
+.cal-tab { border: 1px solid var(--border); border-bottom: none; border-radius: 10px 10px 0 0; background: var(--panel-3); color: var(--muted); font-weight: 700; font-size: 13.5px; padding: 10px 18px; margin-bottom: -1px; min-height: 0; }
+.cal-tab:hover:not(.active) { color: #fff; }
+.cal-tab.active { color: #fff; background: var(--panel); position: relative; }
+.cal-tab.active::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--blue); border-radius: 2px 2px 0 0; }
+/* Flex so a tab's panel can FILL the host height (auto-fit) instead of stacking
+   at the top; overflow:auto stays as the fallback for very short windows. */
+.cal-tab-host { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+.cal-tab-host[hidden] { display: none; }
+
+/* ---------- intrinsics panel ---------- */
+/* Fills the tab host; the single grid row is height-capped so the stage auto-fits
+   the window instead of sizing off width alone. Sidebars scroll internally. */
+.intr-panel { flex: 1 1 auto; display: grid; grid-template-columns: 240px minmax(0, 1fr) 300px; grid-template-rows: minmax(0, 1fr); gap: 16px; padding: 16px; min-height: 0; }
+.intr-cams, .intr-side { min-height: 0; overflow: auto; }
+
+/* ---- Camera Pose tab: 9 draggable numbered handles over the live frame ---- */
+.pose-stage { position: relative; }
+.pose-overlay { position: absolute; inset: 0; z-index: 4; touch-action: none; }
+.pose-pt {
+  position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px;
+  border-radius: 50%; background: rgba(10, 12, 16, 0.85);
+  border: 2px solid var(--pc, var(--blue)); color: #fff;
+  font: 700 11px Inter, system-ui, sans-serif; display: grid; place-items: center;
+  cursor: grab; user-select: none; box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.5);
+}
+.pose-pt.active { transform: scale(1.25); box-shadow: 0 0 0 3px color-mix(in srgb, var(--pc) 55%, transparent); }
+.pose-pt:active { cursor: grabbing; }
+.pose-labels { display: flex; flex-direction: column; gap: 4px; }
+.pose-label {
+  display: flex; align-items: center; gap: 8px; text-align: left; font-size: 12.5px;
+  padding: 5px 8px; border-radius: 8px; border: 1px solid transparent; background: none; color: var(--ink, #e8edf3);
+}
+.pose-label.active { border-color: var(--border-2); background: var(--panel-3); }
+.pose-num {
+  width: 18px; height: 18px; border-radius: 50%; flex: none; color: #0a0e14;
+  font: 800 10.5px Inter, system-ui, sans-serif; display: grid; place-items: center;
+}
+.pose-warn {
+  margin-top: 10px; padding: 9px 11px; border-radius: 9px; font-size: 12.5px; line-height: 1.45;
+  border: 1px solid rgba(245, 158, 11, 0.45); background: rgba(245, 158, 11, 0.1); color: #fcd34d;
+}
+.pill.warn { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 50%, transparent); }
+.readout .v.bad { color: #fca5a5; }
+@media (max-width: 1100px) {
+  /* Stacked fallback: content-sized rows, panel scrolls; the live image degrades
+     to width-fit (max-height:100% is moot without a definite wrap height). */
+  .intr-panel { grid-template-columns: 220px minmax(0, 1fr); grid-template-rows: auto; overflow: auto; }
+  .intr-side { grid-column: 1 / -1; }
+}
+.intr-cams h4, .intr-side h4 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
+.intr-cam-list { display: grid; gap: 8px; }
+.intr-cam { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-3); padding: 10px 11px; color: inherit; font-weight: 600; }
+.intr-cam.active { border-color: var(--blue); background: rgba(59, 130, 246, 0.08); }
+.intr-cam .cp-name { flex: 1; }
+.intr-cam .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.16); }
+.intr-cam .pill { flex: none; }
+
+.intr-stage { display: flex; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; }
+/* Auto-fit: the wrap takes all remaining stage height; the image scales to fit
+   BOTH dimensions at its natural aspect. The <img> box always equals the visible
+   frame (no letterboxed dead zone inside it), which the pose drag math relies on. */
+.intr-live-wrap { position: relative; background: #070c12; border: 1px solid var(--border-2); border-radius: 12px; overflow: hidden; flex: 1 1 auto; min-height: 220px; display: grid; place-items: center; }
+.intr-live { max-width: 100%; max-height: 100%; width: auto; height: auto; }
+/* No feed → no broken-image glyph; the caption already reports the state. */
+.intr-live.dead { visibility: hidden; }
+.intr-live-cap { position: absolute; left: 0; right: 0; bottom: 0; padding: 8px 12px; font-size: 12.5px; background: linear-gradient(0deg, rgba(0, 0, 0, 0.6), transparent); }
+.intr-actions { display: flex; flex-wrap: wrap; gap: 9px; }
+
+.intr-side { display: flex; flex-direction: column; }
+.intr-collected { display: flex; align-items: baseline; gap: 9px; margin-bottom: 8px; }
+.intr-collected .n { font-family: Consolas, monospace; font-size: 30px; font-weight: 800; }
+.intr-collected .lbl { font-size: 12px; color: var(--muted); }
+.intr-cov { display: block; }
+.cov-frame { border: 1px solid var(--border-2); border-radius: 10px; background: linear-gradient(180deg, rgba(59, 130, 246, 0.06), var(--panel-3)); padding: 12px; }
+.cov-row { display: flex; justify-content: space-around; align-items: flex-start; padding: 2px 4px 10px; border-bottom: 1px dashed var(--border-2); }
+.cov-pos { display: flex; flex-direction: column; align-items: center; gap: 3px; font-size: 16px; font-weight: 800; }
+.cov-pos i { font-style: normal; font-size: 10.5px; font-weight: 600; color: var(--muted); }
+.cov-pos.done { color: #86efac; } .cov-pos.miss { color: #6b7a8a; }
+.cov-attrs { display: flex; gap: 7px; margin-top: 10px; }
+.cov-attr { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-3); padding: 7px 4px; }
+.cov-attr span { font-weight: 800; }
+.cov-attr.done { color: #cfeedd; } .cov-attr.done span { color: #86efac; }
+.cov-attr.miss { color: var(--muted); } .cov-attr.miss span { color: #6b7a8a; }
+
+.intr-foot { padding: 10px 16px; border-top: 1px solid var(--border); font-size: 12.5px; }
+
+.readout { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.readout .rd { border: 1px solid var(--border); border-radius: 9px; background: var(--panel-3); padding: 9px 11px; }
+.readout .rd .k { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.readout .rd .v { font-family: Consolas, monospace; font-size: 15px; font-weight: 600; margin-top: 3px; }
+.readout .rd .v.good { color: #86efac; }
+
+.btn { min-height: 34px; border: 1px solid var(--border-2); border-radius: 9px; background: rgba(59, 130, 246, 0.10); color: inherit; font: inherit; font-weight: 600; font-size: 13px; padding: 8px 14px; cursor: pointer; }
+.btn:hover:not(:disabled) { border-color: rgba(59, 130, 246, 0.55); background: rgba(59, 130, 246, 0.18); }
+.btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+.btn.primary:hover:not(:disabled) { background: var(--accent2); }
+.btn.ghost { background: transparent; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.progress { height: 7px; border-radius: 5px; background: var(--panel-3); overflow: hidden; border: 1px solid var(--border); }
+.progress > i { display: block; height: 100%; background: linear-gradient(90deg, var(--blue), var(--accent2)); }
 .cws-showall { width: 100%; margin-top: 8px; min-height: 30px; border: 1px solid var(--border-2); border-radius: 8px; background: transparent; color: var(--muted); font-size: 12px; padding: 4px 8px; }
 .cws-showall:hover { background: rgba(59, 130, 246, 0.1); color: #fff; }
 .cws-role { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -707,11 +728,7 @@ body.mode-match .engineer-only { display: none !important; }
 .canonical-review h4 { margin: 12px 0 6px; color: #cfe6d6; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
 .canonical-review video { width: 100%; height: auto; display: block; border-radius: 8px; background: #000; }
 .replay-canonical { margin: 8px 14px 0; }
-.lbw-view-toggle button.ready::after { content: " ●"; color: var(--green, #2fe07a); }
 /* Evidence video tabs: the replay letterboxes to fill the panel without scrolling. */
-.lbw-view[data-lbw-view="observed"], .lbw-view[data-lbw-view="clean"] { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
-.lbw-view[data-lbw-view="observed"] .canonical-review, .lbw-view[data-lbw-view="clean"] .canonical-review { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-.lbw-view[data-lbw-view="observed"] .canonical-review video, .lbw-view[data-lbw-view="clean"] .canonical-review video { flex: 1 1 auto; min-height: 0; object-fit: contain; }
 .canonical-review .cr-tips { margin: 8px 0 0; padding: 0 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .rm-canonical { border: 1px solid var(--border-2); background: var(--panel-3); color: var(--muted); border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: default; }
 .rm-canonical.ready { border-color: var(--green, #2fe07a); color: var(--green, #2fe07a); cursor: pointer; font-weight: 600; }
@@ -745,20 +762,14 @@ body.mode-match .engineer-only { display: none !important; }
 @keyframes toast-in { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: none; } }
 
 /* ---------- responsive ---------- */
-/* Single-column stack is for genuinely NARROW windows only. It must name the
-   data-state variants too — they carry higher specificity than a bare .dash-grid,
-   and losing to them produced a half-applied hybrid (1fr + implicit columns) that
-   silently skewed proportions at 1366px-wide laptops. */
+/* Single-column stack is for genuinely NARROW windows only. */
 @media (max-width: 1100px) {
-  .dash-grid,
-  .dash-grid[data-state="waiting"],
-  .dash-grid[data-state="processing"],
-  .dash-grid[data-state="result"] {
+  .dash-grid {
     grid-template-columns: 1fr;
     grid-template-rows: none;
-    grid-template-areas: "feed" "detail" "decision" "evidence" "timeline" "queue";
+    grid-template-areas: "feed" "queue";
   }
-  .d-feed, .d-detail, .d-decision, .d-evidence, .d-timeline, .d-queue { min-height: 320px; }
+  .d-feed, .d-queue { min-height: 320px; }
 }
 
 /* ============================ REVIEW MODE ============================ */
@@ -785,7 +796,12 @@ body.mode-match .engineer-only { display: none !important; }
 .rm2-title { font-size: 20px; font-weight: 800; letter-spacing: 2px; color: #dfe8e4; }
 .rm2-steps { display: flex; gap: 10px; flex: 1; }
 .rm2-steps[hidden], .rm2-gates[hidden] { display: none; }
-.rm2-step { display: flex; align-items: center; gap: 9px; padding: 8px 14px; border-radius: 999px; border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.04); transition: border-color .25s ease; }
+/* Stages are NAVIGATION as well as status: click one to inspect that evidence. */
+.rm2-step { display: flex; align-items: center; gap: 9px; padding: 8px 14px; border-radius: 999px; border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.04); transition: border-color .25s ease, background .25s ease; cursor: pointer; }
+.rm2-step:hover { background: rgba(255,255,255,.09); }
+/* focus = the stage whose evidence surface is mounted right now. */
+.rm2-step.focus { background: rgba(255,255,255,.12); box-shadow: 0 0 0 1px rgba(255,255,255,.28); }
+.rm2-step.focus .rm2-lbl { color: #eef8f2; }
 .rm2-num { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 800; color: #0b0f14; background: #6b7a86; transition: background .25s ease; }
 .rm2-lbl { font-size: 13px; font-weight: 600; color: #b7c6be; }
 .rm2-step.processing { border-color: rgba(56,189,248,.55); }
@@ -795,10 +811,51 @@ body.mode-match .engineer-only { display: none !important; }
 .rm2-step.passed .rm2-lbl { color: #d6e6df; }
 .rm2-step.failed { border-color: rgba(239,68,68,.55); }
 .rm2-step.failed .rm2-num { background: #ef4444; }
+/* skipped = the check can't run here; the chip's tooltip tells the operator
+   what to do instead — amber, not red: the review continues gracefully. */
+.rm2-step.skipped { border-color: rgba(245,190,90,.5); }
+.rm2-step.skipped .rm2-num { background: #f5be5a; }
+/* Live operator status line: what the review is doing RIGHT NOW, in umpire
+   language — the answer to "is it processing, waiting for me, or stuck?". */
+.rm2-oper { flex: 0 1 auto; max-width: 36%; font-size: 12.5px; color: #cfe0d7; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @keyframes rm2-pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
 /* MIDDLE — both replays, always visible together */
 .rm2-mid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; min-height: 0; }
+/* ---- per-type evidence surfaces (mounted by the protocol engine) ---- */
+.rm2-mid[data-surface="panel"] { grid-template-columns: minmax(0,2.2fr) minmax(250px,1fr); }
+.rms-stagewrap { display: grid; grid-template-rows: minmax(0,1fr) auto auto; gap: 8px; min-height: 0; }
+.rms-stage { position: relative; min-height: 0; border-radius: 12px; overflow: hidden; background: #0d1a12; border: 1px solid rgba(255,255,255,.08); display: grid; place-items: center; }
+.rms-stage img { width: 100%; height: 100%; object-fit: contain; background: #000; }
+/* Evidence layer over the stepped frame. Centred on the letterboxed image, never
+   stretched: the overlay is drawn in the frame's own pixel space, so any mismatch
+   between this box and the image would misplace the evidence. */
+.rms-stage .rms-fo { position: absolute; pointer-events: none; z-index: 3; }
+.rms-empty { position: absolute; inset: 0; display: grid; place-items: center; color: #9fb3ab; font-size: 13.5px; text-align: center; padding: 18px; background: rgba(10,14,12,.6); }
+.rms-empty[hidden] { display: none; }
+.rms-wave { width: 100%; height: 84px; border-radius: 10px; background: rgba(8,12,10,.9); border: 1px solid rgba(255,255,255,.08); }
+.rms-wave[hidden] { display: none; }
+.rms-controls { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.rms-controls button { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.14); color: #dfe8e4; border-radius: 8px; padding: 6px 11px; cursor: pointer; font-size: 12.5px; }
+.rms-controls button:hover { background: rgba(255,255,255,.12); }
+.rms-controls button.active { border-color: rgba(56,189,248,.6); color: #aee6ff; }
+.rms-controls button[hidden] { display: none; }
+.rms-controls input[type="range"] { flex: 1; min-width: 120px; }
+.rms-frame-label { font-size: 11.5px; color: #8ea79c; min-width: 96px; text-align: right; }
+.rms-side { display: grid; align-content: start; gap: 8px; min-height: 0; overflow: auto; }
+.rms-verdict { font-size: 26px; font-weight: 900; letter-spacing: 1.5px; padding: 12px; text-align: center; border-radius: 12px; border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.04); color: #9fb3ab; }
+.rms-verdict.out { color: #fca5a5; background: rgba(239,68,68,.14); border-color: rgba(239,68,68,.45); }
+.rms-verdict.not-out { color: #86efac; background: rgba(34,197,94,.14); border-color: rgba(34,197,94,.45); }
+.rms-row { display: flex; justify-content: space-between; gap: 10px; padding: 9px 12px; border-radius: 10px; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.07); }
+.rms-row span { font-size: 11px; text-transform: uppercase; letter-spacing: .7px; color: #8ea79c; align-self: center; }
+.rms-row strong { font-size: 14.5px; color: #e6efe9; text-align: right; }
+.rms-row.flagged strong { color: #ffb4a8; }
+.rms-note { font-size: 12.5px; color: #cfc39a; padding: 4px 2px; }
+.rms-stage img { transition: transform .18s ease; cursor: zoom-in; }
+.rms-adjust { gap: 6px; }
+.rms-adjust input[type="range"] { flex: 1; min-width: 60px; max-width: 140px; }
+.rms-adjust-lbl { color: #8ea79c; font-size: 13px; }
+.rms-wide-mini { width: 100%; background: rgba(8,12,10,.5); border: 1px solid rgba(255,255,255,.06); border-radius: 10px; }
 .rm2-vid { display: grid; grid-template-rows: auto minmax(0,1fr); gap: 6px; min-height: 0; }
 .rm2-vlabel { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: #8ea79c; }
 .rm2-vbox { min-height: 0; border-radius: 12px; overflow: hidden; background: #0d1a12; border: 1px solid rgba(255,255,255,.08); display: grid; place-items: center; }
@@ -826,8 +883,18 @@ body.mode-match .engineer-only { display: none !important; }
 .rm-verdict.reviewing { color: #9fb3ab; }
 .rm-verdict.out { color: #fca5a5; background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.5); }
 .rm-verdict.not-out { color: #86efac; background: rgba(34,197,94,.16); border-color: rgba(34,197,94,.5); }
-.rm-back { justify-self: end; background: rgba(255,255,255,.06); color: #cfe; border: 1px solid rgba(255,255,255,.14); border-radius: 9px; padding: 9px 14px; cursor: pointer; font-size: 12px; }
+/* Export sits with the decision actions but reads as secondary — it records the
+   review, it does not make the call. */
+.rm2-actions .rm-quiet { background: rgba(255,255,255,.06); color: #cfe; font-weight: 700; padding: 10px 16px; }
+.rm2-actions .rm-quiet:hover { background: rgba(255,255,255,.12); }
+/* Leaving is TWO distinct actions: Back keeps the review running (the dashboard
+   strip leads back here); Abandon is the only one that discards it. */
+.rm2-nav { justify-self: end; display: grid; gap: 6px; }
+.rm-back, .rm-abandon { background: rgba(255,255,255,.06); color: #cfe; border: 1px solid rgba(255,255,255,.14); border-radius: 9px; padding: 9px 14px; cursor: pointer; font-size: 12px; }
 .rm-back:hover { background: rgba(255,255,255,.12); }
+.rm-abandon { color: #fca5a5; border-color: rgba(239,68,68,.32); }
+.rm-abandon:hover { background: rgba(239,68,68,.16); }
+.rm-abandon[hidden] { display: none; }
 
 /* When a review is active, calm the underlying dashboard so the transition reads. */
 body.review-active .app-shell { filter: saturate(.85) brightness(.9); }
@@ -953,9 +1020,18 @@ body.review-active .app-shell { filter: saturate(.85) brightness(.9); }
 
 /* ============================ TESTING WIZARD (engineer page) ============================ */
 .view-testing { min-height: 0; }
-.testing-root { height: 100%; display: flex; min-height: 0; }
+.testing-root { flex: 1 1 auto; display: flex; min-height: 0; }
 .testing-wizard { flex: 1 1 auto; min-height: 0; }
-.tw-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 16px; display: grid; gap: 14px; align-content: start; max-width: 760px; }
+/* Two panes filling the viewport: config steps (scroll) | results (scroll).
+   The old single 760px column left a dead strip on the right and buried results
+   ~1150px below the fold. */
+.tw-body { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 16px; display: grid; grid-template-columns: minmax(340px, 420px) minmax(0, 1fr); gap: 14px; }
+.tw-config { min-height: 0; overflow: auto; display: grid; gap: 14px; align-content: start; }
+.tw-results-step { min-height: 0; overflow: auto; align-content: start; }
+@media (max-width: 1000px) {
+  .tw-body { grid-template-columns: minmax(0, 1fr); overflow: auto; }
+  .tw-config, .tw-results-step { overflow: visible; min-height: auto; }
+}
 .tw-step { display: grid; gap: 10px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-3); }
 .tw-step-h { display: flex; align-items: center; gap: 10px; }
 .tw-step-h strong { font-size: 14px; }
@@ -1038,7 +1114,6 @@ body.review-active .app-shell { filter: saturate(.85) brightness(.9); }
 .rev-dec.not-out { color: var(--green); }
 .rev-dec.interrupted { color: var(--amber); }
 .rev-model { color: var(--muted); font-family: var(--mono, monospace); font-size: 12px; }
-.rs-flag { color: var(--red); }
 
 /* ---------- Replay workspace: mode-driven scene ---------- */
 .rp-path { fill: none; stroke: #2fe07a; stroke-width: 5; stroke-linecap: round; stroke-linejoin: round; opacity: 0.9; }

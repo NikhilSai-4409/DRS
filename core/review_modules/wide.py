@@ -9,6 +9,7 @@ configured wide line.
 from __future__ import annotations
 
 from config.settings import WIDE_LINE_FROM_MIDDLE_M
+from core.frame_ref import FrameRef
 from core.review_modules.base import (
     ReviewContext,
     ReviewModule,
@@ -26,6 +27,8 @@ class WideReviewModule(ReviewModule):
                 "guideline_distance", "deviation", "replay")
     replay_mode = "wide_line"
     decision_card = ("Guideline", "Margin", "Decision")
+    # Operator workflow: measure the wide line, decide. Nothing else exists here.
+    protocol = (("wide_line", "Wide Line"), ("decision", "Decision"))
     supports = {"trajectory": True, "guideline": True, "crease": True,
                 "frame_step": True, "measurement": True}
 
@@ -70,6 +73,10 @@ class WideReviewModule(ReviewModule):
             f"wide line at {wide_line_m * 100:.0f} cm — "
             f"{'WIDE' if is_wide else 'within reach (not wide)'}."
         )
+        # The wide line lies on the side the ball actually passed; drawing it on the
+        # other side would be a correct number against the wrong reference.
+        wide_line_lateral_mm = (-1.0 if lateral_m < 0 else 1.0) * wide_line_m * 1000.0
+        frame_ref = FrameRef.capture(last.frame_id, last.timestamp_ms, camera_id)
         result = self.base_result(explanation, round(confidence, 3))
         result["wide_analysis"] = {
             "distance_cm": round(distance_cm, 1),
@@ -84,6 +91,23 @@ class WideReviewModule(ReviewModule):
             "camera_id": camera_id,
             "frames_analysed": len(samples),
             "requires_calibration": False,
+            # Which frame the measurement belongs to. Wide previously emitted no
+            # frame id at all, so its readout could not be tied to a replay frame.
+            "frame": frame_ref.to_dict(),
+        }
+        # Geometry for the overlay engine. The wide LINE is the piece that was
+        # missing: without a pixel projection it could only ever be drawn as a
+        # schematic guess, which cannot carry a measurement.
+        result["geometry"] = {
+            "kind": "wide",
+            "camera_id": camera_id,
+            "ball_px": [round(last.cx, 1), round(last.cy, 1)],
+            "ball_radius_px": radius_px,
+            "wide_line_lateral_mm": round(wide_line_lateral_mm, 1),
+            "crease_along_mm": ctx.crease_along_mm,
+            "distance_cm": round(distance_cm, 1),
+            "is_wide": is_wide,
+            "frame": frame_ref.to_dict(),
         }
         warnings = []
         if abs(lateral_m) > 0.3:

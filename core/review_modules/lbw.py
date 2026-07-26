@@ -15,8 +15,20 @@ follow-up — the interface here will not change when that lands.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from core.camera_roles import BALL_TRACKING
+from core.frame_ref import FrameRef
+from core.observation import Observation
 from core.review_modules.base import ReviewContext, ReviewModule, confidence_score
+
+
+def _wicket_observation(prediction) -> Observation:
+    """Did the predicted path hit the stumps? UNKNOWN unless the collision test was
+    actually performed — "we never checked" is not the same answer as "it missed"."""
+    if prediction is None or not getattr(prediction, "wicket_evaluated", False):
+        return Observation.UNKNOWN
+    return Observation.of(bool(getattr(prediction, "wicket_collision", False)))
 
 
 class LbwReviewModule(ReviewModule):
@@ -31,10 +43,20 @@ class LbwReviewModule(ReviewModule):
                 "ball_speed", "replay")
     replay_mode = "trajectory"
     decision_card = ("No Ball", "UltraEdge", "Pitching", "Impact", "Wickets", "Decision")
+    # Operator workflow: clear the front foot, clear the bat, then read tracking.
+    protocol = (("front_foot", "Front Foot"), ("ultra_edge", "UltraEdge"),
+                ("trajectory", "Ball Tracking"), ("decision", "Decision"))
     supports = {"trajectory": True, "audio": True, "crease": True,
                 "frame_step": True, "measurement": True}
 
     def analyze(self, ctx: ReviewContext) -> dict:
+        # DRS protocol step 1 — FRONT-FOOT NO BALL, checked FIRST, exactly like TV
+        # umpiring: an overstep ends the review on the spot. No UltraEdge, no ball
+        # tracking, no trajectory — the batter cannot be out LBW off a no-ball.
+        no_ball_analysis = self._front_foot_check(ctx)
+        if (no_ball_analysis or {}).get("is_no_ball") is True:
+            return self._no_ball_short_circuit(no_ball_analysis)
+
         camera_id = self.select_camera(ctx)
         frames = ctx.frames.get(camera_id, []) if camera_id is not None else []
         capped = frames[-ctx.max_frames:]
@@ -79,28 +101,14 @@ class LbwReviewModule(ReviewModule):
         if samples:
             result["geometry"] = self._geometry(camera_id, samples, prediction)
 
-        # DRS protocol step 1: FRONT-FOOT NO BALL. A no-ball voids the dismissal
-        # outright — checked before anything else. Only the no_ball_analysis block is
-        # merged (the module's own result would clear LBW's trajectory fields).
-        no_ball_value = "Unchecked — verify manually"
+        # Legal (or unchecked) delivery: merge the step-1 front-foot result and
+        # continue the protocol. A NO BALL never reaches this point — it already
+        # short-circuited above.
         no_ball_flag = False
-        try:
-            from core.review_modules.no_ball import NoBallReviewModule
-
-            nb_result = NoBallReviewModule().analyze(ctx) or {}
-            if nb_result.get("no_ball_analysis") is not None:
-                result["no_ball_analysis"] = nb_result["no_ball_analysis"]
-        except Exception:
-            pass
-        no_ball = result.get("no_ball_analysis") or {}
-        if no_ball.get("is_no_ball") is True:
-            overstep = no_ball.get("distance_past_cm")
-            no_ball_value = f"NO BALL — over by {abs(overstep):.1f} cm" if overstep is not None else "NO BALL"
-            no_ball_flag = True
-            # Protocol override: the batter cannot be out LBW off a no-ball.
-            result["verdict"] = "NOT OUT - NO BALL"
-            warnings.append("FRONT-FOOT NO BALL — the delivery is illegal; the batter cannot be out LBW.")
-        elif no_ball.get("is_no_ball") is False:
+        if no_ball_analysis is not None:
+            result["no_ball_analysis"] = no_ball_analysis
+        no_ball = no_ball_analysis or {}
+        if no_ball.get("is_no_ball") is False:
             behind = no_ball.get("distance_past_cm")
             no_ball_value = f"Legal ({abs(behind):.1f} cm behind)" if behind is not None else "Legal delivery"
         else:
@@ -149,11 +157,64 @@ class LbwReviewModule(ReviewModule):
         return result
 
     @staticmethod
+    def _front_foot_check(ctx: ReviewContext) -> Optional[dict]:
+        """Run the front-foot module on the same captured frames; None when the
+        check itself could not run (its honest reason travels in the analysis)."""
+        try:
+            from core.review_modules.no_ball import NoBallReviewModule
+
+            nb_result = NoBallReviewModule().analyze(ctx) or {}
+            return nb_result.get("no_ball_analysis")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _no_ball_short_circuit(no_ball_analysis: dict) -> dict:
+        """The review ends at step 1: NO BALL. Nothing further is analysed — the
+        result explicitly says the later protocol stages were not needed."""
+        overstep = no_ball_analysis.get("distance_past_cm")
+        value = f"NO BALL — over by {abs(overstep):.1f} cm" if overstep is not None else "NO BALL"
+        return {
+            "review_type": "lbw",
+            "no_ball_analysis": no_ball_analysis,
+            "verdict": "NOT OUT - NO BALL",
+            "review_ended": "no_ball",           # protocol short-circuit marker
+            "summary": {
+                "headline": "NOT OUT — NO BALL",
+                "measurements": [
+                    {"label": "No Ball", "value": value, "flag": True},
+                    {"label": "UltraEdge", "value": "Not needed — review ended"},
+                    {"label": "Ball Tracking", "value": "Not needed — review ended"},
+                ],
+                "confidence": no_ball_analysis.get("confidence"),
+                "warnings": ["FRONT-FOOT NO BALL — the delivery is illegal; the batter cannot be out LBW."],
+            },
+        }
+
+    @staticmethod
     def _geometry(camera_id, samples, prediction) -> dict:
         measured = [
             [round(float(s.cx), 1), round(float(s.cy), 1),
              round(s.lateral_mm, 1) if s.lateral_mm is not None else None,
              round(s.along_mm, 1) if s.along_mm is not None else None]
+            for s in samples
+        ]
+        # Frame identity per tracked point. `measured` above is a bare polyline —
+        # its frame ids were dropped here, so an overlay could be drawn once on a
+        # decision frame but could never FOLLOW the ball as the umpire steps. The
+        # frontend was reduced to synthesising `frame_id: i` array positions.
+        # `track` carries the real capture frame and timestamp alongside each
+        # point; `measured` stays for existing consumers.
+        track = [
+            {
+                "px": [round(float(s.cx), 1), round(float(s.cy), 1)],
+                "world_mm": [
+                    round(s.lateral_mm, 1) if s.lateral_mm is not None else None,
+                    round(s.along_mm, 1) if s.along_mm is not None else None,
+                ],
+                "confidence": s.confidence,
+                "frame": FrameRef.capture(s.frame_id, s.timestamp_ms, camera_id).to_dict(),
+            }
             for s in samples
         ]
         predicted_world: list[list[float]] = []
@@ -168,10 +229,21 @@ class LbwReviewModule(ReviewModule):
             "kind": "lbw",
             "camera_id": camera_id,
             "measured": measured,
+            "track": track,
             "predicted_world": predicted_world,
             "bounce_world": bounce_world,
             "impact_px": [measured[-1][0], measured[-1][1]] if measured else None,
-            "hitting": bool(getattr(prediction, "hit_wicket", False)) if prediction is not None else None,
+            # Tri-state. Two defects made this permanently False — a claim that the
+            # ball MISSED the stumps on every delivery:
+            #   1. it read `hit_wicket`, but the field is `wicket_collision`;
+            #   2. `_predict` never supplies `wicket_x_m`, so the collision test is
+            #      never performed at all (see `wicket_evaluated`).
+            # (2) is a real gap, not a typo: `_find_wicket_collision` treats x as the
+            # down-pitch axis while `_predict` packs x as LATERAL offset, so wiring it
+            # up needs the axis convention reconciled first — a functional change that
+            # can move LBW verdicts, deliberately not made here. Until then the honest
+            # answer is UNKNOWN.
+            "hitting": _wicket_observation(prediction).value,
         }
 
     def _predict(self, samples):

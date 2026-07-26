@@ -88,6 +88,32 @@
 
           <div id="system-alerts" class="system-alerts" hidden></div>
 
+          <!-- The dashboard is a CONTROL ROOM: cameras, match, health, request a
+               review. Evidence is INSPECTED only in Review Mode; while a review
+               runs the dashboard mirrors the protocol so the operator never has
+               to remember it — which checks are done, what each concluded, and
+               what still needs attention. ONE review presence, never two: idle →
+               the readiness line; active → this panel (protocol checklist +
+               elapsed + the way back into the workspace). Each row deep-links to
+               that stage's evidence in the workspace. -->
+          <div class="status-line">
+            <button id="readiness-strip" class="readiness-strip" type="button" title="Open the Pre-Match Checklist" hidden>
+              <span class="sl-dot"></span>
+              <strong id="readiness-text">Checking readiness…</strong>
+              <small id="readiness-detail"></small>
+            </button>
+            <div id="review-strip" class="review-strip" hidden>
+              <div class="rs-head">
+                <span class="sl-dot"></span>
+                <strong id="review-strip-title">Review running</strong>
+                <span id="review-strip-elapsed" class="rs-elapsed"></span>
+                <button id="open-review-mode" type="button" class="rs-open">Open Review Workspace</button>
+              </div>
+              <div id="rs-evidence" class="rs-evidence" aria-label="Evidence checklist" hidden></div>
+              <button id="rs-decision" class="rs-decision" type="button" hidden></button>
+            </div>
+          </div>
+
           <div class="dash-grid" id="dash-grid" data-state="waiting">
             <!-- MAIN FEED (auto-switches to the review role camera) -->
             <article class="card d-feed">
@@ -98,223 +124,8 @@
               <div class="live-stage">
                 <img id="primary-feed" class="primary-feed" alt="Primary camera feed" />
                 <div class="primary-placeholder">Waiting for primary camera feed</div>
-                <svg id="wide-overlay" class="feed-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" hidden>
-                  <rect id="wide-overlap" x="22" y="0" width="6" height="100" class="ov-overlap" />
-                  <line x1="28" y1="0" x2="28" y2="100" class="ov-line" stroke-dasharray="3 2" />
-                  <text x="29.5" y="8" class="ov-text">Wide line</text>
-                  <line id="wide-ballpath" x1="0" y1="34" x2="62" y2="46" class="ov-path" />
-                  <circle id="wide-ball-feed" cx="50" cy="44" r="2.2" class="ov-ball" />
-                </svg>
-                <svg id="noball-overlay" class="feed-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" hidden>
-                  <line x1="0" y1="62" x2="100" y2="62" class="ov-line" />
-                  <text x="2" y="59" class="ov-text">Popping crease</text>
-                  <polygon id="noball-foot" points="42,52 58,50 60,66 44,68" class="ov-foot" />
-                  <circle id="noball-toe" cx="59" cy="51" r="1.8" class="ov-toe" />
-                  <text x="61" y="51" class="ov-text">Toe</text>
-                  <circle id="noball-heel" cx="43" cy="67" r="1.8" class="ov-heel" />
-                  <text x="30" y="69" class="ov-text">Heel</text>
-                </svg>
               </div>
               <div id="camera-thumbs" class="camera-thumbs" aria-label="Mini cameras"></div>
-            </article>
-
-            <!-- ANALYSIS (swaps with review type; hidden while waiting) -->
-            <article class="card d-detail">
-              <header class="card-h">
-                <div><strong id="detail-title">LBW Review</strong><small id="detail-sub">Ball-tracking trajectory</small></div>
-                <div class="scene-tools engineer-only" id="lbw-tools">
-                  <button id="reset-camera" type="button" title="Engineer: reset the 3D camera view">Reset View</button>
-                </div>
-              </header>
-
-              <div class="review-panel" data-review-panel="lbw">
-                <!-- The two PIPELINE replays are the primary evidence (same videos as the
-                     Testing page). The legacy SVG animation and 3D reconstruction predate
-                     the pipeline replay and are engineer/debug views only. -->
-                <div class="lbw-view-toggle" id="lbw-view-toggle">
-                  <button type="button" data-lbw-view="observed" id="lbw-observed-btn" class="active" title="Real footage with the tracked-ball overlay — pipeline replay">Observed Trajectory</button>
-                  <button type="button" data-lbw-view="clean" id="lbw-clean-btn" title="Clean broadcast DRS replay — pipeline render">Broadcast Replay</button>
-                  <button type="button" data-lbw-view="broadcast" class="engineer-only" title="Engineer: legacy SVG animation (pre-pipeline)">Animation</button>
-                  <button type="button" data-lbw-view="3d" class="engineer-only" title="Engineer: 3D reconstruction (debug)">3D Analysis</button>
-                </div>
-                <div class="lbw-view" data-lbw-view="observed">
-                  <div id="canonical-observed" class="canonical-review">
-                    <div class="cr-note quiet">Request an LBW review — the tracked-footage replay renders here when analysis completes.</div>
-                  </div>
-                </div>
-                <div class="lbw-view" data-lbw-view="clean" hidden>
-                  <div id="canonical-review" class="canonical-review">
-                    <div class="cr-note quiet">Request an LBW review — the clean DRS broadcast replay renders here when analysis completes.</div>
-                  </div>
-                </div>
-                <div class="lbw-view" data-lbw-view="broadcast" hidden>
-                  <div id="broadcast-review" class="drsa-wrap"></div>
-                </div>
-                <div class="lbw-view" data-lbw-view="3d" hidden>
-                  <div id="trajectory-scene" class="trajectory-scene"></div>
-                  <div class="decision-metrics live-metrics">
-                    <div><span>Confidence</span><strong id="overall-confidence">--</strong></div>
-                    <div><span>Impact</span><strong id="impact-location">--</strong></div>
-                    <div><span>Wicket</span><strong id="wicket-zone">--</strong></div>
-                    <div><span>Speed</span><strong id="ball-speed">--</strong></div>
-                  </div>
-                  <canvas id="pitch-map-canvas" class="pitch-map-mini" width="420" height="120"></canvas>
-                </div>
-              </div>
-
-              <div class="review-panel" data-review-panel="wide" hidden>
-                <div class="topview-wrap">
-                  <svg class="topview" viewBox="0 0 200 150" preserveAspectRatio="xMidYMid meet" aria-label="Wide top view">
-                    <rect x="60" y="6" width="80" height="138" class="tv-pitch" />
-                    <rect id="tv-overlap" x="40" y="6" width="30" height="138" class="tv-overlap" />
-                    <line x1="40" y1="6" x2="40" y2="144" class="tv-wide" stroke-dasharray="5 3" />
-                    <text x="8" y="78" class="tv-label">WIDE LINE</text>
-                    <line x1="60" y1="20" x2="140" y2="20" class="tv-crease" />
-                    <g class="tv-stumps"><rect x="96" y="16" width="2" height="8"/><rect x="99" y="16" width="2" height="8"/><rect x="102" y="16" width="2" height="8"/></g>
-                    <line id="tv-distline" x1="40" y1="96" x2="70" y2="96" class="tv-dist" />
-                    <circle id="tv-ball" cx="70" cy="96" r="5" class="tv-ball" />
-                    <text id="tv-distlabel" x="42" y="112" class="tv-label">--</text>
-                  </svg>
-                  <div class="tv-legend">
-                    <span><i class="lg-wide"></i>Wide line</span>
-                    <span><i class="lg-ball"></i>Ball</span>
-                    <span><i class="lg-overlap"></i>Overlap</span>
-                  </div>
-                </div>
-                <div class="verdict-block">
-                  <div id="wide-verdict" class="big-verdict waiting">AWAITING</div>
-                  <div id="wide-distance" class="verdict-figure">--</div>
-                </div>
-                <div class="metric-list">
-                  <div><span>Distance from wide line</span><strong id="wide-distance-2">--</strong></div>
-                  <div><span>Ball centre</span><strong id="wide-centre">--</strong></div>
-                  <div><span>Ball radius</span><strong id="wide-radius">--</strong></div>
-                  <div><span>Batter movement</span><strong id="wide-batter">--</strong></div>
-                  <div><span>Confidence</span><strong id="wide-confidence">--</strong></div>
-                </div>
-              </div>
-
-              <div class="review-panel" data-review-panel="noball" hidden>
-                <div class="verdict-block">
-                  <div id="noball-verdict" class="big-verdict waiting">AWAITING</div>
-                  <div class="verdict-sub">Front foot past popping crease</div>
-                  <div id="noball-distance" class="verdict-figure">--</div>
-                </div>
-                <div class="foot-meter">
-                  <div class="foot-meter-label"><span>Behind</span><span>Crease</span><span>Past line</span></div>
-                  <div class="foot-meter-track"><i id="noball-meter"></i><b class="foot-crease-mark"></b></div>
-                </div>
-                <div class="metric-list">
-                  <div><span>Front foot position</span><strong id="noball-foot-pos">--</strong></div>
-                  <div><span>Distance past line</span><strong id="noball-foot-cm">--</strong></div>
-                  <div><span>Confidence</span><strong id="noball-confidence">--</strong></div>
-                </div>
-              </div>
-
-              <div class="review-panel" data-review-panel="edge" hidden>
-                <canvas id="ultraedge-canvas" class="ultraedge-canvas" width="600" height="180"></canvas>
-                <div class="metric-list">
-                  <div><span>Edge probability</span><strong id="edge-probability">--</strong></div>
-                  <div><span>Contact</span><strong id="edge-contact">--</strong></div>
-                </div>
-                <div id="hotspot-view" class="thermal-view">No contact heatmap yet</div>
-                <small id="hotspot-mode" class="edge-mode">Visible mode</small>
-              </div>
-
-              <!-- RUN OUT: crease-centric — bat-to-crease geometry, no trajectory graphics -->
-              <div class="review-panel" data-review-panel="runout" hidden>
-                <div class="verdict-block">
-                  <div id="runout-verdict" class="big-verdict waiting">AWAITING</div>
-                  <div class="verdict-sub">Bat grounded behind the popping crease?</div>
-                  <div id="runout-distance" class="verdict-figure">--</div>
-                </div>
-                <div class="foot-meter">
-                  <div class="foot-meter-label"><span>Short — OUT</span><span>Crease</span><span>Behind — SAFE</span></div>
-                  <div class="foot-meter-track"><i id="runout-meter"></i><b class="foot-crease-mark"></b></div>
-                </div>
-                <div class="metric-list">
-                  <div><span>Bat to crease</span><strong id="runout-batcrease">--</strong></div>
-                  <div><span>Decision frame</span><strong id="runout-frame">--</strong></div>
-                  <div><span>Bails</span><strong id="runout-bails">--</strong></div>
-                  <div><span>Confidence</span><strong id="runout-confidence">--</strong></div>
-                </div>
-                <small class="edge-mode">Bat located by motion analysis; bails detection pending — verify on the frame-stepped replay.</small>
-              </div>
-
-              <!-- STUMPING: keeper-centric — same crease geometry, gloves/bails emphasis -->
-              <div class="review-panel" data-review-panel="stumping" hidden>
-                <div class="verdict-block">
-                  <div id="stumping-verdict" class="big-verdict waiting">AWAITING</div>
-                  <div class="verdict-sub">Bat behind the crease when the bails came off?</div>
-                  <div id="stumping-distance" class="verdict-figure">--</div>
-                </div>
-                <div class="foot-meter">
-                  <div class="foot-meter-label"><span>Short — OUT</span><span>Crease</span><span>Behind — SAFE</span></div>
-                  <div class="foot-meter-track"><i id="stumping-meter"></i><b class="foot-crease-mark"></b></div>
-                </div>
-                <div class="metric-list">
-                  <div><span>Gloves / collection</span><strong id="stumping-gloves">Manual check</strong></div>
-                  <div><span>Bat to crease</span><strong id="stumping-batcrease">--</strong></div>
-                  <div><span>Decision frame</span><strong id="stumping-frame">--</strong></div>
-                  <div><span>Bails</span><strong id="stumping-bails">--</strong></div>
-                </div>
-                <small class="edge-mode">Glove and ball-collection detection pending — confirm a fair take on the replay.</small>
-              </div>
-            </article>
-
-            <!-- DECISION: state machine (waiting/processing) → review summary (result) -->
-            <article class="card d-decision">
-              <header class="card-h"><strong>Review State</strong><span id="decision-review-type">LBW</span></header>
-              <span id="decision-badge" class="badge waiting">Waiting</span>
-              <div class="state-machine" id="decision-state">
-                <div class="state-node" data-state="waiting"><i></i><span>WAITING</span></div>
-                <div class="state-arrow">↓</div>
-                <div class="state-node" data-state="processing"><i></i><span>PROCESSING</span></div>
-                <div class="state-arrow">↓</div>
-                <div class="state-node" data-state="result"><i></i><span id="state-result">DECISION</span></div>
-              </div>
-              <div id="broadcast-overlay" class="broadcast-overlay waiting">WAITING</div>
-              <h1 id="decision-title" class="decision-title-quiet">Waiting for appeal</h1>
-              <p id="decision-explanation" class="decision-explanation">Awaiting appeal sequence.</p>
-
-              <section id="review-summary" class="review-summary">
-                <strong class="rs-h">Review Summary</strong>
-                <!-- The LBW 3-step protocol now lives ONLY in Review Mode (the single
-                     review workspace), driven by the computeProtocol state machine —
-                     not duplicated here on the dashboard. -->
-                <!-- Rows are built per review type from the module's capability contract
-                     (decision_card) + its typed summary.measurements — an Edge review
-                     shows Spike/HotSpot, a Wide shows Guideline/Margin, never a shared
-                     LBW template. See renderReviewSummary. -->
-                <div class="rs-grid" id="rs-grid">
-                  <div><span>Type</span><strong id="rs-type">--</strong></div>
-                  <div><span>Prediction</span><strong id="rs-prediction">--</strong></div>
-                  <div><span>Confidence</span><strong id="rs-confidence">--</strong></div>
-                  <div><span>Time</span><strong id="rs-time">--</strong></div>
-                </div>
-              </section>
-
-              <!-- Diagnostic confidence gauges (ball/tracking/calibration/prediction/
-                   model) are engineering detail, not something an umpire acts on —
-                   Engineer Mode only. -->
-              <div id="confidence-breakdown" class="confidence-breakdown engineer-only"></div>
-              <div class="decision-actions" id="decision-actions">
-                <button id="confirm-out" type="button" class="danger" title="Shortcut: O" hidden>Confirm OUT</button>
-                <button id="confirm-not-out" type="button" class="success" title="Shortcut: N" hidden>Confirm NOT OUT</button>
-                <button id="export-review" type="button" hidden title="Save this review's broadcast clip (asks where to save)">Export</button>
-                <button id="reset-review" type="button" hidden>New Review</button>
-              </div>
-            </article>
-
-            <!-- REVIEW EVIDENCE (dynamic per review type; own cell so it never hides behind a scroll) -->
-            <article class="card d-evidence">
-              <div id="decision-evidence" class="decision-evidence-host"></div>
-            </article>
-
-            <!-- ADAPTIVE TIMELINE -->
-            <article class="card d-timeline">
-              <header class="card-h"><strong>Timeline</strong><span id="timeline-type">LBW sequence</span></header>
-              <div id="decision-timeline" class="decision-stages"></div>
             </article>
 
             <!-- CURRENT MATCH (queue) + Session History entry point -->
@@ -613,34 +424,23 @@
     </div>
 
     <!-- ============================ REVIEW MODE (the single review workspace) ============================
-         One screen from Request Review to Decision — no jumping to a separate replay
-         page. Three zones: top = protocol progress, middle = both replays, bottom =
-         gates + verdict. All evidence visible together; no tabs, no hidden overlays. -->
+         One screen from Request Review to Decision, driven ENTIRELY by the
+         protocol engine (renderer.js): the active review type's contract decides
+         the stage rail, the evidence surface and the decision vocabulary BEFORE
+         this screen opens. This markup is only the frame — the engine fills it. -->
     <div id="review-mode" class="review-mode" aria-hidden="true">
       <div class="rm2">
-        <!-- TOP: protocol progress (colour = state: waiting/processing/complete/failed) -->
+        <!-- TOP: the type's OWN protocol rail + live operator status line -->
         <div class="rm2-top">
-          <span class="rm2-title" id="rm-type">LBW REVIEW</span>
-          <div class="rm2-steps" id="rm-steps">
-            <div class="rm2-step waiting" data-step="ff"><span class="rm2-num">1</span><span class="rm2-lbl">Front Foot</span></div>
-            <div class="rm2-step waiting" data-step="ue"><span class="rm2-num">2</span><span class="rm2-lbl">UltraEdge</span></div>
-            <div class="rm2-step waiting" data-step="bt"><span class="rm2-num">3</span><span class="rm2-lbl">Ball Tracking</span></div>
-          </div>
+          <span class="rm2-title" id="rm-type">REVIEW</span>
+          <div class="rm2-steps" id="rm-steps"></div>
+          <span class="rm2-oper" id="rm-oper"></span>
         </div>
-        <!-- MIDDLE: both replays, always visible together -->
-        <div class="rm2-mid">
-          <div class="rm2-vid">
-            <span class="rm2-vlabel">Observed Trajectory</span>
-            <div class="rm2-vbox" id="rm-observed"></div>
-          </div>
-          <div class="rm2-vid">
-            <span class="rm2-vlabel">Broadcast Replay</span>
-            <div class="rm2-vbox" id="rm-broadcast"></div>
-          </div>
-        </div>
-        <!-- BOTTOM: ball-tracking gates + verdict + decision actions -->
+        <!-- MIDDLE: the type's OWN evidence surface, mounted by the engine -->
+        <div class="rm2-mid" id="rm-mid"></div>
+        <!-- BOTTOM: LBW wicket gates + verdict + per-type decision actions -->
         <div class="rm2-bottom">
-          <div class="rm2-gates">
+          <div class="rm2-gates" hidden>
             <div class="rm2-gate"><span>Pitching</span><strong id="rm-gate-pitching">—</strong></div>
             <div class="rm2-gate"><span>Impact</span><strong id="rm-gate-impact">—</strong></div>
             <div class="rm2-gate"><span>Wickets</span><strong id="rm-gate-wickets">—</strong></div>
@@ -650,9 +450,15 @@
             <div class="rm2-actions">
               <button id="rm-confirm-out" type="button" class="danger">OUT</button>
               <button id="rm-confirm-not-out" type="button" class="success">NOT OUT</button>
+              <button id="rm-export" type="button" class="rm-quiet" title="Save this review's broadcast clip (asks where to save)">Export</button>
             </div>
           </div>
-          <button id="rm-back" class="rm-back" type="button">← Back to Dashboard</button>
+          <div class="rm2-nav">
+            <!-- Back never abandons — the review keeps running and the dashboard
+                 strip leads back here. Abandon is the only destructive exit. -->
+            <button id="rm-back" class="rm-back" type="button">← Dashboard</button>
+            <button id="rm-abandon" class="rm-abandon" type="button" title="Discard this review without a decision">✕ Abandon Review</button>
+          </div>
         </div>
       </div>
     </div>

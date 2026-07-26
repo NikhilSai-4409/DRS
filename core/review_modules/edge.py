@@ -25,6 +25,10 @@ class EdgeReviewModule(ReviewModule):
     evidence = ("waveform", "spike", "snickometer", "hotspot", "frame_sync", "replay")
     replay_mode = "audio_sync"
     decision_card = ("Spike", "HotSpot", "Decision")
+    # Operator workflow: slow-motion + synchronized audio, then decide.
+    protocol = (("audio_sync", "Audio Sync"), ("decision", "Decision"))
+    # UltraEdge assists: waveform + slow motion + stepping; the umpire decides.
+    decision_mode = "assisted"
     supports = {"audio": True, "frame_step": True, "zoom": True, "measurement": True}
 
     def analyze(self, ctx: ReviewContext) -> dict:

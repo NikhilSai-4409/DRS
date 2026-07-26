@@ -1,16 +1,10 @@
-import * as THREE from "../node_modules/three/build/three.module.js";
-import { OrbitControls } from "./vendor/OrbitControls.js";
-import { CalibrationWorkspace } from "./components/CalibrationModal.js";
-import { DRSAnimationSequencer } from "./components/DRSAnimationSequencer.js";
-import { ResultsPanel } from "./components/ResultsPanel.js";
+import { bailsLabel, observationLabel } from "./overlay/observation.js";
+import { drawFrameOverlay } from "./overlay/frame-overlay.js";
+import { CalibrationTabs } from "./components/CalibrationTabs.js";
 import { StatusPanel } from "./components/StatusPanel.js";
 import { TestingPanel } from "./components/TestingPanel.js";
 import { ValidationPanel } from "./components/ValidationPanel.js";
 import { ModelManagerPanel } from "./components/ModelManagerPanel.js";
-import { ReviewPlayer } from "./overlay/overlay-renderer.js";
-import { BroadcastReview } from "./components/BroadcastReview.js";
-import { EvidencePanel } from "./components/EvidencePanel.js";
-import { resultsToBroadcastDecision } from "./components/resultsToBroadcast.js";
 
 const API_BASE = "http://localhost:8765";
 const WS_BASE = "ws://localhost:8765";
@@ -22,32 +16,57 @@ const REVIEW_MODULES = {
     label: "LBW", role: "Ball Tracking", panel: "lbw",
     feedTitle: "Ball Tracking", detailTitle: "LBW Review", detailSub: "Ball-tracking trajectory",
     stages: ["Release", "Pitch", "Impact", "Prediction", "Decision"],
+    protocol: [{ key: "front_foot", label: "Front Foot" }, { key: "ultra_edge", label: "UltraEdge" },
+               { key: "trajectory", label: "Ball Tracking" }, { key: "decision", label: "Decision" }],
   },
   wide: {
     label: "Wide", role: "Wide Camera", panel: "wide",
     feedTitle: "Wide Camera", detailTitle: "Wide Review", detailSub: "Off / leg-side wide line",
     stages: ["Release", "Passing Batter", "Wide Line", "Decision"],
+    protocol: [{ key: "wide_line", label: "Wide Line" }, { key: "decision", label: "Decision" }],
   },
   noball: {
     label: "No Ball", role: "Front Foot", panel: "noball",
     feedTitle: "Front Foot Camera", detailTitle: "Front Foot No Ball", detailSub: "Popping-crease overstep",
     stages: ["Release", "Landing", "Front Foot", "Decision"],
+    protocol: [{ key: "front_foot", label: "Front Foot" }, { key: "decision", label: "Decision" }],
   },
   edge: {
     label: "Edge", role: "Stump Camera", panel: "edge",
     feedTitle: "Stump Camera", detailTitle: "Edge Review", detailSub: "UltraEdge + HotSpot",
     stages: ["Release", "Spike", "HotSpot", "Decision"],
+    protocol: [{ key: "audio_sync", label: "Audio Sync" }, { key: "decision", label: "Decision" }],
+    decisionMode: "assisted",
   },
   runout: {
     label: "Run Out", role: "Stump", panel: "runout",
     feedTitle: "Run-Out Camera", detailTitle: "Run Out", detailSub: "Crease / bat / bails",
     stages: ["Appeal", "Crease", "Bat", "Bails", "Decision"],
+    protocol: [{ key: "crease", label: "Crease Check" }, { key: "decision", label: "Decision" }],
+    decisionMode: "assisted",
   },
   stumping: {
     label: "Stumping", role: "Stump", panel: "stumping",
     feedTitle: "Stump Camera", detailTitle: "Stumping", detailSub: "Gloves / bails / bat position",
     stages: ["Appeal", "Gloves", "Bails", "Bat", "Decision"],
+    protocol: [{ key: "crease", label: "Crease Check" }, { key: "timing", label: "Bail Timing" },
+               { key: "decision", label: "Decision" }],
+    decisionMode: "assisted",
   },
+};
+
+// assisted = the system provides evidence tools and ADVISORY readings only;
+// the umpire makes the call (Edge / Run Out / Stumping — like broadcast DRS).
+// automatic = the system produces a measurement-backed reading (LBW/Wide/NoBall).
+const isAssisted = (type) => (REVIEW_MODULES[type]?.decisionMode || "automatic") === "assisted";
+
+// The decision is confirmed in the review type's OWN vocabulary — a Wide review
+// resolves WIDE / NOT WIDE, never OUT. `send` is what /api/decision/confirm
+// records; the backend maps "appeal upheld" words onto its binary status.
+const DECISION_ACTIONS = {
+  wide: { positive: { send: "WIDE", label: "WIDE" }, negative: { send: "NOT WIDE", label: "NOT WIDE" } },
+  noball: { positive: { send: "NO BALL", label: "NO BALL" }, negative: { send: "LEGAL", label: "LEGAL" } },
+  default: { positive: { send: "OUT", label: "OUT" }, negative: { send: "NOT_OUT", label: "NOT OUT" } },
 };
 const FUTURE_MODULES = ["Bouncer Height", "Above-Waist No Ball", "Custom"];
 
@@ -75,6 +94,9 @@ async function loadReviewTypes() {
         evidence: contract.evidence || [],
         replayMode: contract.replay_mode || "generic",
         decisionCard: contract.decision_card || ["Decision"],
+        // The operator protocol drives the review workspace (stage rail + flow).
+        protocol: contract.protocol || existing.protocol,
+        decisionMode: contract.decision_mode || existing.decisionMode || "automatic",
         supports: contract.supports || existing.supports || { frame_step: true },
       };
     }
@@ -104,18 +126,18 @@ const state = {
   cameras: [],
   mode: { id: "visible", label: "Mode A - visible-spectrum approximation" },
   activeAppeal: false,
+  // Review generation counter: bumped whenever a review starts OR is finished/
+  // cancelled. An in-flight appeal response whose generation is stale must NOT
+  // touch the UI (it would reopen the workspace as a zombie after confirm).
+  reviewGen: 0,
   replayFrame: 0,
-  scene: null,
   replayTimer: null,
   panelMode: "live",
   testingPanel: null,
   statusPanel: null,
-  resultsPanel: null,
-  animationSequencer: null,
   calibrationModal: null,
   activeVideoInfo: null,
   lastStatus: "WAITING",
-  revealing: false,
   lastHealth: null,
   reviewStartMs: null,
   reviewElapsed: null,
@@ -144,6 +166,8 @@ const state = {
   replayLayerOff: {},
   // Canonical pipeline job for the current live appeal: {jobId, results} once complete.
   canonical: null,
+  // Latest /api/preflight payload — feeds the dashboard's one-line readiness.
+  readiness: null,
 };
 
 const timers = {};
@@ -172,30 +196,13 @@ const els = {
   primaryTag: document.getElementById("primary-tag"),
   feedTitle: document.getElementById("feed-title"),
   feedSub: document.getElementById("feed-sub"),
-  detailTitle: document.getElementById("detail-title"),
-  detailSub: document.getElementById("detail-sub"),
-  lbwTools: document.getElementById("lbw-tools"),
-  decisionReviewType: document.getElementById("decision-review-type"),
-  timelineType: document.getElementById("timeline-type"),
-  badge: document.getElementById("decision-badge"),
-  decisionState: document.getElementById("decision-state"),
-  stateResult: document.getElementById("state-result"),
-  title: document.getElementById("decision-title"),
-  overlay: document.getElementById("broadcast-overlay"),
-  overall: document.getElementById("overall-confidence"),
-  impact: document.getElementById("impact-location"),
-  wicket: document.getElementById("wicket-zone"),
-  speed: document.getElementById("ball-speed"),
-  explanation: document.getElementById("decision-explanation"),
-  trajectoryStatus: document.getElementById("trajectory-status"),
-  sceneHost: document.getElementById("trajectory-scene"),
-  timeline: document.getElementById("decision-timeline"),
-  confidenceBreakdown: document.getElementById("confidence-breakdown"),
-  hotspotMode: document.getElementById("hotspot-mode"),
-  hotspotView: document.getElementById("hotspot-view"),
-  ultraedge: document.getElementById("ultraedge-canvas"),
-  edgeProbability: document.getElementById("edge-probability"),
-  edgeContact: document.getElementById("edge-contact"),
+  reviewStrip: document.getElementById("review-strip"),
+  reviewStripTitle: document.getElementById("review-strip-title"),
+  reviewStripElapsed: document.getElementById("review-strip-elapsed"),
+  openReviewMode: document.getElementById("open-review-mode"),
+  readinessStrip: document.getElementById("readiness-strip"),
+  readinessText: document.getElementById("readiness-text"),
+  readinessDetail: document.getElementById("readiness-detail"),
   healthGrid: document.getElementById("health-grid"),
   preflightSummary: document.getElementById("preflight-summary"),
   preflightGrid: document.getElementById("preflight-grid"),
@@ -259,12 +266,7 @@ const els = {
   frameTimeline: document.getElementById("frame-timeline"),
   frameLabel: document.getElementById("frame-label"),
   requestReview: document.getElementById("request-review"),
-  confirmOut: document.getElementById("confirm-out"),
-  confirmNotOut: document.getElementById("confirm-not-out"),
-  exportReview: document.getElementById("export-review"),
-  resetReview: document.getElementById("reset-review"),
   calibrationButton: document.getElementById("calibration-button"),
-  resetCamera: document.getElementById("reset-camera"),
   replayBack: document.getElementById("replay-back"),
   replayForward: document.getElementById("replay-forward"),
   replayPlay: document.getElementById("replay-play"),
@@ -293,48 +295,6 @@ const els = {
   validationRoot: document.getElementById("validation-root"),
   modelsRoot: document.getElementById("models-root"),
   calibrationRoot: document.getElementById("calibration-root"),
-  wideOverlay: document.getElementById("wide-overlay"),
-  noballOverlay: document.getElementById("noball-overlay"),
-  wideVerdict: document.getElementById("wide-verdict"),
-  wideDistance: document.getElementById("wide-distance"),
-  wideDistance2: document.getElementById("wide-distance-2"),
-  wideCentre: document.getElementById("wide-centre"),
-  wideRadius: document.getElementById("wide-radius"),
-  wideBatter: document.getElementById("wide-batter"),
-  wideConfidence: document.getElementById("wide-confidence"),
-  tvBall: document.getElementById("tv-ball"),
-  tvDistLine: document.getElementById("tv-distline"),
-  tvDistLabel: document.getElementById("tv-distlabel"),
-  tvOverlap: document.getElementById("tv-overlap"),
-  noballVerdict: document.getElementById("noball-verdict"),
-  noballDistance: document.getElementById("noball-distance"),
-  noballMeter: document.getElementById("noball-meter"),
-  noballFoot: document.getElementById("noball-foot"),
-  noballFootPos: document.getElementById("noball-foot-pos"),
-  noballFootCm: document.getElementById("noball-foot-cm"),
-  noballConfidence: document.getElementById("noball-confidence"),
-  runoutVerdict: document.getElementById("runout-verdict"),
-  runoutDistance: document.getElementById("runout-distance"),
-  runoutMeter: document.getElementById("runout-meter"),
-  runoutBatCrease: document.getElementById("runout-batcrease"),
-  runoutFrame: document.getElementById("runout-frame"),
-  runoutBails: document.getElementById("runout-bails"),
-  runoutConfidence: document.getElementById("runout-confidence"),
-  stumpingVerdict: document.getElementById("stumping-verdict"),
-  stumpingDistance: document.getElementById("stumping-distance"),
-  stumpingMeter: document.getElementById("stumping-meter"),
-  stumpingGloves: document.getElementById("stumping-gloves"),
-  stumpingBatCrease: document.getElementById("stumping-batcrease"),
-  stumpingFrame: document.getElementById("stumping-frame"),
-  stumpingBails: document.getElementById("stumping-bails"),
-  // review summary
-  rsType: document.getElementById("rs-type"),
-  rsPrediction: document.getElementById("rs-prediction"),
-  rsConfidence: document.getElementById("rs-confidence"),
-  rsTime: document.getElementById("rs-time"),
-  rsTrajectory: document.getElementById("rs-trajectory"),
-  rsEdge: document.getElementById("rs-edge"),
-  rsHotspot: document.getElementById("rs-hotspot"),
   // operator + settings controls
   opModeMatch: document.getElementById("mode-match"),
   opModeEngineer: document.getElementById("mode-engineer"),
@@ -366,12 +326,11 @@ function setView(view) {
   document.querySelectorAll(".nav-item[data-view]").forEach((nav) => nav.classList.toggle("active", nav.dataset.view === view));
   els.viewTitle.textContent = VIEW_TITLES[view];
   renderMode();
-  if (view === "dashboard") requestAnimationFrame(resizeThree);
   if (view === "testing") ensureTestingPanel();
   if (view === "validation") ensureValidationPanel();
   if (view === "models") ensureModelManagerPanel();
   if (view === "development") refreshAiDevelopmentStatus();
-  if (view === "checklist") refreshPreflight();
+  if (view === "checklist" || view === "dashboard") refreshPreflight();
   if (view === "cameras") renderCamerasInUse();
   if (view === "reviews") renderReviews();
   if (view === "health") renderSystemView();
@@ -390,13 +349,6 @@ function setOperatorMode(mode) {
   const engineer = state.operatorMode === "engineer";
   [els.opModeEngineer, els.settingsModeEngineer].forEach((b) => b && b.classList.toggle("active", engineer));
   [els.opModeMatch, els.settingsModeMatch].forEach((b) => b && b.classList.toggle("active", !engineer));
-  // Match Mode hides the engineer evidence views (SVG animation / 3D) — if the
-  // operator was parked on one, snap back to the primary pipeline replay.
-  if (!engineer && (state.lbwView === "broadcast" || state.lbwView === "3d")) {
-    document.getElementById("lbw-observed-btn")?.click();
-  }
-  // Re-render the review summary so diagnostic rows appear/disappear immediately.
-  if (state.decision) renderReviewSummary(state.decision);
 }
 
 function applySidebarState() {
@@ -410,7 +362,6 @@ function toggleSidebar() {
   els.appShell.classList.toggle("collapsed", collapsed);
   store.set("drs.sidebarCollapsed", collapsed);
   if (els.sidebarToggle) els.sidebarToggle.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
-  setTimeout(resizeThree, 300);
 }
 
 function setCalm(on) {
@@ -442,16 +393,8 @@ function applyReviewType() {
   const type = state.reviewType;
   const mod = REVIEW_MODULES[type];
   document.querySelectorAll(".rt-btn").forEach((b) => b.classList.toggle("active", b.dataset.reviewType === type));
-  document.querySelectorAll(".review-panel").forEach((panel) => { panel.hidden = panel.dataset.reviewPanel !== type; });
-  if (els.wideOverlay) els.wideOverlay.hidden = type !== "wide";
-  if (els.noballOverlay) els.noballOverlay.hidden = type !== "noball";
-  if (els.lbwTools) els.lbwTools.hidden = type !== "lbw";
   if (els.feedTitle) els.feedTitle.textContent = mod.feedTitle;
   if (els.feedSub) els.feedSub.textContent = `${mod.label} primary feed`;
-  if (els.detailTitle) els.detailTitle.textContent = mod.detailTitle;
-  if (els.detailSub) els.detailSub.textContent = mod.detailSub;
-  if (els.decisionReviewType) els.decisionReviewType.textContent = mod.label;
-  if (els.timelineType) els.timelineType.textContent = `${mod.label} sequence`;
   // The Replay workspace declares which replay mode the active review type uses
   // (from the module contract) — trajectory for LBW, frame-stepping for Run Out, etc.
   const replaySubEl = document.getElementById("replay-sub");
@@ -467,10 +410,6 @@ function applyReviewType() {
     replaySubEl.textContent = `${mod.label} · ${modeLabel}`;
   }
   applyReplayMode();
-  renderTimeline();
-  renderReviewPanels(state.decision || {});
-  if (state.evidencePanel) state.evidencePanel.update(type, state.decision || {});
-  if (type === "lbw" && state.view === "dashboard") requestAnimationFrame(resizeThree);
 }
 
 /* ===================== camera roles + primary selection ===================== */
@@ -555,13 +494,6 @@ function renderMode() {
   } else {
     els.modeBanner.textContent = state.mode.label;
     els.modeBanner.classList.toggle("thermal", state.mode.id === "thermal_demo");
-  }
-  if (els.hotspotMode) els.hotspotMode.textContent = state.mode.id === "thermal_demo" ? "Demo overlay - simulated" : "Visible-spectrum approximation";
-  if (els.hotspotView) {
-    els.hotspotView.textContent = state.mode.id === "thermal_demo"
-      ? "Presentation heat colors are simulated and explicitly not real thermal data."
-      : "Mode A uses frame differencing and motion-energy approximation.";
-    els.hotspotView.classList.toggle("thermal", state.mode.id === "thermal_demo");
   }
 }
 
@@ -727,10 +659,9 @@ function renderLiveFrames(frames) {
 }
 
 async function refreshDecision() {
-  // Suppress the poll during the confirm→reset handoff and the staged reveal, so
-  // a GET dispatched just before the reset can't resolve late and resurrect the
-  // verdict (re-firing the whole reveal). The explicit renders drive those phases.
-  if (state.confirmHold || state.revealing) return;
+  // Suppress the poll during the confirm→reset handoff, so a GET dispatched just
+  // before the reset can't resolve late and resurrect the verdict.
+  if (state.confirmHold) return;
   try {
     const decision = await jsonFetch("/api/decision/current");
     renderDecision(decision);
@@ -741,41 +672,19 @@ function renderDecision(decision) {
   state.decision = decision;
   const status = decision.status || "WAITING";
   state.activeAppeal = status !== "WAITING";
-  const justResolved = status !== "WAITING" && state.lastStatus === "WAITING";
   const nowResolved = status === "OUT" || status === "NOT_OUT";
   const wasResolved = state.lastStatus === "OUT" || state.lastStatus === "NOT_OUT";
   if (nowResolved && !wasResolved) {
     state.reviewElapsed = state.reviewStartMs ? (Date.now() - state.reviewStartMs) / 1000 : null;
   }
   state.lastStatus = status;
-  if (justResolved && !state.revealing) {
-    playDecisionReveal(status, decision);
-  } else if (!state.revealing) {
-    els.badge.className = `badge ${statusClass(status)}`;
-    els.badge.textContent = displayStatus(status);
-    els.title.textContent = decision.outcome || statusText(status);
-    els.overlay.className = `broadcast-overlay ${statusClass(status)}`;
-    els.overlay.textContent = status === "PROCESSING" ? "REVIEWING" : broadcastText(status, decision);
-    renderDecisionState(status);
-  }
+  // The dashboard is a control room: the decision only drives the layout state,
+  // the review strip and the match/queue records. ALL evidence rendering happens
+  // in Review Mode — there is no second review surface to feed.
+  renderDecisionState(status);
   if (nowResolved && !wasResolved) resolveQueue(status);
-  els.overall.textContent = pct(decision.overall_confidence ?? decision.ball_confidence);
   if (els.kpiModel) els.kpiModel.textContent = pct(decision.overall_confidence ?? decision.ball_confidence);
-  els.impact.textContent = formatPoint(decision.impact_marker || decision.impact_point);
-  els.wicket.textContent = decision.wicket_zone_status || "--";
-  els.speed.textContent = decision.ball_speed_kmh ? `${Number(decision.ball_speed_kmh).toFixed(1)} km/h` : "--";
-  els.explanation.textContent = decision.explanation || "Awaiting appeal sequence.";
-  if (els.trajectoryStatus) { const n = trajectoryPoints(decision.trajectory).length; els.trajectoryStatus.textContent = n ? `${n} tracked points` : "Waiting for review data"; }
-  if (!state.revealing) renderTimeline();
-  renderConfidence(decision);
-  renderReviewPanels(decision);
-  renderReviewSummary(decision);
-  updateTrajectory(decision);
-  if (state.broadcastReview) state.broadcastReview.update(decision);
-  if (state.evidencePanel) state.evidencePanel.update(state.reviewType, decision);
   if (state.view === "replay") applyReplayMode();
-  drawUltraEdge(decision);
-  renderHotspot(decision);
   if (ReviewMode.active) ReviewMode.update(decision);
 }
 
@@ -786,7 +695,6 @@ function setReviewLayoutState(phase, status) {
     els.rtState.textContent = phase === "result" ? displayStatus(status || state.lastStatus)
       : phase === "processing" ? "Reviewing" : "Waiting";
   }
-  requestAnimationFrame(resizeThree);
 }
 
 // Current Match lifecycle badge: WAITING → REVIEW IN PROGRESS → CONFIRMED → WAITING.
@@ -800,44 +708,43 @@ function setMatchStatus(kind) {
 // results, endpoints and replay exports as the Testing page (one implementation).
 let _canonicalJobWatching = null;
 function watchCanonicalReview(decision) {
-  const hosts = canonicalHosts();
-  if (!hosts.observed && !hosts.clean) return;
+  // The canonical trajectory pipeline IS the LBW protocol's Ball-Tracking stage.
+  // No other review type runs it — their protocols never mention trajectory, so
+  // nothing here may touch their screens (the old "No pipeline replay for this
+  // review type" dead-end came from exactly that leak).
+  if ((decision?.review_type || state.reviewType) !== "lbw") return;
   state.canonical = null;
   syncCanonicalSurfaces();                                 // clear the badges for the new appeal
   const jobId = decision?.canonical_job_id;
   if (!jobId) {
-    // honesty rule: name the reason, never fabricate a replay
-    const why = decision?.canonical_skip_reason
-      ? `No DRS replay — ${decision.canonical_skip_reason}`
-      : "No pipeline replay for this review type.";
-    setCanonicalNotes(`<div class="cr-note quiet">${why}</div>`);
+    // honesty rule: never fabricate a replay. Operator copy up front, the
+    // pipeline's own reason preserved for the engineer surfaces.
+    const why = "Replay clip wasn't captured for this appeal — decide from the live replay.";
     if (ReviewMode.active) {
       ["rm-observed", "rm-broadcast"].forEach((id) => { const b = document.getElementById(id); if (b) b.innerHTML = `<div class="rm2-noreplay">${why}</div>`; });
-      ReviewMode.setStep("bt", "failed");
+      ReviewMode.renderFlow(decision);   // trajectory stage → skipped, via the engine
     }
     return;
   }
   _canonicalJobWatching = jobId;
-  setCanonicalNotes(`<div class="cr-note">DRS analysis running… (ball tracking + replay render)</div>`);
   setCanonicalChip("Replay rendering …", false);
   const started = Date.now();
   const poll = async () => {
     if (_canonicalJobWatching !== jobId) return;           // superseded by a newer appeal
     if (Date.now() - started > 5 * 60 * 1000) {
-      setCanonicalNotes(`<div class="cr-note">DRS analysis timed out — check the backend log.</div>`);
+      setCanonicalChip("Replay timed out — check the backend log", false);
+      if (ReviewMode.active) ReviewMode.renderPending("Replay render timed out — decide from the frame-stepped evidence.");
       return;
     }
     try {
       const res = await fetch(`${API_BASE}/api/analyze/${jobId}/results`);
       if (!res.ok) {
-        // Still processing — show the job's REAL progress (percent + step) in both
-        // evidence tabs and the Review Mode chip, instead of a static note.
+        // Still processing — show the job's REAL progress (percent + step) in the
+        // Review Mode chip, instead of a static note.
         try {
           const st = await fetch(`${API_BASE}/api/analyze/${jobId}/status`).then((r) => r.json());
           if (_canonicalJobWatching === jobId) {
             const pct = Number(st.progress ?? st.percent ?? 0);
-            const step = st.current_step || st.step || "processing";
-            setCanonicalNotes(`<div class="cr-note">DRS analysis ${pct ? `${pct}% — ` : "running… "}${step}</div>`);
             setCanonicalChip(`Replay rendering ${pct ? `${pct}%` : "…"}`, false);
             if (ReviewMode.active) ReviewMode.renderPending(`Rendering replay… ${pct ? pct + "%" : ""}`);
           }
@@ -846,30 +753,11 @@ function watchCanonicalReview(decision) {
       }
       const results = await res.json();
       state.canonical = { jobId, results };
-      if (hosts.observed) renderCanonicalReview(hosts.observed, jobId, results, "players");
-      if (hosts.clean) renderCanonicalReview(hosts.clean, jobId, results, "review");
       if (ReviewMode.active) ReviewMode.setCanonical(jobId, results);   // the single review workspace
-      syncCanonicalSurfaces();                             // badge the tabs + mirror into Replay
+      syncCanonicalSurfaces();                             // badge the chip + mirror into Replay
     } catch { setTimeout(poll, 3000); }
   };
   setTimeout(poll, 3000);
-}
-
-// The two pipeline replays live in their OWN primary tabs: Observed Trajectory
-// (#canonical-observed, tracked footage) and Broadcast Replay (#canonical-review,
-// clean DRS render). Both hosts get identical pending/failure notes so whichever
-// tab the operator is on tells the truth.
-function canonicalHosts() {
-  return {
-    observed: document.getElementById("canonical-observed"),
-    clean: document.getElementById("canonical-review"),
-  };
-}
-
-function setCanonicalNotes(html) {
-  const { observed, clean } = canonicalHosts();
-  if (observed) observed.innerHTML = html;
-  if (clean) clean.innerHTML = html;
 }
 
 // Review Mode status chip: replay-rendering progress / readiness, visible WITHOUT
@@ -883,14 +771,12 @@ function setCanonicalChip(text, ready) {
   chip.disabled = !ready;
 }
 
-// Mirror the canonical replays into the Replay workspace (LBW mode) and badge the
-// LBW "DRS Replay" toggle so the operator knows the videos are ready.
+// Mirror the canonical replays into the Replay workspace (LBW mode) and badge
+// the Review Mode chip so the operator knows the videos are ready.
 function syncCanonicalSurfaces() {
   const replayHost = document.getElementById("replay-canonical");
   const c = state.canonical;
   const ready = Boolean(c && c.results && (c.results.exports || {}).replay_players);
-  document.getElementById("lbw-observed-btn")?.classList.toggle("ready", ready);
-  document.getElementById("lbw-clean-btn")?.classList.toggle("ready", ready && Boolean((c.results.exports || {}).replay_review));
   if (c && c.results) {
     setCanonicalChip(ready ? "DRS replay ready ✓ — view" : "Analysis done — no replay (see DRS Replay tab)", ready);
   } else if (!c) {
@@ -902,9 +788,16 @@ function syncCanonicalSurfaces() {
     if (showInReplay) renderCanonicalReview(replayHost, c.jobId, c.results);
     else replayHost.innerHTML = "";
   }
-  // The Ball-Tracking stage depends on the async gates — refresh the Review Mode
-  // protocol from the single state machine now that canonical results have landed.
+  // The Ball-Tracking stage depends on the async gates — refresh BOTH protocol
+  // surfaces from the single state machine now that canonical results have
+  // landed: the workspace rail and the dashboard's Evidence Checklist (the
+  // trajectory renders in the background while the operator is on the earlier
+  // stages — the checklist row must flip to done on its own).
   if (ReviewMode.active) ReviewMode.renderProtocol();
+  if (state.activeAppeal) {
+    const phase = (state.lastStatus === "OUT" || state.lastStatus === "NOT_OUT") ? "result" : "processing";
+    renderDashEvidence(phase, state.lastStatus);
+  }
 }
 
 function renderCanonicalReview(host, jobId, results, which = "both") {
@@ -947,272 +840,309 @@ function renderDecisionState(status) {
   // Reflect the lifecycle on the Current Match badge, unless we're holding a brief
   // CONFIRMED flash right after a confirmation.
   if (!state.confirmHold) setMatchStatus(phase === "waiting" ? "waiting" : "review");
-  els.decisionState.querySelectorAll(".state-node").forEach((node) => {
-    const st = node.dataset.state;
-    node.className = "state-node";
-    if (phase === "waiting" && st === "waiting") node.classList.add("active");
-    else if (phase === "processing") {
-      if (st === "waiting") node.classList.add("done");
-      if (st === "processing") node.classList.add("active");
-    } else if (phase === "result") {
-      if (st === "waiting" || st === "processing") node.classList.add("done");
-      if (st === "result") node.classList.add("result", statusClass(status));
-    }
-  });
-  els.stateResult.textContent = phase === "result" ? displayStatus(status) : "DECISION";
-  // Contextual buttons. Confirm is available once the system is reviewing (so the
-  // umpire can call an inconclusive review), but everything is hidden mid-reveal.
-  const reviewing = state.revealing;
-  els.requestReview.hidden = reviewing || phase !== "waiting";
-  els.confirmOut.hidden = reviewing || phase === "waiting";
-  els.confirmNotOut.hidden = reviewing || phase === "waiting";
-  els.exportReview.hidden = reviewing || phase === "waiting";
-  els.resetReview.hidden = reviewing || phase === "waiting";
-  els.confirmOut.disabled = false;
-  els.confirmNotOut.disabled = false;
+  els.requestReview.hidden = phase !== "waiting";
+  renderReviewStrip(phase, status);
 }
 
-// Adaptive timeline driven by the active module's stages (item 10)
-function renderTimeline() {
-  const stages = REVIEW_MODULES[state.reviewType].stages;
-  const status = state.lastStatus;
-  const resolved = status === "OUT" || status === "NOT_OUT";
-  const processing = status === "PROCESSING";
-  const source = stages.map((label, index) => {
-    let st = "pending";
-    if (resolved) st = "complete";
-    else if (processing) st = index < stages.length - 1 ? "complete" : "active";
-    else if (state.activeAppeal && index === 0) st = "active";
-    return { label, status: st };
-  });
-  els.timeline.innerHTML = source.map((item) => `
-    <div class="timeline-row ${item.status}">
-      <i></i><span>${item.label}</span>
-    </div>
-  `).join("");
+// The dashboard's ONE review presence. Idle → readiness ("can I review right
+// now?"). Active → the protocol itself: which checks are done and what each
+// concluded, which are still running, and the way back into the workspace.
+// The dashboard never asks the operator to REMEMBER the protocol — it shows it.
+function renderReviewStrip(phase, status) {
+  if (!els.reviewStrip) return;
+  const active = phase !== "waiting";
+  els.reviewStrip.hidden = !active;
+  els.reviewStrip.classList.toggle("result", phase === "result");
+  // The two lines share one slot — readiness only matters between reviews.
+  if (els.readinessStrip) els.readinessStrip.hidden = active || !state.readiness;
+  if (!active) { stopReviewClock(); return; }
+  const mod = REVIEW_MODULES[state.decision?.review_type || state.reviewType] || {};
+  if (phase === "result") {
+    const word = state.decision?.outcome || displayStatus(status);
+    if (els.reviewStripTitle) els.reviewStripTitle.textContent = `${mod.label || "Review"} · decision ready — ${word}`;
+    stopReviewClock();
+    if (els.reviewStripElapsed) els.reviewStripElapsed.textContent = "Confirm in the workspace";
+  } else {
+    if (els.reviewStripTitle) els.reviewStripTitle.textContent = `${mod.label || "Review"} review running`;
+    startReviewClock();
+  }
+  renderDashEvidence(phase, status);
 }
 
-function paintTimelineProgress(activeIndex) {
-  els.timeline.querySelectorAll(".timeline-row").forEach((row, index) => {
-    row.className = "timeline-row " + (index < activeIndex ? "complete" : index === activeIndex ? "active" : "pending");
-  });
+// Checklist row icons speak the same tri-state language as the workspace rail.
+const EV_ICONS = { passed: "✓", processing: "⏳", waiting: "○", skipped: "⚠", failed: "✕" };
+const EV_FALLBACK_WORD = { passed: "DONE", processing: "Processing", waiting: "Pending", skipped: "Skipped", failed: "Failed" };
+
+// The Evidence Checklist: the active type's protocol from the ONE state machine
+// (computeFlow), one row per evidence stage. Clicking a row opens the workspace
+// ON that stage — the dashboard is the control panel, the workspace is where the
+// evidence is inspected. The Decision footer answers "can I decide yet?".
+function renderDashEvidence(phase, status) {
+  const host = document.getElementById("rs-evidence");
+  const dec = document.getElementById("rs-decision");
+  if (!host || !dec) return;
+  const type = state.decision?.review_type || state.reviewType;
+  const flow = computeFlow(type, state.decision || {});
+  const rows = flow.stages.filter((s) => s.key !== "decision");
+  host.hidden = !rows.length;
+  host.innerHTML = rows.map((s) => `
+    <button type="button" class="rs-ev ${s.state}" data-stage="${s.key}" title="${(s.note || s.label).replace(/"/g, "&quot;")} — click to open this evidence">
+      <span class="rs-ev-ico">${EV_ICONS[s.state] || "○"}</span>
+      <span class="rs-ev-lbl">${s.label}</span>
+      <span class="rs-ev-word">${s.word || EV_FALLBACK_WORD[s.state] || ""}</span>
+    </button>`).join("");
+  // Decision footer: ready only when every evidence stage has settled.
+  const settled = rows.length && rows.every((s) => s.state === "passed" || s.state === "skipped" || s.state === "failed");
+  dec.hidden = false;
+  let text, cls;
+  if (phase === "result") {
+    text = `Ready for decision — confirm ${state.decision?.outcome || displayStatus(status)} in the workspace`;
+    cls = "ready";
+  } else if (settled) {
+    const rr = state.decision?.review_result || {};
+    const reading = rr.verdict && !NON_VERDICTS.test(rr.verdict) && rr.verdict !== "INCONCLUSIVE" ? rr.verdict : null;
+    text = reading ? `Ready for decision${isAssisted(type) ? ` — system reading ${reading} (advisory)` : ` — system reads ${reading}`}` : "Evidence complete — your call from the workspace";
+    cls = "ready";
+  } else {
+    text = "Waiting for evidence";
+    cls = "";
+  }
+  dec.className = `rs-decision ${cls}`;
+  dec.innerHTML = `<span class="rs-ev-lbl">Decision</span><span class="rs-dec-text">${text}</span>`;
 }
 
-function renderConfidence(decision) {
-  const rows = [
-    ["Ball detection", decision.ball_confidence],
-    ["Tracking", decision.tracking_confidence],
-    ["Calibration", decision.calibration_confidence],
-    ["Prediction", decision.prediction_confidence],
-    ["Model", decision.model_confidence],
-  ];
-  els.confidenceBreakdown.innerHTML = rows.map(([label, value]) => `
-    <div class="confidence-row">
-      <span>${label}</span><strong>${pct(value)}</strong>
-      <div><i style="width:${Math.round(Number(value || 0) * 100)}%"></i></div>
-    </div>
-  `).join("");
+// Elapsed time is the one number worth watching from the dashboard: a review that
+// has been running too long is the operator's cue to go look at it.
+function startReviewClock() {
+  paintReviewClock();
+  if (timers.reviewClock) return;
+  timers.reviewClock = setInterval(paintReviewClock, 1000);
 }
 
-// ── LBW protocol state machine — the SINGLE source of truth ──────────────────
-// Every stage is exactly one of: "waiting" | "processing" | "passed" | "failed".
-// The Review Mode UI is driven ONLY from this object, so the display is
-// deterministic — never inferred ad hoc from whichever backend field arrives
-// first (which is what made steps read "waiting" while actually processing).
+function stopReviewClock() {
+  clearInterval(timers.reviewClock);
+  timers.reviewClock = null;
+}
+
+function paintReviewClock() {
+  if (!els.reviewStripElapsed) return;
+  // Honest when unknown: a review already running when this window opened has no
+  // local start time, so we say nothing rather than invent an elapsed figure.
+  if (!state.reviewStartMs) { els.reviewStripElapsed.textContent = ""; return; }
+  const secs = Math.max(0, Math.round((Date.now() - state.reviewStartMs) / 1000));
+  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+  const ss = String(secs % 60).padStart(2, "0");
+  els.reviewStripElapsed.textContent = `Started ${mm}:${ss} ago`;
+}
+
+// Readiness: a ONE-LINE summary of the checklist the operator would otherwise
+// have to open. Same /api/preflight the Pre-Match Checklist uses — one source of
+// truth, no second opinion about whether the rig is ready.
+function renderReadiness(data) {
+  state.readiness = data;
+  if (!els.readinessStrip) return;
+  const blocking = (data.blocking || []).length;
+  const warnings = (data.warnings || []).length;
+  const kind = blocking ? "fail" : warnings ? "warn" : "pass";
+  els.readinessStrip.className = `readiness-strip ${kind}`;
+  els.readinessStrip.hidden = state.activeAppeal;
+  els.readinessText.textContent = blocking ? "Not ready to review"
+    : warnings ? "Ready — with warnings" : "Ready to review";
+  // Name the first thing that is actually wrong; a count alone isn't actionable.
+  const first = (data.items || []).find((i) => i.status === (blocking ? "fail" : "warn"));
+  const summary = data.summary || {};
+  els.readinessDetail.textContent = blocking || warnings
+    ? `${first ? first.label : `${blocking + warnings} checks`} — open the checklist`
+    : `${summary.pass || 0} checks passed`;
+}
+
+// Reopen the workspace for the review that is already running (the strip's
+// button). Canonical replays that finished while the workspace was closed are
+// re-attached from state.
+function reopenReviewMode() {
+  if (ReviewMode.active) return;
+  const decision = state.decision && state.decision.status !== "WAITING"
+    ? state.decision
+    : { review_type: state.reviewType, status: "PROCESSING", review_result: { verdict: "REVIEWING" } };
+  ReviewMode.enter(decision);
+  if (state.canonical?.results) ReviewMode.setCanonical(state.canonical.jobId, state.canonical.results);
+}
+
+// A checklist row is a deep link: open (or refocus) the workspace ON that
+// stage's evidence. From the dashboard the operator clicks WHAT they want to
+// inspect, not just "the workspace".
+function openReviewAtStage(stageKey) {
+  if (!ReviewMode.active) reopenReviewMode();
+  if (ReviewMode.active && stageKey) ReviewMode.focusStage(stageKey);
+}
+
+
+// ── PROTOCOL ENGINE — one state machine per review ───────────────────────────
+// The active review type's contract declares its ordered operator stages
+// (REVIEW_MODULES[type].protocol, served by /api/review-types). This engine is
+// the ONLY thing that decides stage states; every screen renders FROM it — a
+// Wide review is built from Wide's protocol and never learns trajectory exists.
+// Stage states:
 //   waiting    — not started yet
 //   processing — the review is live but this stage's result hasn't arrived
-//   passed     — the check completed successfully
-//   failed     — the check completed but couldn't run (no camera / mic / track)
-const PROTOCOL_STAGES = ["frontFoot", "ultraEdge", "ballTracking"];
+//   passed     — the check completed and produced a result
+//   skipped    — the check can't run here (no camera / mic / track); the note
+//                tells the operator what to do instead — the review continues
+//   failed     — the check ran and genuinely errored
+// Every stage carries an OPERATOR-language note; internal pipeline terminology
+// never reaches the rail (raw detail stays on hover / Engineer Mode surfaces).
 
-function computeProtocol(decision) {
+// Translate backend reason strings into umpire language. Last resort: the honest
+// raw reason (better than silence), but every known case reads like an instruction.
+function operatorReason(reason) {
+  if (!reason) return "";
+  if (/no ball detected|not detected/i.test(reason)) return "Ball not picked up on this camera — judge from the replay";
+  if (/not calibrated|calibrat/i.test(reason)) return "Camera not calibrated — measurements unavailable; judge from the replay";
+  if (/no .*camera|camera .*unavailable|unavailable/i.test(reason)) return "Camera unavailable for this check — judge from the replay";
+  if (/did not reach|insufficient/i.test(reason)) return "Not enough of the flight was captured — judge from the replay";
+  return reason;
+}
+
+const fmtCm = (v) => (v == null || !Number.isFinite(Number(v)) ? null : `${Math.abs(Number(v)).toFixed(1)} cm`);
+
+// In-flight status words are NOT verdicts — they must never reach the operator
+// as if the system had made a call.
+const NON_VERDICTS = /^(AWAITING|PROCESSING|REVIEWING|WAITING)$/i;
+
+// One evaluator per stage KEY (stage keys are shared across types on purpose:
+// "front_foot" behaves identically in an LBW and a No Ball review).
+const STAGE_EVAL = {
+  front_foot(decision, pending) {
+    const nb = decision.no_ball_analysis || decision.noball || {};
+    if (nb.is_no_ball === true) return { state: "passed", word: "NO BALL", note: `NO BALL — over the line${fmtCm(nb.distance_past_cm) ? ` by ${fmtCm(nb.distance_past_cm)}` : ""}` };
+    if (nb.is_no_ball === false) return { state: "passed", word: "NOT A NO BALL", note: "Front foot behind the line — legal delivery" };
+    if (nb.reason) return { state: "skipped", word: "NOT SEEN", note: "Front foot not visible — check it on the replay" };
+    return { state: pending, note: "Checking the front foot…" };
+  },
+  ultra_edge(decision, pending) {
+    const edge = decision.edge_analysis || {};
+    if (edge.available === false || edge.inconclusive) return { state: "skipped", word: "NO AUDIO", note: "No stump-mic audio — clear the bat from the slow-motion replay" };
+    if ((edge.events || []).length || edge.edge_probability != null) {
+      const hit = (edge.edge_probability || 0) >= 0.5;
+      return { state: "passed", word: hit ? "POSSIBLE EDGE" : "NO EDGE", note: hit ? "Possible bat involvement — review the spike" : "No bat involvement detected" };
+    }
+    return { state: pending, note: "Listening for an edge…" };
+  },
+  audio_sync(decision, pending) {
+    const edge = decision.edge_analysis || {};
+    if (edge.available === false || edge.inconclusive) return { state: "skipped", word: "NO AUDIO", note: "No stump microphone — judge from the slow-motion replay" };
+    if ((edge.events || []).length || edge.edge_probability != null) {
+      const n = (edge.events || []).length;
+      return { state: "passed", word: n ? `${n} SPIKE${n === 1 ? "" : "S"}` : "NO SPIKES", note: n ? `${n} spike${n === 1 ? "" : "s"} found — step to the marked frames` : "Audio analysed — no spikes found" };
+    }
+    return { state: pending, note: "Synchronising audio with the replay…" };
+  },
+  trajectory(decision, pending) {
+    const canon = state.canonical;
+    if (canon && canon.results) {
+      const gates = canon.results.reconstruction && canon.results.reconstruction.gates;
+      const hasReplay = Boolean((canon.results.exports || {}).replay_players);
+      // The wickets gate is THE trajectory verdict word (HITTING / MISSING);
+      // a track without gates is honest about being just a track.
+      if (gates || hasReplay) return { state: "passed", word: (gates && gates.wickets) ? String(gates.wickets).replace(/_/g, " ").toUpperCase() : "TRACKED", note: "Ball track ready — read pitching, impact and wickets" };
+      return { state: "skipped", word: "NOT TRACKED", note: "Ball couldn't be tracked — decide from the replay" };
+    }
+    if (decision.canonical_skip_reason) return { state: "skipped", word: "NOT TRACKED", note: "Ball tracking unavailable — decide from the replay" };
+    if (typeof ReviewMode !== "undefined" && ReviewMode.active && ReviewMode.restored) {
+      return { state: "skipped", word: "NOT STORED", note: "Tracking data is not stored for this review" };
+    }
+    if (decision.canonical_job_id || (canon && !canon.results)) return { state: "processing", note: "Tracking the ball…" };
+    return { state: pending, note: "Preparing ball tracking…" };
+  },
+  wide_line(decision, pending) {
+    const wide = decision.wide_analysis || decision.wide || {};
+    if (wide.is_wide === true) return { state: "passed", word: "WIDE", note: `WIDE — outside the guideline${fmtCm(wide.distance_cm) ? ` by ${fmtCm(wide.distance_cm)}` : ""}` };
+    if (wide.is_wide === false) return { state: "passed", word: "NOT WIDE", note: "Inside the guideline — not a wide" };
+    if (wide.reason) return { state: "skipped", word: "NOT MEASURED", note: operatorReason(wide.reason) };
+    return { state: pending, note: "Measuring the wide line…" };
+  },
+  crease(decision, pending) {
+    const a = decision.run_out_analysis || decision.stumping_analysis || {};
+    if (a.is_out === true || a.is_out === false || a.distance_cm != null) {
+      const cm = fmtCm(a.distance_cm);
+      const where = Number(a.distance_cm) < 0 ? "short of the crease" : "behind the crease";
+      return { state: "passed", word: cm ? `${cm} ${Number(a.distance_cm) < 0 ? "SHORT" : "BEHIND"}`.toUpperCase() : "FRAME FOUND", note: cm ? `Bat ${cm} ${where} at the decision frame` : "Decision frame found — step around it" };
+    }
+    if (a.reason) return { state: "skipped", word: "NOT MEASURED", note: operatorReason(a.reason) };
+    return { state: pending, note: "Finding the decision frame…" };
+  },
+  timing(decision, pending) {
+    const a = decision.stumping_analysis || {};
+    // A decision frame is NOT a bail reading. Only an actual bails_status may be
+    // reported as a completed check; a frame number alone means "here is where to
+    // look", which is a skipped check with a useful pointer.
+    if (a.bails_status) {
+      return { state: "passed", word: String(a.bails_status).replace(/_/g, " ").toUpperCase(), note: `Bails: ${String(a.bails_status).replace(/_/g, " ")}` };
+    }
+    if (a.frame_number != null) {
+      return { state: "skipped", word: "NOT OBSERVED", note: `Bails not observed — judge the moment around frame #${a.frame_number}` };
+    }
+    return { state: "skipped", word: "NOT OBSERVED", note: "Bails not observed — step to the moment manually" };
+  },
+  decision(decision, pending, type) {
+    const status = decision.status || "";
+    if (status === "OUT" || status === "NOT_OUT") {
+      return { state: "passed", note: `Decision confirmed: ${decision.outcome || displayStatus(status)}` };
+    }
+    const rr = decision.review_result || {};
+    // Only a REAL verdict word counts — in-flight status vocabulary never leaks.
+    if (rr.verdict && !NON_VERDICTS.test(rr.verdict)) {
+      if (rr.verdict === "INCONCLUSIVE") return { state: "processing", note: "No system recommendation — your call from the evidence" };
+      // Assisted types (Edge / Run Out / Stumping): the system reading is
+      // ADVISORY — the umpire decides from the evidence tools.
+      if (isAssisted(type)) return { state: "processing", note: `Evidence ready (system reading: ${rr.verdict}, advisory) — your call` };
+      return { state: "processing", note: `System reads ${rr.verdict} — confirm the decision` };
+    }
+    return { state: pending, note: pending === "processing" ? "Weighing the evidence…" : "" };
+  },
+  analysis(decision, pending) {
+    const rr = decision.review_result || {};
+    if (rr.verdict && rr.verdict !== "AWAITING") return { state: "passed", note: "Analysis complete" };
+    return { state: pending, note: "Analysing…" };
+  },
+};
+
+// The one state machine for the active review: the type's protocol stages, each
+// with a state + operator note, plus the CURRENT stage (what's happening now).
+function computeFlow(type, decision) {
   decision = decision || {};
+  const proto = (REVIEW_MODULES[type] && REVIEW_MODULES[type].protocol) ||
+    [{ key: "analysis", label: "Analysis" }, { key: "decision", label: "Decision" }];
   const status = decision.status || state.lastStatus || "WAITING";
-  // The review is "live" whenever Review Mode is open — not only when the last
-  // polled status says PROCESSING. During the appeal round-trip the poll can still
-  // report the stale pre-appeal WAITING decision; without this, pending stages
-  // would wrongly read "waiting" while the review is actually running.
-  const reviewLive = typeof ReviewMode !== "undefined" && ReviewMode.active;
+  // The review is "live" whenever the workspace is open on a live review — during
+  // the appeal round-trip the poll can still report the stale pre-appeal WAITING
+  // decision; without this, stages would read "waiting" while actually running.
+  const reviewLive = typeof ReviewMode !== "undefined" && ReviewMode.active && !ReviewMode.restored;
   const live = reviewLive || status === "PROCESSING" || status === "OUT" || status === "NOT_OUT";
   const pending = live ? "processing" : "waiting";
-
-  // ① Front Foot — front-foot no-ball check
-  const nb = decision.no_ball_analysis || decision.noball || {};
-  let frontFoot;
-  if (nb.is_no_ball === true || nb.is_no_ball === false) frontFoot = "passed";
-  else if (nb.reason && /no .*camera|not available|unavailable|not detected/i.test(nb.reason)) frontFoot = "failed";
-  else frontFoot = pending;
-
-  // ② UltraEdge — stump-mic audio analysis
-  const edge = decision.edge_analysis || {};
-  let ultraEdge;
-  if (edge.available === false) ultraEdge = "failed";
-  else if (edge.available === true || (edge.events && edge.events.length) || edge.inconclusive != null || edge.edge_probability != null) ultraEdge = "passed";
-  else ultraEdge = pending;
-
-  // ③ Ball Tracking — the async trajectory/replay pipeline (canonical job)
-  let ballTracking;
-  const canon = state.canonical;
-  const restored = reviewLive && ReviewMode.restored;
-  if (decision.canonical_skip_reason) ballTracking = "failed";
-  else if (canon && canon.results) {
-    const g = canon.results.reconstruction && canon.results.reconstruction.gates;
-    const hasReplay = Boolean((canon.results.exports || {}).replay_players);
-    ballTracking = (g || hasReplay) ? "passed" : "failed";
-  } else if (restored) {
-    ballTracking = "failed";         // historical review: results would be loaded if still on disk
-  } else if (decision.canonical_job_id || (canon && !canon.results)) {
-    ballTracking = "processing";     // job created / trajectory rendering
-  } else ballTracking = pending;
-
-  return { frontFoot, ultraEdge, ballTracking };
+  const stages = proto.map(({ key, label }) => {
+    const evaluate = STAGE_EVAL[key] || STAGE_EVAL.analysis;
+    const result = evaluate(decision, pending, type) || {};
+    return { key, label, state: result.state || "waiting", note: result.note || "", word: result.word || "" };
+  });
+  // TV-umpiring short-circuit: a front-foot NO BALL ends the review at that
+  // stage — everything after it (except the decision itself) never runs.
+  const ffIndex = stages.findIndex((s) => s.key === "front_foot");
+  const noBall = (decision.no_ball_analysis || {}).is_no_ball === true || decision.review_ended === "no_ball";
+  if (ffIndex >= 0 && noBall) {
+    for (let i = ffIndex + 1; i < stages.length; i += 1) {
+      if (stages[i].key !== "decision") {
+        stages[i].state = "skipped";
+        stages[i].note = "Not needed — the NO BALL ends the review";
+        stages[i].word = "NOT NEEDED";
+      }
+    }
+  }
+  const current = stages.find((s) => s.state === "processing") ||
+    stages.find((s) => s.state === "waiting") || stages[stages.length - 1];
+  return { stages, current };
 }
 
-// Review summary shown on result (commercial-style record)
-function renderReviewSummary(decision) {
-  const status = decision.status || state.lastStatus;
-  const resolved = status === "OUT" || status === "NOT_OUT";
-  const mod = REVIEW_MODULES[state.reviewType] || {};
-  if (els.rsType) els.rsType.textContent = mod.label || "--";
-  if (els.rsPrediction) els.rsPrediction.textContent = resolved ? displayStatus(status) : "--";
-  if (els.rsConfidence) els.rsConfidence.textContent = pct(decision.overall_confidence ?? decision.ball_confidence);
-  if (els.rsTime) els.rsTime.textContent = state.reviewElapsed != null ? `${state.reviewElapsed.toFixed(1)} sec` : "--";
-
-  // Per-type rows: the module's typed measurements when the analysis has run
-  // (Wide → "Outside 18.3 cm", Edge → "Edge probability 4%", Run Out → "Bat to
-  // crease 12.0 cm"), else the contract's decision-card labels as "--" placeholders.
-  // No review type ever sees another type's fields.
-  const grid = document.getElementById("rs-grid");
-  if (!grid) return;
-  grid.querySelectorAll("[data-rs-dynamic]").forEach((n) => n.remove());
-  const rr = decision.review_result || {};
-  const measurements = Array.isArray(rr.measurements) && rr.measurements.length
-    ? rr.measurements
-    : (mod.decisionCard || []).filter((label) => label !== "Decision").map((label) => ({ label, value: "--" }));
-  // Match Mode shows only decision-relevant rows — tracking diagnostics (detection
-  // rate, frames tracked, confidence, model) are engineering detail → Engineer Mode.
-  const DIAGNOSTIC_ROWS = /detection rate|frames? tracked|confidence|model|fps|tracking/i;
-  const engineerMode = state.operatorMode === "engineer";
-  const visibleMeasurements = engineerMode ? measurements : measurements.filter((m) => !DIAGNOSTIC_ROWS.test(m.label || ""));
-  for (const m of visibleMeasurements.slice(0, 6)) {
-    const row = document.createElement("div");
-    row.dataset.rsDynamic = "1";
-    const labelEl = document.createElement("span");
-    labelEl.textContent = m.label;
-    const valueEl = document.createElement("strong");
-    valueEl.textContent = m.value ?? "--";
-    if (m.flag) valueEl.classList.add("rs-flag");
-    row.append(labelEl, valueEl);
-    grid.appendChild(row);
-  }
-  // The unified verdict (WIDE / NO BALL / EDGE / OUT…) is richer than the
-  // OUT/NOT_OUT status vocabulary — prefer it while the review is unresolved.
-  if (rr.verdict && els.rsPrediction && !resolved && rr.verdict !== "AWAITING") {
-    els.rsPrediction.textContent = rr.verdict;
-  }
-}
-
-/* ----- per-review-type detail panels (items 6, 7) ----- */
-function renderReviewPanels(decision) {
-  renderWideReview(decision.wide_analysis || decision.wide || {});
-  renderNoBallReview(decision.no_ball_analysis || decision.noball || {});
-  renderEdgeReview(decision.edge_analysis || {});
-  renderRunOutReview(decision.run_out_analysis || {});
-  renderStumpingReview(decision.stumping_analysis || {});
-}
-
-// Shared crease-distance painter for the two crease reviews (Run Out / Stumping):
-// >0 cm = grounded behind the crease (SAFE), <0 = short of the line (OUT).
-function paintCreaseReview(analysis, ui, safeWord, outWord) {
-  const hasData = analysis.distance_cm != null || analysis.is_out != null;
-  const cm = Number(analysis.distance_cm);
-  const distance = Number.isFinite(cm) ? `${Math.abs(cm).toFixed(1)} cm` : "--";
-  if (ui.distance) ui.distance.textContent = distance;
-  if (ui.batCrease) ui.batCrease.textContent = Number.isFinite(cm)
-    ? `${Math.abs(cm).toFixed(1)} cm ${cm < 0 ? "short" : "behind"}` : "--";
-  if (ui.frame) ui.frame.textContent = analysis.frame_number != null ? `#${analysis.frame_number}` : "--";
-  if (ui.bails) ui.bails.textContent = analysis.bails_status ? String(analysis.bails_status).replace(/_/g, " ") : "--";
-  if (ui.confidence) ui.confidence.textContent = pct(analysis.confidence);
-  if (ui.meter) {
-    const fill = Number.isFinite(cm) ? Math.max(2, Math.min(100, 50 + cm * 2)) : 50;
-    ui.meter.style.width = `${fill}%`;
-    ui.meter.classList.toggle("over", Boolean(analysis.is_out));
-  }
-  if (ui.verdict) {
-    if (!hasData) { ui.verdict.textContent = "AWAITING"; ui.verdict.className = "big-verdict waiting"; }
-    else if (analysis.is_out) { ui.verdict.textContent = outWord; ui.verdict.className = "big-verdict out"; }
-    else { ui.verdict.textContent = safeWord; ui.verdict.className = "big-verdict not-out"; }
-  }
-}
-
-function renderRunOutReview(analysis) {
-  paintCreaseReview(analysis, {
-    verdict: els.runoutVerdict, distance: els.runoutDistance, meter: els.runoutMeter,
-    batCrease: els.runoutBatCrease, frame: els.runoutFrame, bails: els.runoutBails,
-    confidence: els.runoutConfidence,
-  }, "NOT OUT", "OUT");
-}
-
-function renderStumpingReview(analysis) {
-  paintCreaseReview(analysis, {
-    verdict: els.stumpingVerdict, distance: els.stumpingDistance, meter: els.stumpingMeter,
-    batCrease: els.stumpingBatCrease, frame: els.stumpingFrame, bails: els.stumpingBails,
-  }, "NOT OUT", "OUT");
-  if (els.stumpingGloves) {
-    els.stumpingGloves.textContent = analysis.gloves_detected == null
-      ? "Manual check" : (analysis.gloves_detected ? "Detected" : "Not detected");
-  }
-}
-
-function renderWideReview(wide) {
-  const hasData = wide.distance_cm != null || wide.is_wide != null;
-  const distance = wide.distance_cm != null ? `${Number(wide.distance_cm).toFixed(1)} cm` : "--";
-  if (els.wideDistance) els.wideDistance.textContent = distance;
-  if (els.wideDistance2) els.wideDistance2.textContent = distance;
-  if (els.wideCentre) els.wideCentre.textContent = formatPoint(wide.ball_centre);
-  if (els.wideRadius) els.wideRadius.textContent = wide.ball_radius_px != null ? `${Number(wide.ball_radius_px).toFixed(0)} px` : "--";
-  if (els.wideBatter) els.wideBatter.textContent = wide.batter_movement || "--";
-  if (els.wideConfidence) els.wideConfidence.textContent = pct(wide.confidence);
-  if (els.tvBall && els.tvDistLine && els.tvDistLabel) {
-    const cm = Number(wide.distance_cm);
-    const ballX = Number.isFinite(cm) ? Math.max(42, Math.min(120, 40 + cm * 1.6)) : 70;
-    els.tvBall.setAttribute("cx", String(ballX));
-    els.tvDistLine.setAttribute("x2", String(ballX));
-    els.tvDistLabel.textContent = Number.isFinite(cm) ? `${cm.toFixed(1)} cm` : "--";
-    if (els.tvOverlap) els.tvOverlap.setAttribute("width", String(Math.max(0, ballX - 40)));
-  }
-  if (els.wideVerdict) {
-    if (!hasData) { els.wideVerdict.textContent = "AWAITING"; els.wideVerdict.className = "big-verdict waiting"; }
-    else if (wide.is_wide) { els.wideVerdict.textContent = "WIDE"; els.wideVerdict.className = "big-verdict out"; }
-    else { els.wideVerdict.textContent = "NOT WIDE"; els.wideVerdict.className = "big-verdict not-out"; }
-  }
-}
-
-function renderNoBallReview(noball) {
-  const hasData = noball.distance_past_cm != null || noball.is_no_ball != null;
-  const distance = noball.distance_past_cm != null ? `${Number(noball.distance_past_cm).toFixed(1)} cm` : "--";
-  if (els.noballDistance) els.noballDistance.textContent = distance;
-  if (els.noballFootCm) els.noballFootCm.textContent = distance;
-  if (els.noballFootPos) els.noballFootPos.textContent = noball.foot_position || (hasData ? (noball.is_no_ball ? "Past line" : "Behind line") : "--");
-  if (els.noballConfidence) els.noballConfidence.textContent = pct(noball.confidence);
-  if (els.noballMeter) {
-    const cm = Number(noball.distance_past_cm || 0);
-    const pctFill = Math.max(2, Math.min(100, 50 + cm * 2));
-    els.noballMeter.style.width = `${pctFill}%`;
-    els.noballMeter.classList.toggle("over", Boolean(noball.is_no_ball));
-  }
-  if (els.noballFoot) els.noballFoot.classList.toggle("flagged", Boolean(noball.is_no_ball));
-  if (els.noballVerdict) {
-    if (!hasData) { els.noballVerdict.textContent = "AWAITING"; els.noballVerdict.className = "big-verdict waiting"; }
-    else if (noball.is_no_ball) { els.noballVerdict.textContent = "NO BALL"; els.noballVerdict.className = "big-verdict out"; }
-    else { els.noballVerdict.textContent = "LEGAL"; els.noballVerdict.className = "big-verdict not-out"; }
-  }
-}
-
-function renderEdgeReview(edge) {
-  if (els.edgeProbability) els.edgeProbability.textContent = pct(edge.edge_probability);
-  if (els.edgeContact) els.edgeContact.textContent = (edge.events || []).length ? "Detected" : (edge.edge_probability != null ? "None" : "--");
-}
 
 /* ===================== review queue / history (item 2) ===================== */
 function renderQueue() {
@@ -1238,7 +1168,9 @@ function renderQueue() {
 
 function resolveQueue(status) {
   const entry = [...state.queue].reverse().find((q) => q.status === "Processing");
-  if (entry) { entry.status = "Completed"; entry.verdict = displayStatus(status); }
+  // Record the review type's own confirmed word (WIDE / NO BALL / …) when the
+  // decision carries one; the binary status is only the fallback.
+  if (entry) { entry.status = "Completed"; entry.verdict = state.decision?.outcome || displayStatus(status); }
   renderQueue();
 }
 
@@ -1435,47 +1367,17 @@ function addFullscreenButton(stage, target) {
 
 function initDashboardModules() {
   state.statusPanel = new StatusPanel(els.leftPanelTitle, els.cameraCount, els.cameraGrid);
-  state.resultsPanel = new ResultsPanel(els);
-  state.animationSequencer = new DRSAnimationSequencer({
-    overlay: els.overlay,
-    title: els.title,
-    frameLabel: els.frameLabel,
-    replayTimeline: els.frameTimeline,
-  });
-  state.calibrationModal = new CalibrationWorkspace(els.calibrationRoot, {
+  state.calibrationModal = new CalibrationTabs(els.calibrationRoot, {
     onRoleChange: (cameraId, role) => setCameraRole(cameraId, role),
     getRole: (cameraId) => cameraRoleFor(cameraId),
   });
-  const broadcastHost = document.getElementById("broadcast-review");
-  if (broadcastHost) state.broadcastReview = new BroadcastReview(broadcastHost);
-  const evidenceHost = document.getElementById("decision-evidence");
-  if (evidenceHost) state.evidencePanel = new EvidencePanel(evidenceHost);
-  setupLbwViewToggle();
-  // Fullscreen on every camera/replay stage (Review ball-tracking feed + Replay Workspace).
+  // The dashboard's review widgets (EvidencePanel, BroadcastReview, the SVG
+  // animation sequencer, the 3D scene, the per-type panels) are GONE — the
+  // review workspace is the one place evidence is shown.
+  // Fullscreen on every camera/replay stage (control-room feed + Replay Workspace).
   document.querySelectorAll(".live-stage").forEach((stage) => addFullscreenButton(stage));
 }
 
-// Toggle between the technical 3D trajectory and the broadcast replay inside the
-// LBW Review card. Both share the same decision data; neither is removed.
-function setupLbwViewToggle() {
-  const toggle = document.getElementById("lbw-view-toggle");
-  if (!toggle) return;
-  // Primary evidence = the pipeline replays; the SVG animation and 3D scene are
-  // engineer-only views and never the default.
-  state.lbwView = "observed";
-  toggle.querySelectorAll("button[data-lbw-view]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const view = btn.dataset.lbwView;
-      state.lbwView = view;
-      toggle.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b === btn));
-      document.querySelectorAll('.review-panel[data-review-panel="lbw"] .lbw-view').forEach((panel) => {
-        panel.hidden = panel.dataset.lbwView !== view;
-      });
-      if (view === "3d") requestAnimationFrame(resizeThree);
-      else if (view === "broadcast" && state.broadcastReview && state.decision) state.broadcastReview.play();
-    });
-  });
-}
 
 // Engineer-only Testing page: a self-contained upload → analyze → results wizard
 // rendered into its own view (not the cameras grid). Instantiated once, on first visit.
@@ -1583,40 +1485,6 @@ async function importDataset(activate) {
   await refreshAiDevelopmentStatus();
 }
 
-function renderAnalysisResults(results) {
-  state.panelMode = "results";
-  state.statusPanel.summary(results);
-  state.resultsPanel.render(results);
-  const decision = dashboardDecisionFromResults(results);
-  renderDecision(decision);
-  state.animationSequencer.play(results);
-}
-
-function dashboardDecisionFromResults(results) {
-  const verdict = results.decision?.verdict || "UMPIRES_CALL";
-  // BroadcastReview's input comes from the ONE shared mapper (resultsToBroadcastDecision),
-  // so the broadcast card is fed the IDENTICAL object the Testing page uses — same
-  // canonical trajectory, same pitching/impact/wickets gate statuses. The dashboard then
-  // layers on the extra fields ONLY its other widgets need (3D view, confidence
-  // breakdown, badge copy), and keeps its own status vocabulary (umpire's call ->
-  // PROCESSING) for the badge/overlay state machine.
-  const points = results.trajectory?.points || [];
-  return {
-    ...resultsToBroadcastDecision(results),
-    status: verdict === "NOT_OUT" ? "NOT_OUT" : verdict === "OUT" ? "OUT" : "PROCESSING",
-    outcome: verdict.replace("_", " "),
-    ball_confidence: results.ball_tracking?.avg_confidence,
-    tracking_confidence: results.ball_tracking?.detection_rate,
-    calibration_confidence: results.lbw_gates?.pitching?.confidence,
-    prediction_confidence: results.lbw_gates?.wickets?.confidence,
-    model_confidence: results.ball_tracking?.avg_confidence,
-    impact_marker: results.trajectory?.impact_point,
-    wicket_zone_status: results.lbw_gates?.wickets?.result || "--",
-    predicted_extension: points.slice(-3),
-    wicket_prediction: results.trajectory?.predicted_stumps,
-    explanation: results.decision?.explanation,
-  };
-}
 
 async function requestReview() {
   state.confirmHold = false;
@@ -1630,8 +1498,9 @@ async function requestReview() {
   state.reviewElapsed = null;
   state.queue.push({ id: ++state.queueSeq, type: state.reviewType, label: mod.label, time: new Date().toLocaleTimeString(), status: "Processing" });
   renderQueue();
-  // Enter Review Mode IMMEDIATELY so the operator gets instant feedback (freeze +
-  // "Reviewing"), then replay the full animation once the decision arrives.
+  // Enter the review workspace IMMEDIATELY — the protocol engine has already
+  // decided this type's stage rail, evidence surface and decision vocabulary
+  // from its contract, so the operator sees THEIR review from the first frame.
   els.requestReview.disabled = true;
   ReviewMode.enter({ review_type: state.reviewType, status: "PROCESSING", review_result: { verdict: "REVIEWING" } });
   const cameraIds = state.cameras.filter((camera) => camera.connected).map((camera) => camera.id);
@@ -1643,6 +1512,7 @@ async function requestReview() {
     camera_roles: cameraRoles,
     primary_camera_id: getPrimaryCameraId(),
   };
+  const gen = ++state.reviewGen;
   try {
     const response = window.drs?.requestReview
       ? await window.drs.requestReview(payload)
@@ -1651,12 +1521,15 @@ async function requestReview() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
+    // The operator may have confirmed or cancelled while the appeal was in
+    // flight — a stale response must not resurrect the review workspace.
+    if (gen !== state.reviewGen) return;
     const decision = response.decision || response;
     renderDecision(decision);
     ReviewMode.play(decision);   // real overlay + verdict → replay the animation
     watchCanonicalReview(decision);   // canonical pipeline replays (same jobs as Testing)
   } catch (err) {
-    ReviewMode.exit();
+    if (gen === state.reviewGen) ReviewMode.exit();
   } finally {
     els.requestReview.disabled = false;
   }
@@ -1705,37 +1578,575 @@ async function resetReview() {
 
 // Tear down all Active-Review state so the dashboard returns to a clean IDLE.
 function finishActiveReview() {
+  state.reviewGen += 1;     // invalidate any appeal response still in flight
   state.reviewStartMs = null;
   state.reviewElapsed = null;
-  state.revealing = false;
   updateDevelopmentGuard();
-  clearInterval(state.revealTimer);
   if (ReviewMode.active) ReviewMode.exit();
 }
 
+/* ==================== PER-TYPE EVIDENCE SURFACES ==================== */
+// Each surface renders ONE review type's evidence into the workspace middle
+// zone. A surface only ever reads its own type's analysis block — the Wide
+// surface doesn't know trajectory exists, the Edge surface never shows one.
+
+function rmsRow(label, value, flagged) {
+  return `<div class="rms-row${flagged ? " flagged" : ""}"><span>${label}</span><strong>${value ?? "--"}</strong></div>`;
+}
+
+// Waveform painter shared by the Edge surface (and reusable elsewhere): real
+// envelope buckets revealed to the cursor, spike buckets cyan, red markers at
+// event frames, white cursor line.
+function drawSurfaceWave(canvas, buckets, events, cursor, total) {
+  if (!canvas || !total) return;
+  const ctx2 = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height, PADX = 16;
+  const plotW = W - PADX * 2, mid = H / 2, amp = H * 0.4;
+  ctx2.clearRect(0, 0, W, H);
+  ctx2.strokeStyle = "rgba(140,175,195,0.3)";
+  ctx2.lineWidth = 1;
+  ctx2.beginPath(); ctx2.moveTo(PADX, mid); ctx2.lineTo(W - PADX, mid); ctx2.stroke();
+  const nb = buckets.length;
+  if (nb) {
+    const revealed = Math.floor(((cursor + 1) / total) * nb);
+    const bw = Math.max(1, (plotW / nb) * 0.6);
+    for (let b = 0; b < revealed && b < nb; b++) {
+      const frame = Math.floor((b / nb) * total);
+      const spike = events.some((f) => Math.abs(f - frame) <= 1);
+      const x = PADX + (plotW * (b + 0.5)) / nb;
+      ctx2.strokeStyle = spike ? "#7df0ff" : "rgba(238,248,252,0.9)";
+      ctx2.lineWidth = bw;
+      ctx2.beginPath();
+      ctx2.moveTo(x, mid - buckets[b][1] * amp - 0.5);
+      ctx2.lineTo(x, mid - buckets[b][0] * amp + 0.5);
+      ctx2.stroke();
+    }
+  }
+  ctx2.fillStyle = "#ff5252";
+  events.forEach((f) => {
+    const x = PADX + (plotW * (f + 0.5)) / total;
+    ctx2.beginPath();
+    ctx2.moveTo(x, H - 14); ctx2.lineTo(x - 5, H - 5); ctx2.lineTo(x + 5, H - 5);
+    ctx2.closePath(); ctx2.fill();
+  });
+  const cxp = PADX + plotW * Math.min(1, (cursor + 1) / total);
+  ctx2.strokeStyle = "#ffffff";
+  ctx2.lineWidth = 2;
+  ctx2.beginPath(); ctx2.moveTo(cxp, 3); ctx2.lineTo(cxp, H - 3); ctx2.stroke();
+}
+
+// Frame-stepping surface over the review's FROZEN replay buffer (read-only:
+// frames are fetched by index, the backend replay cursor is never touched).
+// Powers Wide, Edge (waveform + audio), No Ball, Run Out and Stumping.
+// Tools: frame stepping (also ←/→ keys, Shift = ×10), slow motion, scrub,
+// 1×/2×/4× zoom (click the frame to centre it), brightness/contrast for
+// difficult footage, jump-to-decision-frame, waveform click-to-seek.
+function createStepSurface(cfg) {
+  // cfg: { waveform?, audio?, role?, readouts(decision)→html, jumpFrame(decision)→index|null, jumpLabel }
+  return {
+    host: null, armed: false, arming: false, total: 0, cursor: 0, cam: null,
+    playing: false, speed: 0.5, timer: null, acc: 0, retry: null,
+    window: null, wave: { buckets: [], available: false }, events: [],
+    zoom: 1, zoomOrigin: "50% 50%", audioEl: null, audioUrl: null,
+    mount(host, restored) {
+      this.host = host;
+      host.dataset.surface = "panel";
+      host.innerHTML = `
+        <div class="rms-stagewrap">
+          <div class="rms-stage"><img alt="Replay frame" draggable="false" /><canvas class="rms-fo" aria-hidden="true"></canvas>
+            <div class="rms-empty">${restored ? "Replay frames from this review are no longer stored — the recorded evidence is on the right." : "Capturing the replay…"}</div>
+          </div>
+          ${cfg.waveform ? `<canvas class="rms-wave" width="900" height="84" hidden title="Click to seek"></canvas>` : ""}
+          <div class="rms-controls">
+            <button type="button" data-act="start" title="First frame">⏮</button>
+            <button type="button" data-act="back" title="Previous frame (←)">◀</button>
+            <input type="range" min="0" max="0" value="0" />
+            <button type="button" data-act="fwd" title="Next frame (→)">▶</button>
+            <button type="button" data-act="play" title="Play slow motion (Space)">▶︎ Play</button>
+            <button type="button" data-act="s25">0.25×</button>
+            <button type="button" data-act="s50" class="active">0.5×</button>
+            <button type="button" data-act="s100">1×</button>
+            <button type="button" data-act="zoom" title="Zoom — click the frame to centre (Z)">🔍 1×</button>
+            <button type="button" data-act="jump" hidden>${cfg.jumpLabel || "Decision frame"}</button>
+            ${cfg.audio ? `<button type="button" data-act="audio" title="Play the window's captured audio">🔊 Audio</button>` : ""}
+            <span class="rms-frame-label">—</span>
+          </div>
+          <div class="rms-controls rms-adjust">
+            <span class="rms-adjust-lbl" title="Brightness">☀</span><input type="range" data-adj="b" min="50" max="170" value="100" />
+            <span class="rms-adjust-lbl" title="Contrast">◐</span><input type="range" data-adj="c" min="50" max="170" value="100" />
+            <button type="button" data-act="reset-adj" title="Reset image adjustments">Reset</button>
+          </div>
+        </div>
+        <aside class="rms-side"></aside>`;
+      host.querySelector(".rms-stagewrap").addEventListener("click", (ev) => {
+        const act = ev.target?.dataset?.act;
+        if (!act) return;
+        if (act === "start") this.seek(0);
+        else if (act === "back") this.step(-1);
+        else if (act === "fwd") this.step(1);
+        else if (act === "play") this.togglePlay();
+        else if (act === "s25") this.setSpeed(0.25, ev.target);
+        else if (act === "s50") this.setSpeed(0.5, ev.target);
+        else if (act === "s100") this.setSpeed(1, ev.target);
+        else if (act === "zoom") this.cycleZoom();
+        else if (act === "jump" && this.jumpTarget != null) this.seek(this.jumpTarget);
+        else if (act === "audio") this.playAudio();
+        else if (act === "reset-adj") {
+          this.host.querySelectorAll("[data-adj]").forEach((r) => { r.value = "100"; });
+          this.applyAdjust();
+        }
+      });
+      const scrub = host.querySelector(".rms-controls input[type=range]:not([data-adj])");
+      scrub.addEventListener("input", (ev) => this.seek(Number(ev.target.value)));
+      host.querySelectorAll("[data-adj]").forEach((r) => r.addEventListener("input", () => this.applyAdjust()));
+      // The overlay can only be placed once the frame's natural size is known, and
+      // must be re-placed whenever the panel resizes.
+      host.querySelector(".rms-stage img").addEventListener("load", () => this.drawOverlay());
+      this._ro = new ResizeObserver(() => this.drawOverlay());
+      this._ro.observe(host.querySelector(".rms-stage"));
+      // Zoom centres on wherever the umpire clicks the frame.
+      const img = host.querySelector(".rms-stage img");
+      img.addEventListener("click", (ev) => {
+        const rect = img.getBoundingClientRect();
+        this.zoomOrigin = `${(((ev.clientX - rect.left) / rect.width) * 100).toFixed(1)}% ${(((ev.clientY - rect.top) / rect.height) * 100).toFixed(1)}%`;
+        if (this.zoom === 1) this.cycleZoom(); else this.applyZoom();
+      });
+      // Waveform click = seek straight to that moment.
+      const wave = host.querySelector(".rms-wave");
+      if (wave) wave.addEventListener("click", (ev) => {
+        if (!this.armed || !this.total) return;
+        const rect = wave.getBoundingClientRect();
+        const x = ((ev.clientX - rect.left) / rect.width) * wave.width;
+        const PADX = 16;
+        this.seek(Math.round(((x - PADX) / (wave.width - PADX * 2)) * this.total));
+      });
+      if (!restored) this.arm();
+    },
+    step(delta) { this.seek(this.cursor + delta); },
+    applyZoom() {
+      const img = this.host?.querySelector(".rms-stage img");
+      if (!img) return;
+      img.style.transform = this.zoom > 1 ? `scale(${this.zoom})` : "";
+      img.style.transformOrigin = this.zoomOrigin;
+      const btn = this.host.querySelector("[data-act=zoom]");
+      if (btn) { btn.textContent = `🔍 ${this.zoom}×`; btn.classList.toggle("active", this.zoom > 1); }
+    },
+    cycleZoom() {
+      this.zoom = this.zoom === 1 ? 2 : this.zoom === 2 ? 4 : 1;
+      this.applyZoom();
+    },
+    applyAdjust() {
+      const img = this.host?.querySelector(".rms-stage img");
+      if (!img) return;
+      const b = this.host.querySelector("[data-adj=b]")?.value ?? 100;
+      const c = this.host.querySelector("[data-adj=c]")?.value ?? 100;
+      img.style.filter = (Number(b) !== 100 || Number(c) !== 100) ? `brightness(${b}%) contrast(${c}%)` : "";
+    },
+    async playAudio() {
+      // The window's REAL captured audio — fetched once, honest note when absent.
+      const btn = this.host?.querySelector("[data-act=audio]");
+      if (!this.window) return;
+      try {
+        if (!this.audioUrl) {
+          const res = await fetch(`${API_BASE}/api/audio/clip.wav?start_ms=${this.window.start_timestamp_ms}&end_ms=${this.window.end_timestamp_ms}`);
+          if (!res.ok) {
+            const why = (await res.json().catch(() => ({})))?.detail || "no audio captured";
+            if (btn) { btn.disabled = true; btn.title = why; }
+            return;
+          }
+          this.audioUrl = URL.createObjectURL(await res.blob());
+          this.audioEl = new Audio(this.audioUrl);
+        }
+        this.audioEl.currentTime = 0;
+        this.audioEl.play();
+        if (btn) btn.classList.add("active");
+        this.audioEl.onended = () => { if (btn) btn.classList.remove("active"); };
+      } catch { if (btn) { btn.disabled = true; btn.title = "audio unavailable"; } }
+    },
+    async arm() {
+      if (this.arming || !this.host) return;
+      this.arming = true;
+      try {
+        const payload = await jsonFetch("/api/replay/state");
+        const cams = payload.camera_ids || [];
+        if (payload.total_frames && cams.length) {
+          this.window = payload;
+          this.total = Number(payload.total_frames);
+          // The surface's OWN declared role wins (an LBW front-foot stage steps
+          // the front-foot camera); otherwise the review type's role decides.
+          const want = cfg.role || REVIEW_MODULES[state.reviewType]?.role;
+          this.cam = cams.find((c) => cameraRoleFor(Number(c)) === want) ?? (cams.includes(getPrimaryCameraId()) ? getPrimaryCameraId() : cams[0]);
+          const scrub = this.host.querySelector("input[type=range]");
+          if (scrub) scrub.max = String(Math.max(0, this.total - 1));
+          this.host.querySelector(".rms-empty")?.setAttribute("hidden", "");
+          this.armed = true;
+          this.seek(this.jumpTarget != null ? this.jumpTarget : 0);
+          if (cfg.waveform) this.armWave(payload);
+        } else if (ReviewMode.active && !ReviewMode.restored) {
+          // The buffer freezes moments after the appeal — retry until it lands.
+          this.retry = setTimeout(() => { this.arming = false; this.arm(); }, 2000);
+          return;
+        }
+      } catch {
+        if (ReviewMode.active && !ReviewMode.restored) {
+          this.retry = setTimeout(() => { this.arming = false; this.arm(); }, 3000);
+          return;
+        }
+      }
+      this.arming = false;
+    },
+    async armWave(payload) {
+      try {
+        const buckets = Math.max(240, Math.min(3600, this.total * 3));
+        const wf = await jsonFetch(`/api/audio/waveform?start_ms=${payload.start_timestamp_ms}&end_ms=${payload.end_timestamp_ms}&buckets=${buckets}`);
+        if (wf.available) { this.wave.buckets = wf.buckets; this.wave.available = true; }
+      } catch {}
+      this.drawWave();
+    },
+    drawWave() {
+      const canvas = this.host?.querySelector(".rms-wave");
+      if (!canvas) return;
+      const show = this.armed && (this.wave.available || this.events.length);
+      canvas.hidden = !show;
+      if (show) drawSurfaceWave(canvas, this.wave.buckets, this.events, this.cursor, this.total);
+    },
+    seek(i) {
+      if (!this.armed || !this.host) return;
+      this.cursor = Math.max(0, Math.min(this.total - 1, Math.round(i)));
+      const img = this.host.querySelector(".rms-stage img");
+      if (img) img.src = `${API_BASE}/api/replay/${this.cam}.jpg?frame_index=${this.cursor}&t=${Date.now()}`;
+      const scrub = this.host.querySelector("input[type=range]");
+      if (scrub) scrub.value = String(this.cursor);
+      const label = this.host.querySelector(".rms-frame-label");
+      if (label) label.textContent = `Frame ${this.cursor + 1} / ${this.total}`;
+      this.drawWave();
+      this.drawOverlay();
+    },
+    // Evidence drawn ON the frame. Sized to the displayed image every time, because
+    // the payload is in the frame's NATURAL pixel space — drawing in display space
+    // would misplace the evidence the moment the panel resized.
+    drawOverlay() {
+      const canvas = this.host?.querySelector(".rms-fo");
+      const img = this.host?.querySelector(".rms-stage img");
+      const stage = this.host?.querySelector(".rms-stage");
+      if (!canvas || !img || !stage || !img.naturalWidth) return;
+      const box = img.getBoundingClientRect();
+      const stageBox = stage.getBoundingClientRect();
+      if (!box.width || !box.height) return;
+      // `object-fit: contain` letterboxes the frame inside the element, so the
+      // element box is NOT the picture. Sizing to it would offset every mark by
+      // the letterbox — evidence drawn slightly wrong is worse than none.
+      const scale = Math.min(box.width / img.naturalWidth, box.height / img.naturalHeight);
+      const w = img.naturalWidth * scale;
+      const h = img.naturalHeight * scale;
+      const left = (box.left - stageBox.left) + (box.width - w) / 2;
+      const top = (box.top - stageBox.top) + (box.height - h) / 2;
+      if (canvas.width !== Math.round(w) || canvas.height !== Math.round(h)) {
+        canvas.width = Math.round(w);
+        canvas.height = Math.round(h);
+      }
+      canvas.style.left = `${left}px`;
+      canvas.style.top = `${top}px`;
+      canvas.style.width = `${w}px`;
+      canvas.style.height = `${h}px`;
+      drawFrameOverlay(canvas, state.decision?.overlay, {
+        frameSize: { width: img.naturalWidth, height: img.naturalHeight },
+        frameIndex: this.cursor,
+      });
+    },
+    setSpeed(speed, btn) {
+      this.speed = speed;
+      this.host?.querySelectorAll("[data-act^='s']").forEach((b) => b.classList.toggle("active", b === btn));
+    },
+    togglePlay() {
+      this.playing = !this.playing;
+      const btn = this.host?.querySelector("[data-act=play]");
+      if (btn) { btn.textContent = this.playing ? "⏸ Pause" : "▶︎ Play"; btn.classList.toggle("active", this.playing); }
+      if (this.playing && !this.timer) {
+        this.acc = 0;
+        this.timer = setInterval(() => {
+          this.acc += this.speed * 1.5;                    // 30fps buffer, 50ms tick
+          const advance = Math.floor(this.acc);
+          if (advance >= 1) {
+            this.acc -= advance;
+            const next = this.cursor + advance;
+            if (next >= this.total - 1) { this.seek(this.total - 1); this.togglePlay(); }
+            else this.seek(next);
+          }
+        }, 50);
+      }
+      if (!this.playing && this.timer) { clearInterval(this.timer); this.timer = null; }
+    },
+    update(decision) {
+      if (!this.host) return;
+      const side = this.host.querySelector(".rms-side");
+      if (side) side.innerHTML = cfg.readouts(decision || {});
+      this.jumpTarget = cfg.jumpFrame ? cfg.jumpFrame(decision || {}) : null;
+      const jump = this.host.querySelector("[data-act=jump]");
+      if (jump) jump.hidden = this.jumpTarget == null;
+      this.events = (decision?.edge_analysis?.events || [])
+        .map((e) => Number(e.frame_id ?? e.frame)).filter((f) => Number.isFinite(f));
+      this.drawWave();
+    },
+    unmount() {
+      if (this.timer) clearInterval(this.timer);
+      if (this.retry) clearTimeout(this.retry);
+      if (this._ro) { try { this._ro.disconnect(); } catch {} this._ro = null; }
+      this.timer = this.retry = null;
+      if (this.audioEl) { try { this.audioEl.pause(); } catch {} this.audioEl = null; }
+      if (this.audioUrl) { try { URL.revokeObjectURL(this.audioUrl); } catch {} this.audioUrl = null; }
+      this.zoom = 1; this.zoomOrigin = "50% 50%";
+      this.playing = false; this.armed = false; this.arming = false; this.host = null;
+      this.wave = { buckets: [], available: false }; this.events = []; this.jumpTarget = null;
+    },
+  };
+}
+
+// -- readout builders (operator language, own-type fields only) --------------
+function wideReadouts(decision) {
+  const wide = decision.wide_analysis || decision.wide || {};
+  const has = wide.is_wide === true || wide.is_wide === false;
+  const cm = wide.distance_cm == null ? NaN : Number(wide.distance_cm);
+  // Ball marker only when MEASURED: outside the guideline for a wide, back
+  // toward the stumps otherwise — positional, to scale where possible.
+  const offset = Number.isFinite(cm) ? Math.min(96, Math.abs(cm) * 3) : 40;
+  const bx = has ? (wide.is_wide ? 190 + Math.max(14, offset) : 190 - Math.max(14, offset)) : null;
+  const diagram = `
+    <svg class="rms-wide-mini" viewBox="0 0 300 140" preserveAspectRatio="xMidYMid meet">
+      <line x1="60" y1="24" x2="60" y2="116" stroke="rgba(230,240,235,.8)" stroke-width="4" stroke-linecap="round"></line>
+      <text x="60" y="132" fill="#8ea79c" font-size="11" text-anchor="middle">STUMPS</text>
+      <line x1="190" y1="14" x2="190" y2="126" stroke="#38bdf8" stroke-width="2" stroke-dasharray="6 6"></line>
+      <text x="190" y="10" fill="#7dd3fc" font-size="11" text-anchor="middle">WIDE LINE</text>
+      ${bx != null ? `<line x1="190" y1="70" x2="${bx}" y2="70" stroke="#f5be5a" stroke-width="2"></line>
+      <circle cx="${bx}" cy="70" r="9" fill="#f8fafc" stroke="#0b0f14" stroke-width="2"></circle>
+      <text x="${(190 + bx) / 2}" y="58" fill="#f5be5a" font-size="12" font-weight="700" text-anchor="middle">${fmtCm(wide.distance_cm) || ""}</text>`
+      : `<text x="150" y="74" fill="#9fb3ab" font-size="12" text-anchor="middle">${wide.reason ? "Not measured" : "Measuring…"}</text>`}
+    </svg>`;
+  const verdictWord = has ? (wide.is_wide ? "WIDE" : "NOT WIDE") : "ANALYSING…";
+  return `<div class="rms-verdict ${has ? (wide.is_wide ? "out" : "not-out") : ""}">${verdictWord}</div>` + diagram +
+    rmsRow("Distance from line", fmtCm(wide.distance_cm), Boolean(wide.is_wide)) +
+    rmsRow("Confidence", pct(wide.confidence)) +
+    (wide.reason ? `<div class="rms-note">${operatorReason(wide.reason)}</div>` : "");
+}
+
+function edgeReadouts(decision) {
+  // ASSISTED review: the system never announces EDGE / NO EDGE as the decision.
+  // It provides the evidence (waveform, spikes, slow motion) plus an advisory
+  // reading — the umpire makes the call.
+  const edge = decision.edge_analysis || {};
+  const n = (edge.events || []).length;
+  const noMic = edge.available === false || edge.inconclusive;
+  const analyzed = !noMic && (edge.edge_probability != null || n > 0);
+  const advisory = !analyzed ? null : (n || (edge.edge_probability || 0) >= 0.5) ? "Spike evidence — advisory" : "No spike found — advisory";
+  return `<div class="rms-verdict">${analyzed || noMic ? "YOUR CALL" : "ANALYSING…"}</div>` +
+    (advisory ? rmsRow("System reading", advisory, advisory.startsWith("Spike")) : "") +
+    rmsRow("Edge probability", pct(edge.edge_probability)) +
+    rmsRow("Spikes", n ? `${n} marked in red` : analyzed ? "None" : "--") +
+    (noMic ? `<div class="rms-note">No stump microphone — judge bat contact from the slow-motion frames.</div>` : "");
+}
+
+function noballReadouts(decision) {
+  const nb = decision.no_ball_analysis || {};
+  const has = nb.is_no_ball === true || nb.is_no_ball === false;
+  const verdictWord = has ? (nb.is_no_ball ? "NO BALL" : "LEGAL") : "ANALYSING…";
+  return `<div class="rms-verdict ${has ? (nb.is_no_ball ? "out" : "not-out") : ""}">${verdictWord}</div>` +
+    rmsRow("Front foot", fmtCm(nb.distance_past_cm) ? `${fmtCm(nb.distance_past_cm)} ${nb.is_no_ball ? "past the line" : "behind the line"}` : "--", Boolean(nb.is_no_ball)) +
+    rmsRow("Decision frame", nb.landing_frame_id != null ? `#${nb.landing_frame_id}` : "--") +
+    rmsRow("Confidence", pct(nb.confidence)) +
+    (nb.reason ? `<div class="rms-note">${operatorReason(nb.reason)}</div>` : "");
+}
+
+function creaseReadouts(analysis, extraRows) {
+  // ASSISTED review: the crease measurement is an ADVISORY reading; the umpire
+  // steps the frames and makes the call.
+  const has = analysis.is_out === true || analysis.is_out === false;
+  const cm = analysis.distance_cm == null ? NaN : Number(analysis.distance_cm);
+  return `<div class="rms-verdict">${has ? "YOUR CALL" : "ANALYSING…"}</div>` +
+    (has ? rmsRow("System reading", `${analysis.is_out ? "OUT" : "NOT OUT"} — advisory`, Boolean(analysis.is_out)) : "") +
+    rmsRow("Bat to crease", Number.isFinite(cm) ? `${Math.abs(cm).toFixed(1)} cm ${cm < 0 ? "short" : "behind"}` : "--", has && analysis.is_out) +
+    rmsRow("Decision frame", analysis.frame_number != null ? `#${analysis.frame_number}` : "--") +
+    (extraRows || "") +
+    rmsRow("Confidence", pct(analysis.confidence)) +
+    (analysis.reason ? `<div class="rms-note">${operatorReason(analysis.reason)}</div>` : "");
+}
+
+// Bails have no detector. Three states, and "unknown" is stated in the umpire's
+// language rather than as a dash: an empty readout looks broken, and "not detected"
+// reads as a model failure. Wording comes from the shared tri-state contract so the
+// readout and the frame overlay can never disagree.
+const bailsText = (status) => bailsLabel(status);
+
+const RM_SURFACES = {
+  // LBW: the two canonical pipeline replays + the wicket gates (bottom zone).
+  // Mounting must SELF-ATTACH whatever the canonical job has already produced —
+  // the trajectory renders in the background while the operator inspects the
+  // Front Foot / UltraEdge stages, so this surface is usually mounted AFTER the
+  // results (or the pending state) already exist.
+  lbw: {
+    mount(host, restored) {
+      host.dataset.surface = "lbw";
+      host.innerHTML = `
+        <div class="rm2-vid"><span class="rm2-vlabel">Observed Trajectory</span><div class="rm2-vbox" id="rm-observed"></div></div>
+        <div class="rm2-vid"><span class="rm2-vlabel">Broadcast Replay</span><div class="rm2-vbox" id="rm-broadcast"></div></div>`;
+      const c = state.canonical;
+      const d = state.decision || {};
+      if (c && c.results) ReviewMode.setCanonical(c.jobId, c.results);
+      else if (!restored && d.status && d.status !== "WAITING" && !d.canonical_job_id) {
+        // The appeal came back without a replay job — never pretend one is coming.
+        ["rm-observed", "rm-broadcast"].forEach((id) => { const b = document.getElementById(id); if (b) b.innerHTML = `<div class="rm2-noreplay">Replay clip wasn't captured for this appeal — decide from the live replay.</div>`; });
+      } else if (!restored) ReviewMode.renderPending("Rendering replay…");
+    },
+    update() {}, unmount() {},
+  },
+  // Wide: a MEASUREMENT tool — the delivery's frames with stepping/zoom, and
+  // the wide-line diagram + margin beside them. Nothing else.
+  wide: createStepSurface({
+    readouts: wideReadouts,
+  }),
+  // Edge: slow-motion frame stepping + synchronized waveform + real audio.
+  edge: createStepSurface({
+    waveform: true,
+    audio: true,
+    readouts: edgeReadouts,
+    jumpLabel: "Jump to spike",
+    jumpFrame(decision) {
+      const events = decision?.edge_analysis?.events || [];
+      const best = events.find((e) => e.is_bat) || events[0];
+      const f = Number(best?.frame_id ?? best?.frame);
+      return Number.isFinite(f) ? f : null;
+    },
+  }),
+  // No Ball: the front-foot decision frame, stepped precisely.
+  noball: createStepSurface({
+    readouts: noballReadouts,
+    jumpLabel: "Landing frame",
+    jumpFrame(decision) {
+      const f = Number(decision?.no_ball_analysis?.landing_frame_id);
+      return Number.isFinite(f) ? f : null;
+    },
+  }),
+  // Run Out / Stumping: crease check by frame stepping (+ bail timing rows).
+  // "Not observed" — never a bare "--", which reads as a broken readout, and never
+  // a claim. There is no bails detector; the umpire judges it from the replay.
+  runout: createStepSurface({
+    readouts: (decision) => creaseReadouts(decision.run_out_analysis || {},
+      rmsRow("Bails", bailsText((decision.run_out_analysis || {}).bails_status))),
+    jumpLabel: "Decision frame",
+    jumpFrame(decision) {
+      const f = Number(decision?.run_out_analysis?.frame_number);
+      return Number.isFinite(f) ? f : null;
+    },
+  }),
+  stumping: createStepSurface({
+    readouts: (decision) => {
+      const a = decision.stumping_analysis || {};
+      const hasData = a.is_out != null || a.distance_cm != null;
+      return creaseReadouts(a,
+        rmsRow("Bail timing", a.frame_number != null ? `Frame #${a.frame_number}` : "--") +
+        rmsRow("Bails", bailsText(a.bails_status)) +
+        // "Check manually" is an instruction that only exists once there is a
+        // decision frame to check — before that, nothing is claimed.
+        // Same tri-state contract: an unobserved check names what to do about it
+        // rather than reporting a negative finding.
+        (hasData ? rmsRow("Gloves", observationLabel(a.gloves_detected, "Collected cleanly", "Not collected", "Not observed — check by eye")) : ""));
+    },
+    jumpLabel: "Bail frame",
+    jumpFrame(decision) {
+      const f = Number(decision?.stumping_analysis?.frame_number);
+      return Number.isFinite(f) ? f : null;
+    },
+  }),
+};
+
+// LBW protocol stages each get a REAL evidence surface: the rail is not just
+// status — Front Foot and UltraEdge are inspected with the same tools the
+// dedicated No Ball / Edge reviews use (the LBW decision carries its own
+// no_ball_analysis + edge_analysis). Ball Tracking / Decision show the canonical
+// replays (RM_SURFACES.lbw), which keep rendering in the background while the
+// operator works through the earlier stages. Fresh instances on purpose — never
+// the other types' surface objects, so mounted state can't leak across types.
+const LBW_STAGE_SURFACES = {
+  front_foot: createStepSurface({
+    role: "Front Foot",
+    readouts: noballReadouts,
+    jumpLabel: "Landing frame",
+    jumpFrame(decision) {
+      const f = Number(decision?.no_ball_analysis?.landing_frame_id);
+      return Number.isFinite(f) ? f : null;
+    },
+  }),
+  ultra_edge: createStepSurface({
+    role: "Stump Camera",
+    waveform: true,
+    audio: true,
+    readouts: edgeReadouts,
+    jumpLabel: "Jump to spike",
+    jumpFrame(decision) {
+      const events = decision?.edge_analysis?.events || [];
+      const best = events.find((e) => e.is_bat) || events[0];
+      const f = Number(best?.frame_id ?? best?.frame);
+      return Number.isFinite(f) ? f : null;
+    },
+  }),
+};
+
+// Unknown (future backend-declared) types: honest generic readouts.
+const GENERIC_SURFACE = {
+  mount(host) {
+    host.dataset.surface = "panel";
+    host.innerHTML = `<div class="rms-stagewrap"><div class="rms-stage"><div class="rms-empty">This review type has no dedicated evidence surface yet.</div></div></div><aside class="rms-side"></aside>`;
+  },
+  update(decision) {
+    const side = document.querySelector("#rm-mid .rms-side");
+    if (!side) return;
+    const rr = decision?.review_result || {};
+    side.innerHTML = (rr.measurements || []).map((m) => rmsRow(m.label, m.value, m.flag)).join("") || rmsRow("Status", "Analysing…");
+  },
+  unmount() {},
+};
+
 /* ============================ REVIEW MODE ============================ */
-// The single review workspace: one screen from Request Review to Decision.
-// Top = protocol progress (① Front Foot ② UltraEdge ③ Ball Tracking), middle =
-// both pipeline replays always visible, bottom = gates + verdict + decision.
-// No separate replay page, no tabs, no hidden evidence.
+// The single review workspace, driven ENTIRELY by the protocol engine: the
+// active type's contract decides the stage rail, the evidence surface and the
+// decision vocabulary BEFORE the screen opens. One screen, one state machine,
+// from Request Review to Decision.
 const ReviewMode = {
-  el: null, active: false, jobId: null, restored: false,
+  el: null, active: false, jobId: null, restored: false, type: "lbw",
+  surface: null, actions: null, stage: null,
   ensure() {
     if (this.el) return;
     this.el = document.getElementById("review-mode");
-    // Back to Dashboard: a RESTORED (read-only, from History) review just closes;
-    // a LIVE review is cancelled cleanly (reset the backend to WAITING) so no zombie
-    // review lingers to block the next Request Review.
-    document.getElementById("rm-back").addEventListener("click", () => {
+    // Back to Dashboard just CLOSES the workspace — the review keeps running and
+    // the dashboard's review strip leads straight back here. (It used to cancel
+    // the review, which is why glancing at the cameras destroyed your appeal.)
+    document.getElementById("rm-back").addEventListener("click", () => this.exit());
+    // The stage rail is NAVIGATION, not just status: clicking a stage inspects
+    // that evidence — the same deep link the dashboard checklist rows use.
+    document.getElementById("rm-steps").addEventListener("click", (ev) => {
+      const step = ev.target.closest(".rm2-step");
+      if (step && step.dataset.step) this.focusStage(step.dataset.step);
+    });
+    // Abandon is the ONLY destructive exit: discard the review, reset the backend
+    // to WAITING so no zombie review blocks the next Request Review.
+    document.getElementById("rm-abandon").addEventListener("click", () => {
       if (this.restored) this.exit();
       else if (this.active) resetReview();
     });
-    document.getElementById("rm-confirm-out").addEventListener("click", () => confirmDecision("OUT"));
-    document.getElementById("rm-confirm-not-out").addEventListener("click", () => confirmDecision("NOT_OUT"));
-  },
-  setStep(key, cls) {
-    const el = this.el && this.el.querySelector(`#rm-steps .rm2-step[data-step="${key}"]`);
-    if (el) el.className = `rm2-step ${cls}`;
+    document.getElementById("rm-confirm-out").addEventListener("click", () => confirmDecision(this.actions?.positive.send || "OUT"));
+    document.getElementById("rm-confirm-not-out").addEventListener("click", () => confirmDecision(this.actions?.negative.send || "NOT_OUT"));
+    // Umpire keyboard: ←/→ step one frame (Shift = ×10), Space = play/pause,
+    // Z = zoom cycle — active only while a step-surface review is open.
+    document.addEventListener("keydown", (ev) => {
+      if (!this.active) return;
+      const surface = this.surface;
+      if (!surface || typeof surface.step !== "function") return;
+      const tag = (ev.target?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || ev.target?.isContentEditable) return;
+      if (ev.key === "ArrowLeft") { surface.step(ev.shiftKey ? -10 : -1); ev.preventDefault(); }
+      else if (ev.key === "ArrowRight") { surface.step(ev.shiftKey ? 10 : 1); ev.preventDefault(); }
+      else if (ev.key === " ") { surface.togglePlay(); ev.preventDefault(); }
+      else if (ev.key === "z" || ev.key === "Z") surface.cycleZoom();
+    });
   },
   renderPending(text) {
     if (!this.el) return;
@@ -1747,37 +2158,70 @@ const ReviewMode = {
     if (!box) return;
     const ex = results.exports || {};
     if (!ex[key]) {
+      // Operator copy up front; the pipeline's technical reason stays on hover.
       const t = results.trajectory || {};
-      const why = t.valid === false
+      const detail = t.valid === false
         ? `trajectory rejected: ${(t.reasons || []).join("; ") || t.observed?.end_reason || "invalid"}`
         : "replay not available for this delivery";
-      box.innerHTML = `<div class="rm2-noreplay">No replay — ${why}</div>`;
+      box.innerHTML = `<div class="rm2-noreplay" title="${String(detail).replace(/"/g, "&quot;")}">Ball couldn't be tracked for this delivery — use the broadcast replay.</div>`;
       return;
     }
     box.innerHTML = `<video muted playsinline controls autoplay loop src="${API_BASE}/api/testing/jobs/${jobId}/exports/${key}"></video>`;
   },
-  // Drive the three step chips ENTIRELY from the protocol state machine — the one
-  // source of truth. Maps {frontFoot,ultraEdge,ballTracking} → the ff/ue/bt chips.
-  renderProtocol(decision) {
-    // The 3-step protocol + gates are LBW-specific — only LBW drives them.
-    if (state.reviewType !== "lbw") return;
-    const p = computeProtocol(decision || state.decision || {});
-    this.setStep("ff", p.frontFoot);
-    this.setStep("ue", p.ultraEdge);
-    this.setStep("bt", p.ballTracking);
+  // Render the stage rail + operator line from the ONE state machine. The
+  // focused stage (whose evidence surface is mounted) is marked on the rail.
+  renderFlow(decision) {
+    if (!this.active || !this.el) return;
+    const flow = computeFlow(this.type, decision || state.decision || {});
+    flow.stages.forEach((s) => {
+      const el = this.el.querySelector(`#rm-steps .rm2-step[data-step="${s.key}"]`);
+      if (el) { el.className = `rm2-step ${s.state}${s.key === this.stage ? " focus" : ""}`; el.title = s.note || s.label; }
+    });
+    const oper = document.getElementById("rm-oper");
+    if (oper) oper.textContent = (flow.current && flow.current.note) || "";
   },
+  // Kept for canonical-surface callers (syncCanonicalSurfaces).
+  renderProtocol(decision) { this.renderFlow(decision); },
   // Called when the canonical job's results land (from watchCanonicalReview).
   setCanonical(jobId, results) {
     if (!this.active || !results) return;
     this.renderVideo("rm-observed", jobId, results, "replay_players");
     this.renderVideo("rm-broadcast", jobId, results, "replay_review");
     const g = results.reconstruction && results.reconstruction.gates;
-    document.getElementById("rm-gate-pitching").textContent = (g && g.pitching) || "—";
-    document.getElementById("rm-gate-impact").textContent = (g && g.impact) || "—";
-    document.getElementById("rm-gate-wickets").textContent = (g && g.wickets) || "—";
-    this.renderProtocol();   // ball-tracking stage → passed/failed per the state machine
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v || "—"; };
+    set("rm-gate-pitching", g && g.pitching);
+    set("rm-gate-impact", g && g.impact);
+    set("rm-gate-wickets", g && g.wickets);
+    this.renderFlow();   // trajectory stage → passed/skipped per the state machine
   },
-  // Shared open: overlay + title + LBW-only step/gate visibility + reset gates.
+  // The surface for (type, focused stage): LBW stages get their own evidence
+  // surfaces; every other case falls back to the type's single surface.
+  surfaceFor(type, stageKey) {
+    return (type === "lbw" && stageKey && LBW_STAGE_SURFACES[stageKey]) || RM_SURFACES[type] || GENERIC_SURFACE;
+  },
+  mountSurface(type) {
+    const host = document.getElementById("rm-mid");
+    if (!host) return;
+    if (this.surface && this.surface.unmount) this.surface.unmount();
+    this.surface = this.surfaceFor(type, this.stage);
+    this.surface.mount(host, this.restored);
+  },
+  // Deep link from the rail or the dashboard checklist: focus a stage and mount
+  // its evidence surface. Same-surface stages (e.g. Ball Tracking → Decision on
+  // LBW, or any stage on a single-surface type) never remount — a remount would
+  // throw away the operator's cursor position mid-inspection.
+  focusStage(stageKey) {
+    if (!this.active || !stageKey) return;
+    this.stage = stageKey;
+    const next = this.surfaceFor(this.type, stageKey);
+    if (next !== this.surface) {
+      this.mountSurface(this.type);
+      if (this.surface && this.surface.update) this.surface.update(state.decision || {});
+    }
+    this.renderFlow();
+  },
+  // Shared open: the protocol engine decides EVERYTHING the screen shows —
+  // stage rail, evidence surface, gates, decision vocabulary — from the type.
   _open(decision) {
     this.ensure();
     this.active = true;
@@ -1785,17 +2229,42 @@ const ReviewMode = {
     document.body.classList.add("review-active");
     this.el.classList.add("open");
     this.el.setAttribute("aria-hidden", "false");
-    const type = decision.review_type || state.reviewType;
+    const type = decision.review_type || state.reviewType || "lbw";
+    this.type = type;
     const mod = REVIEW_MODULES[type];
     document.getElementById("rm-type").textContent = `${(mod && mod.label) || "Review"} REVIEW`.toUpperCase();
-    const isLbw = type === "lbw";
+    // Stage rail = the type's OWN protocol from its contract.
+    const proto = (mod && mod.protocol) || [{ key: "analysis", label: "Analysis" }, { key: "decision", label: "Decision" }];
     const steps = this.el.querySelector("#rm-steps");
+    if (steps) {
+      steps.hidden = false;
+      steps.innerHTML = proto.map((s, i) =>
+        `<div class="rm2-step waiting" data-step="${s.key}"><span class="rm2-num">${i + 1}</span><span class="rm2-lbl">${s.label}</span></div>`).join("");
+    }
+    const oper = document.getElementById("rm-oper");
+    if (oper) oper.textContent = "";
+    // Wicket gates belong to LBW's trajectory stage only.
     const gates = this.el.querySelector(".rm2-gates");
-    if (steps) steps.hidden = !isLbw;
-    if (gates) gates.hidden = !isLbw;
-    document.getElementById("rm-gate-pitching").textContent = "—";
-    document.getElementById("rm-gate-impact").textContent = "—";
-    document.getElementById("rm-gate-wickets").textContent = "—";
+    if (gates) gates.hidden = type !== "lbw";
+    ["rm-gate-pitching", "rm-gate-impact", "rm-gate-wickets"].forEach((id) => { const el = document.getElementById(id); if (el) el.textContent = "—"; });
+    // Decision actions in the type's own vocabulary (WIDE / NO BALL / OUT …).
+    this.actions = DECISION_ACTIONS[type] || DECISION_ACTIONS.default;
+    const bOut = document.getElementById("rm-confirm-out");
+    const bNot = document.getElementById("rm-confirm-not-out");
+    if (bOut) bOut.textContent = this.actions.positive.label;
+    if (bNot) bNot.textContent = this.actions.negative.label;
+    // A restored review is already decided and stored: there is nothing to
+    // abandon and nothing new to export.
+    const bAbandon = document.getElementById("rm-abandon");
+    if (bAbandon) bAbandon.hidden = this.restored;
+    const bExport = document.getElementById("rm-export");
+    if (bExport) bExport.hidden = this.restored;
+    // Open ON the protocol's current stage — the workspace resumes where the
+    // protocol actually is (a fresh LBW appeal starts at Front Foot; a decided
+    // review lands on Decision). A checklist deep link refocuses right after.
+    const flow = computeFlow(type, decision || {});
+    this.stage = (flow.current && flow.current.key) || null;
+    this.mountSurface(type);
   },
   enter(decision) {
     this.restored = false;
@@ -1815,25 +2284,38 @@ const ReviewMode = {
   play(decision) { if (!this.active) return this.enter(decision); this.update(decision); },
   update(decision) {
     if (!this.active) return;
-    this.renderProtocol(decision);
+    this.renderFlow(decision);
+    if (this.surface && this.surface.update) this.surface.update(decision);
     const status = decision.status || "PROCESSING";
     const rr = decision.review_result || {};
     const resolved = status === "OUT" || status === "NOT_OUT";
     const v = document.getElementById("rm-verdict");
-    const cls = status === "OUT" ? "out" : status === "NOT_OUT" ? "not-out"
-      : /not out/i.test(rr.verdict || "") ? "not-out" : /(^|[^t] )out|hitting/i.test(rr.verdict || "") ? "out"
+    // Verdict box in operator language: the type's own word, never pipeline
+    // jargon. Assisted types (Edge / Run Out / Stumping) NEVER present a system
+    // reading as the decision — the box says YOUR CALL and the reading stays
+    // advisory in the evidence readouts. INCONCLUSIVE is likewise the umpire's.
+    const word = resolved ? (decision.outcome || displayStatus(status))
+      : rr.verdict === "INCONCLUSIVE" ? "YOUR CALL"
+      : (rr.verdict && !NON_VERDICTS.test(rr.verdict)) ? (isAssisted(this.type) ? "YOUR CALL" : rr.verdict)
+      : (this.restored ? "—" : "REVIEWING");
+    const cls = /^(not |no edge|legal|missing)/i.test(word) ? "not-out"
+      : /out|wide|no ball|edge|hitting|stumped/i.test(word) ? "out"
       : this.restored ? "" : "reviewing";
     v.className = "rm-verdict " + cls;
-    v.textContent = resolved ? displayStatus(status) : (rr.verdict && rr.verdict !== "AWAITING" ? rr.verdict : (this.restored ? "—" : "REVIEWING"));
+    v.textContent = word;
     // Restored reviews are read-only — never offer to confirm an already-decided review.
     const hideConfirm = this.restored || resolved;
     document.getElementById("rm-confirm-out").hidden = hideConfirm;
     document.getElementById("rm-confirm-not-out").hidden = hideConfirm;
   },
   exit() {
+    const wasRestored = this.restored;
     this.active = false;
     this.restored = false;
     this.jobId = null;
+    this.stage = null;
+    if (this.surface && this.surface.unmount) this.surface.unmount();
+    this.surface = null;
     document.body.classList.remove("review-active");
     if (this.el) {
       this.el.classList.remove("open");
@@ -1841,154 +2323,14 @@ const ReviewMode = {
       // Release any playing <video> so decoders/timers don't linger after close.
       this.el.querySelectorAll("video").forEach((v) => { try { v.pause(); v.removeAttribute("src"); v.load(); } catch {} });
     }
+    // Closing a RESTORED review returns to a clean dashboard; closing a live one
+    // must leave the strip up immediately (the way back in), not wait for the poll.
+    if (wasRestored) { state.decision = null; renderDecisionState("WAITING"); }
+    else renderDecisionState(state.lastStatus);
   },
 };
 window.__reviewMode = ReviewMode;
 
-function initThree() {
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x07100d);
-  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
-  camera.position.set(8, 7, 12);
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  els.sceneHost.appendChild(renderer.domElement);
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.target.set(0, 0, 0.55);
-
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x163126, 1.4));
-  const key = new THREE.DirectionalLight(0xffffff, 1.8);
-  key.position.set(-4, 8, 6);
-  scene.add(key);
-  buildPitch(scene);
-
-  state.scene = { scene, camera, renderer, controls, dynamic: new THREE.Group() };
-  scene.add(state.scene.dynamic);
-  resizeThree();
-  renderer.setAnimationLoop(() => {
-    controls.update();
-    renderer.render(scene, camera);
-  });
-}
-
-function buildPitch(scene) {
-  const pitch = new THREE.Mesh(
-    new THREE.BoxGeometry(20.12, 3.05, 0.04),
-    new THREE.MeshStandardMaterial({ color: 0x8f7d55, roughness: 0.8 })
-  );
-  pitch.position.z = -0.02;
-  scene.add(pitch);
-  const turf = new THREE.GridHelper(24, 24, 0x2a6b49, 0x204532);
-  turf.rotation.x = Math.PI / 2;
-  turf.position.z = -0.04;
-  scene.add(turf);
-  const stumpMaterial = new THREE.MeshStandardMaterial({ color: 0xf2e6bd });
-  [-0.23, 0, 0.23].forEach((y) => {
-    const stump = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.72, 16), stumpMaterial);
-    stump.rotation.x = Math.PI / 2;
-    stump.position.set(7.1, y, 0.36);
-    scene.add(stump);
-  });
-}
-
-function updateTrajectory(decision) {
-  if (!state.scene) return;
-  const group = state.scene.dynamic;
-  group.clear();
-  const points = normalizeTrajectory(trajectoryPoints(decision.trajectory));
-  if (points.length > 1) {
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    group.add(new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: 0xf8f7ef, linewidth: 4 })));
-    addTube(group, points, 0x42d895, 0.035);
-    addConfidenceVolumes(group, points, decision);
-  }
-  addMarker(group, normalizePoint(decision.bounce_point), 0xffd45c, "bounce");
-  addMarker(group, normalizePoint(decision.impact_marker || decision.impact_point), 0xe24b4a, "impact");
-  const predicted = normalizeTrajectory(decision.predicted_extension || []);
-  if (predicted.length > 1) addTube(group, predicted, 0x37b7d8, 0.025);
-  addWicketPrediction(group, decision.wicket_prediction);
-}
-
-function addTube(group, points, color, radius) {
-  const curve = new THREE.CatmullRomCurve3(points);
-  const tube = new THREE.Mesh(
-    new THREE.TubeGeometry(curve, 64, radius, 12, false),
-    new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.22 })
-  );
-  group.add(tube);
-}
-
-function addConfidenceVolumes(group, points) {
-  points.forEach((point, index) => {
-    const mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(0.18 + index * 0.018, 24, 12),
-      new THREE.MeshStandardMaterial({ color: 0x37b7d8, transparent: true, opacity: 0.12, depthWrite: false })
-    );
-    mesh.position.copy(point);
-    group.add(mesh);
-  });
-}
-
-function addMarker(group, point, color) {
-  if (!point) return;
-  const marker = new THREE.Mesh(
-    new THREE.SphereGeometry(0.14, 24, 16),
-    new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.35 })
-  );
-  marker.position.copy(point);
-  group.add(marker);
-}
-
-function addWicketPrediction(group, prediction) {
-  const zone = new THREE.Mesh(
-    new THREE.BoxGeometry(0.62, 0.72, 0.72),
-    new THREE.MeshStandardMaterial({ color: 0xef9f27, transparent: true, opacity: 0.16 })
-  );
-  zone.position.set(7.1, 0, 0.36);
-  group.add(zone);
-  if (prediction?.collision) addMarker(group, normalizePoint(prediction.collision), 0xef9f27);
-}
-
-// The dashboard decision now carries the canonical trajectory OBJECT (matching the
-// Testing page), but the live websocket path may still deliver a bare points array.
-// The 3D technical view and the point-count labels want the observed points either way,
-// so this normalises both shapes to a flat array — no consumer needs to know which.
-function trajectoryPoints(trajectory) {
-  if (Array.isArray(trajectory)) return trajectory;
-  if (Array.isArray(trajectory?.points)) return trajectory.points;
-  if (Array.isArray(trajectory?.observed?.points)) return trajectory.observed.points;
-  return [];
-}
-
-function normalizeTrajectory(points) {
-  return points.map(normalizePoint).filter(Boolean);
-}
-
-function normalizePoint(point) {
-  if (!point) return null;
-  const x = Number(point.x);
-  const y = Number(point.y);
-  const z = Number(point.z ?? 0.2);
-  if ([x, y, z].some((value) => Number.isNaN(value))) return null;
-  return new THREE.Vector3(x, y, z);
-}
-
-function resizeThree() {
-  if (!state.scene) return;
-  const rect = els.sceneHost.getBoundingClientRect();
-  if (rect.width < 1 || rect.height < 1) return;
-  state.scene.camera.aspect = rect.width / Math.max(1, rect.height);
-  state.scene.camera.updateProjectionMatrix();
-  state.scene.renderer.setSize(rect.width, rect.height, false);
-}
-
-function resetThreeCamera() {
-  if (!state.scene?.camera || !state.scene?.controls) return;
-  state.scene.camera.position.set(8, 7, 12);
-  state.scene.controls.target.set(0, 0, 0.55);
-  state.scene.controls.update();
-}
 
 // Open the Replay workspace on the frozen buffer and start playback. Shared by
 // every "Replay" button (Review State panel + LBW analysis card). Gives honest
@@ -2297,89 +2639,9 @@ async function exportReplay() {
   }
 }
 
-const ueState = { peak: 0, targetPeak: 0, hasEvents: false };
-
-function drawUltraEdge(decision) {
-  ueState.targetPeak = Number(decision?.edge_analysis?.edge_probability || 0);
-  ueState.hasEvents = (decision?.edge_analysis?.events || []).length > 0;
-}
 
 let ueFrame = 0;
-function ultraEdgeLoop() {
-  requestAnimationFrame(ultraEdgeLoop);
-  if ((ueFrame += 1) % 2 !== 0) return;
-  const canvas = els.ultraedge;
-  if (canvas && canvas.getContext) {
-    const ctx = canvas.getContext("2d");
-    const { width, height } = canvas;
-    const now = performance.now();
-    const cursor = (now / 7) % width;
-    ueState.peak += (ueState.targetPeak - ueState.peak) * 0.06;
-    ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = "#080d0f";
-    ctx.fillRect(0, 0, width, height);
-    ctx.strokeStyle = "rgba(96,165,250,0.75)";
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    for (let x = 0; x < width; x += 1) {
-      const base = Math.sin((x + now / 40) * 0.09) * 7 + Math.sin((x + now / 22) * 0.21) * 3.5;
-      const spike = ueState.hasEvents && Math.abs(x - cursor) < 18
-        ? Math.sin((x - cursor) / 2) * 46 * Math.max(ueState.peak, 0.4) : 0;
-      const y = height / 2 + base - spike;
-      if (x === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-    ctx.strokeStyle = "rgba(34,197,94,0.9)";
-    ctx.beginPath();
-    ctx.moveTo(cursor, 6);
-    ctx.lineTo(cursor, height - 6);
-    ctx.stroke();
-    if (ueState.peak > 0.2) {
-      ctx.fillStyle = "rgba(245,158,11,0.9)";
-      ctx.fillRect(width * 0.58, 14, 2, height - 28);
-      ctx.fillStyle = "rgba(245,158,11,0.95)";
-      ctx.font = "bold 13px Inter, sans-serif";
-      ctx.fillText("Edge detected", width * 0.58 + 8, 26);
-    }
-  }
-}
-requestAnimationFrame(ultraEdgeLoop);
 
-// VAR-style staged reveal: light the adaptive timeline up stage by stage (item 4).
-// On completion it re-renders against the *current* decision, so a verdict that
-// arrives (or an umpire confirmation made) during the animation is reflected.
-function playDecisionReveal(triggerStatus, decision) {
-  state.revealing = true;
-  renderDecisionState("PROCESSING");
-  const stages = REVIEW_MODULES[state.reviewType].stages;
-  renderTimeline();
-  els.badge.className = "badge processing";
-  els.badge.textContent = "REVIEWING";
-  els.title.textContent = "Reviewing…";
-  let i = 0;
-  clearInterval(state.revealTimer);
-  state.revealTimer = setInterval(() => {
-    if (i < stages.length) {
-      paintTimelineProgress(i);
-      els.overlay.className = "";
-      void els.overlay.offsetWidth;
-      els.overlay.className = "broadcast-overlay processing";
-      els.overlay.textContent = stages[i].toUpperCase();
-      i += 1;
-    } else {
-      clearInterval(state.revealTimer);
-      state.revealing = false;
-      paintTimelineProgress(stages.length);
-      const latest = state.decision || decision;
-      const finalStatus = latest.status || triggerStatus;
-      renderDecision(latest);
-      if (finalStatus === "OUT" || finalStatus === "NOT_OUT") {
-        showToast(`Decision: ${displayStatus(finalStatus)}`, statusClass(finalStatus));
-      }
-    }
-  }, 400);
-}
 
 function showToast(message, kind = "") {
   let host = document.getElementById("toast-host");
@@ -2399,17 +2661,6 @@ function showToast(message, kind = "") {
   }, 3400);
 }
 
-function renderHotspot(decision) {
-  if (!els.hotspotView) return;
-  const hotspot = decision?.hotspot_analysis || {};
-  if (hotspot.contact_detected) {
-    els.hotspotView.textContent = `Contact detected (${pct(hotspot.confidence)}) · ${hotspot.reason || "Optical-flow proxy"}`;
-    els.hotspotView.classList.add("active");
-  } else {
-    els.hotspotView.textContent = hotspot.reason || "No contact heatmap yet";
-    els.hotspotView.classList.remove("active");
-  }
-}
 
 function connectChannel(channel) {
   const socket = new WebSocket(`${WS_BASE}/ws/${channel}`);
@@ -2548,14 +2799,21 @@ function renderPreflight(data) {
   else pfBanner("pass", "MATCH READY — cleared for live operation");
 }
 
+// ONE preflight fetch feeds both consumers: the full checklist page and the
+// dashboard's one-line readiness. They can never disagree.
 async function refreshPreflight() {
-  if (state.view !== "checklist" || !els.preflightGrid) return;
+  if (state.view !== "checklist" && state.view !== "dashboard") return;
   const ids = preflightSelectedCameras();
   const params = new URLSearchParams();
   if (ids.length) params.set("cameras", ids.join(","));
   try {
-    renderPreflight(await jsonFetch(`/api/preflight?${params.toString()}`));
+    const data = await jsonFetch(`/api/preflight?${params.toString()}`);
+    renderReadiness(data);
+    if (state.view === "checklist" && els.preflightGrid) renderPreflight(data);
   } catch {
+    state.readiness = null;
+    if (els.readinessStrip) els.readinessStrip.hidden = true;
+    if (state.view !== "checklist" || !els.preflightGrid) return;
     els.preflightGrid.innerHTML = `<div class="pf-offline">Backend offline — cannot verify readiness</div>`;
     if (els.preflightSummary) els.preflightSummary.textContent = "--";
     pfBanner("pending", "Backend offline");
@@ -2648,8 +2906,11 @@ async function openReviewFromHistory(reviewId) {
   if (!reviewId) return;
   // Never let a read-only restore collide with a LIVE review in flight — that left
   // the two fighting over Review Mode. One review experience: finish first.
-  if (ReviewMode.active && !ReviewMode.restored) {
-    showToast("Finish or cancel the current review first", "out");
+  // The test is the REVIEW's state, not the workspace's: Back now closes the
+  // workspace without ending the review, so a live review can be running with
+  // ReviewMode.active === false.
+  if (state.activeAppeal || (ReviewMode.active && !ReviewMode.restored)) {
+    showToast("Finish or abandon the current review first", "out");
     return;
   }
   let decision;
@@ -2819,18 +3080,6 @@ function displayStatus(status) {
   return String(status).replaceAll("_", " ");
 }
 
-function statusText(status) {
-  if (status === "OUT") return "OUT";
-  if (status === "NOT_OUT") return "NOT OUT";
-  return status === "PROCESSING" ? "Processing review" : "Waiting for appeal";
-}
-
-function broadcastText(status, decision) {
-  if (status === "OUT") return "OUT";
-  if (status === "NOT_OUT") return "NOT OUT";
-  if (decision?.wicket_prediction?.umpire_call) return "UMPIRE'S CALL";
-  return "WAITING";
-}
 
 function pct(value) {
   return value === null || value === undefined ? "--" : `${Math.round(Number(value) * 100)}%`;
@@ -2890,13 +3139,22 @@ function trackingHealthLabel(cameras) {
    All listeners use optional chaining: a single missing element id must never
    throw here and abort the rest of startup (view init, websockets, timers). */
 els.requestReview?.addEventListener("click", requestReview);
-els.confirmOut?.addEventListener("click", () => confirmDecision("OUT"));
-els.confirmNotOut?.addEventListener("click", () => confirmDecision("NOT_OUT"));
-els.resetReview?.addEventListener("click", resetReview);
-els.exportReview?.addEventListener("click", async () => {
+els.openReviewMode?.addEventListener("click", reopenReviewMode);
+// Evidence Checklist rows are deep links into the workspace: click the evidence
+// you want to inspect, not just "the workspace". The Decision footer lands on
+// the decision stage (verdict + confirm actions).
+document.getElementById("rs-evidence")?.addEventListener("click", (ev) => {
+  const row = ev.target.closest("[data-stage]");
+  if (row) openReviewAtStage(row.dataset.stage);
+});
+document.getElementById("rs-decision")?.addEventListener("click", () => openReviewAtStage("decision"));
+// Readiness is a summary, not a verdict — clicking opens the checklist that owns it.
+els.readinessStrip?.addEventListener("click", () => setView("checklist"));
+// Export lives in the review workspace — it exports THAT review's clip.
+document.getElementById("rm-export")?.addEventListener("click", async (event) => {
   // ONE export, browser-download style: a save dialog asks WHERE, the backend
   // renders the broadcast review clip (UltraEdge scene + verdict) to that path.
-  const btn = els.exportReview;
+  const btn = event.currentTarget;
   const label = btn.textContent;
   btn.disabled = true;
   btn.textContent = "Rendering…";
@@ -2984,7 +3242,6 @@ document.getElementById("syncrep-cams")?.addEventListener("click", (e) => {
   SyncReplay.show(SyncReplay.t);
 });
 els.modeToggle?.addEventListener("click", toggleMode);
-els.resetCamera?.addEventListener("click", resetThreeCamera);
 els.replayPlay?.addEventListener("click", () => replayControl("play", { speed: Number(els.replaySpeed.value) }));
 els.replayPause?.addEventListener("click", () => replayControl("pause"));
 els.replayBack?.addEventListener("click", () => replayControl("step_back"));
@@ -3143,7 +3400,6 @@ document.addEventListener("click", (event) => {
 });
 
 window.drs?.onDecision((decision) => renderDecision(decision));
-window.addEventListener("resize", resizeThree);
 window.addEventListener("keydown", (event) => {
   if (event.target.matches("input, textarea")) return;
   const key = event.key.toLowerCase();
@@ -3183,11 +3439,11 @@ setView(state.view);
 
 initDashboardModules();
 if (state.view === "calibration") state.calibrationModal.activate();
-initThree();
 connectWebSockets();
 refreshHealth();
 refreshSystemHealth();
 refreshCameraStatus();
+refreshPreflight();      // the dashboard's readiness line, before the 15s timer
 refreshDecision();
 // Resume the current match (name + review queue) — but never the active review,
 // which the backend keeps at WAITING on launch.

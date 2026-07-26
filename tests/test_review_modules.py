@@ -12,12 +12,14 @@ from types import SimpleNamespace
 import pytest
 
 from core.camera_roles import FRONT_FOOT, WIDE, canonical_role
+from core.observation import BailsState, Observation
 from core.review_modules import build_review_result, get_module, run_review, supported_types
 from core.review_modules.base import ReviewContext
 from core.review_modules.edge import EdgeReviewModule
 from core.review_modules.lbw import LbwReviewModule
 from core.review_modules.no_ball import FootLocation, NoBallReviewModule
 from core.review_modules.run_out import BatLocation, RunOutReviewModule
+from core.review_modules.stumping import StumpingReviewModule
 from core.review_modules.wide import WideReviewModule
 
 
@@ -87,6 +89,32 @@ def test_registry_supports_all_review_types() -> None:
     assert set(supported_types()) == {"lbw", "wide", "noball", "edge", "runout", "stumping"}
 
 
+def test_operator_protocol_is_distinct_per_type() -> None:
+    # The operator protocol drives the review workspace: each type declares its OWN
+    # ordered stages, every protocol ends at "decision", and only LBW ever contains
+    # a trajectory stage — a Wide review must never learn trajectory exists.
+    expected = {
+        "lbw": ["front_foot", "ultra_edge", "trajectory", "decision"],
+        "wide": ["wide_line", "decision"],
+        "noball": ["front_foot", "decision"],
+        "edge": ["audio_sync", "decision"],
+        "runout": ["crease", "decision"],
+        "stumping": ["crease", "timing", "decision"],
+    }
+    for key, stages in expected.items():
+        contract = get_module(key).describe()
+        assert [s["key"] for s in contract["protocol"]] == stages, key
+        assert all(s["label"] for s in contract["protocol"]), key
+    for key in expected:
+        if key != "lbw":
+            assert "trajectory" not in [s["key"] for s in get_module(key).describe()["protocol"]]
+    # Broadcast-DRS decision modes: measurement-backed types decide automatically;
+    # Edge / Run Out / Stumping ASSIST — their readings are advisory, umpire decides.
+    modes = {key: get_module(key).describe()["decision_mode"] for key in expected}
+    assert modes == {"lbw": "automatic", "wide": "automatic", "noball": "automatic",
+                     "edge": "assisted", "runout": "assisted", "stumping": "assisted"}
+
+
 def test_lbw_no_ball_voids_dismissal(monkeypatch) -> None:
     # DRS protocol: a front-foot NO BALL voids the dismissal — the LBW verdict
     # overrides to NOT OUT and the decision card's first row is the flagged check.
@@ -103,6 +131,45 @@ def test_lbw_no_ball_voids_dismissal(monkeypatch) -> None:
     first = result["summary"]["measurements"][0]
     assert first["label"] == "No Ball" and first["flag"] is True
     assert any("cannot be out LBW" in w for w in result["summary"]["warnings"])
+
+
+def test_lbw_no_ball_short_circuits_the_protocol(monkeypatch) -> None:
+    # TV-umpiring flow: an overstep ENDS the review at step 1 — no UltraEdge, no
+    # ball tracking ever runs, and the result carries the short-circuit marker.
+    from core.review_modules.no_ball import NoBallReviewModule
+
+    monkeypatch.setattr(NoBallReviewModule, "analyze", lambda self, ctx: {
+        "no_ball_analysis": {"is_no_ball": True, "distance_past_cm": 3.2}})
+    monkeypatch.setattr(LbwReviewModule, "detect_samples",
+                        lambda self, ctx, camera_id: pytest.fail("ball tracking ran after a NO BALL"))
+    ctx = ReviewContext(
+        review_type="lbw", frames={0: [_frame(1), _frame(2), _frame(3)]}, detector=None,
+        calibrators={}, camera_roles={0: "Ball Tracking"}, primary_camera_id=0)
+    result = run_review("lbw", ctx)
+    assert result["review_ended"] == "no_ball"
+    assert "edge_analysis" not in result            # UltraEdge never ran
+    assert "trajectory" not in result               # tracking never ran
+    assert build_review_result("lbw", result)["verdict"] == "NOT OUT - NO BALL"
+    labels = {m["label"]: m["value"] for m in result["summary"]["measurements"]}
+    assert labels["UltraEdge"] == "Not needed — review ended"
+
+
+def test_edge_verdict_never_fabricated_without_analysis() -> None:
+    # NO EDGE is a real finding — with no audio and no heatmap analysed, the only
+    # honest verdict is AWAITING (the old seeded {probability: 0.0} read as NO EDGE).
+    assert build_review_result("edge", {})["verdict"] == "AWAITING"
+    assert build_review_result("edge", {"edge_analysis": {"edge_probability": 0.0, "events": []},
+                                        "hotspot_analysis": {"contact_detected": False}})["verdict"] == "NO EDGE"
+
+
+def test_timeline_stays_neutral_until_analysis_completes() -> None:
+    # Honest timeline: an awaiting review paints NO completed stages (green means
+    # verified); a completed analysis marks them all complete.
+    wide = WideReviewModule()
+    pending = wide.base_result("awaiting", confidence=None)["timeline"]
+    done = wide.base_result("done", confidence=0.9)["timeline"]
+    assert all(row["status"] == "pending" for row in pending)
+    assert all(row["status"] == "complete" for row in done)
 
 
 def test_lbw_verdict_not_hijacked_by_merged_precheck_analysis() -> None:
@@ -358,3 +425,82 @@ def test_run_out_overlay_payload_projects_crease_and_cards() -> None:
     assert len(payload["crease_px"]) == 2       # projected popping-crease line
     assert payload["bat_px"] and len(payload["stumps_px"]) == 3 and len(payload["bails_px"]) == 3
     assert [c["label"] for c in payload["decision_cards"]][0] == "DECISION"
+
+
+# ---------------------------------------------------------------------------
+# The bails are NOT observed by any detector. These tests exist because a
+# placeholder "dislodged" once flowed all the way onto the evidence frame as a
+# red "BAILS DISLODGED", telling the umpire something the system never measured.
+# Nothing may assert a bails state until a real detector produces one.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bat_y,label", [(600, "short of crease"), (500, "behind crease")])
+def test_bails_status_is_never_fabricated(bat_y: int, label: str) -> None:
+    """Unknown is an EXPLICIT third value on the wire, not an absent one — a null
+    invites consumers to collapse it into the negative case."""
+    for module, block in (
+        (RunOutReviewModule(bat_locator=_StubBatLocator((640, bat_y))), "run_out_analysis"),
+        (StumpingReviewModule(bat_locator=_StubBatLocator((640, bat_y))), "stumping_analysis"),
+    ):
+        decision = module.analyze(_run_out_ctx())
+        analysis = decision[block]
+        assert analysis["bails_status"] == BailsState.NOT_OBSERVED.value, \
+            f"{block} fabricated a bails state ({label})"
+        assert BailsState.coerce(analysis["bails_status"]).wicket_broken is None
+        rows = {m["label"]: m["value"] for m in decision["summary"]["measurements"]}
+        assert rows["Bails"] == "Not observed"
+
+
+def test_undetectable_checks_are_tri_state_not_null() -> None:
+    """Every check without a detector reports UNKNOWN explicitly, so no consumer can
+    read the gap as a negative finding."""
+    decision = StumpingReviewModule(bat_locator=_StubBatLocator((640, 600))).analyze(_run_out_ctx())
+    analysis = decision["stumping_analysis"]
+    for field in ("gloves_detected", "ball_collected", "ball_possession"):
+        assert analysis[field] == Observation.UNKNOWN.value, f"{field} is not tri-state"
+        assert Observation.coerce(analysis[field]).as_optional_bool() is None
+        assert Observation.coerce(analysis[field]).is_known is False
+
+
+def test_observation_never_collapses_unknown_into_false() -> None:
+    assert Observation.of(None) is Observation.UNKNOWN
+    assert Observation.of(False) is Observation.FALSE
+    assert Observation.of(True) is Observation.TRUE
+    assert Observation.UNKNOWN.label("yes", "no") == "Not observed"
+    # legacy/garbage values degrade to UNKNOWN, never to a claim
+    assert Observation.coerce("nonsense") is Observation.UNKNOWN
+    assert BailsState.coerce(None) is BailsState.NOT_OBSERVED
+    assert BailsState.coerce("dislodged").wicket_broken is True
+    assert BailsState.coerce("intact").wicket_broken is False
+
+
+def test_unknown_bails_never_claims_a_broken_wicket() -> None:
+    """`hitting` drives the stump-hit treatment. Unknown must stay None: False
+    would assert the wicket was NOT broken, which is just as unmeasured."""
+    from core.overlay_builder import build_overlay_payload
+
+    decision = RunOutReviewModule(bat_locator=_StubBatLocator((640, 600))).analyze(_run_out_ctx())
+    decision["review_result"] = build_review_result("runout", decision)
+    payload = build_overlay_payload(decision, calibrators={1: LinearCalibrator()})
+    assert payload["bails_status"] == BailsState.NOT_OBSERVED.value
+    assert payload["hitting"] is None          # None, NOT False — see the docstring
+    bails_card = next(c for c in payload["decision_cards"] if c["label"] == "BAILS")
+    assert bails_card["value"] == "NOT OBSERVED"   # not a bare dash, not a claim
+
+
+def test_bails_overlay_renders_a_third_unknown_state() -> None:
+    """The renderer must not fall back to INTACT when the state is unknown."""
+    import numpy as np
+    from core.overlay_renderer import OverlayRenderer
+
+    renderer = OverlayRenderer()
+    bails = [{"x": 100.0, "y": 80.0}, {"x": 130.0, "y": 80.0}]
+    seen = {}
+    for status in ("dislodged", "intact", None):
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        renderer._draw_bails(frame, bails, status, 1.0)
+        seen[str(status)] = frame.copy()
+    # all three states must be visually distinct from one another
+    assert not np.array_equal(seen["None"], seen["intact"])
+    assert not np.array_equal(seen["None"], seen["dislodged"])
+    assert not np.array_equal(seen["intact"], seen["dislodged"])

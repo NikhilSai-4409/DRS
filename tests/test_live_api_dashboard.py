@@ -81,6 +81,23 @@ async def test_confirm_decision_records_review_history():
 
 
 @pytest.mark.asyncio
+async def test_confirm_decision_keeps_review_type_vocabulary():
+    # The operator confirms in the review type's OWN words: a Wide resolves WIDE
+    # (recorded verbatim; internally an upheld appeal maps to the OUT status),
+    # and LEGAL resolves as a not-upheld appeal.
+    app = create_app([0], record=False)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        wide = await client.post("/api/decision/confirm", json={"outcome": "WIDE"})
+        await client.post("/api/decision/reset")
+        legal = await client.post("/api/decision/confirm", json={"outcome": "LEGAL"})
+        reviews = await client.get("/api/reviews")
+
+    assert wide.json()["status"] == "OUT" and wide.json()["outcome"] == "WIDE"
+    assert legal.json()["status"] == "NOT_OUT" and legal.json()["outcome"] == "LEGAL"
+    assert [r["decision"] for r in reviews.json()["reviews"][:2]] == ["LEGAL", "WIDE"]
+
+
+@pytest.mark.asyncio
 async def test_reset_returns_to_idle_after_confirmation():
     # RESULT -> IDLE: confirming records the review, then /api/decision/reset clears
     # the active review so the dashboard shows WAITING again (the recorded review
